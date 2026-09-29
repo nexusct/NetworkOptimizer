@@ -1479,6 +1479,21 @@ public class AuditService : IAuditScanService
                 _logger.LogWarning(ex, "Failed to fetch network configs for zone ID detection");
             }
 
+            // Fetch WLAN configurations for wireless security analysis
+            List<NetworkOptimizer.UniFi.Models.UniFiWlanConfig>? wlanConfigs = null;
+            try
+            {
+                wlanConfigs = await _connectionService.Client.GetWlanConfigurationsAsync();
+                if (wlanConfigs.Count > 0)
+                {
+                    _logger.LogInformation("Fetched {Count} WLAN configurations for wireless security analysis", wlanConfigs.Count);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to fetch WLAN configurations");
+            }
+
             // Fetch firewall zones for zone validation and DMZ/Hotspot identification
             List<NetworkOptimizer.UniFi.Models.UniFiFirewallZone>? firewallZones = null;
             try
@@ -1559,6 +1574,7 @@ public class AuditService : IAuditScanService
                 UpnpEnabled = upnpEnabled,
                 PortForwardRules = portForwardRules,
                 NetworkConfigs = networkConfigs,
+                WlanConfigs = wlanConfigs,
                 FirewallZones = firewallZones,
                 NetworkPurposeOverrides = options.NetworkPurposeOverrides,
                 ThreatContext = threatContext

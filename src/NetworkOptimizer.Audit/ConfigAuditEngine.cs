@@ -30,6 +30,9 @@ public class ConfigAuditEngine
     private readonly FirewallRuleAnalyzer _firewallAnalyzer;
     private readonly DnsSecurityAnalyzer _dnsAnalyzer;
     private readonly UpnpSecurityAnalyzer _upnpAnalyzer;
+    private readonly WirelessConfigAnalyzer _wirelessConfigAnalyzer;
+    private readonly DeviceFirmwareAnalyzer _deviceFirmwareAnalyzer;
+    private readonly MdnsScopeAnalyzer _mdnsScopeAnalyzer;
     private readonly AuditScorer _scorer;
 
     /// <summary>
@@ -55,6 +58,7 @@ public class ConfigAuditEngine
         public bool? UpnpEnabled { get; init; }
         public List<UniFiPortForwardRule>? PortForwardRules { get; init; }
         public List<UniFiNetworkConfig>? NetworkConfigs { get; init; }
+        public List<UniFiWlanConfig>? WlanConfigs { get; init; }
 
         // Populated by phases
         public List<NetworkInfo> Networks { get; set; } = [];
@@ -161,6 +165,9 @@ public class ConfigAuditEngine
             new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(3) });
         _dnsAnalyzer = new DnsSecurityAnalyzer(loggerFactory.CreateLogger<DnsSecurityAnalyzer>(), thirdPartyDetector);
         _upnpAnalyzer = new UpnpSecurityAnalyzer(loggerFactory.CreateLogger<UpnpSecurityAnalyzer>());
+        _wirelessConfigAnalyzer = new WirelessConfigAnalyzer(loggerFactory.CreateLogger<WirelessConfigAnalyzer>());
+        _deviceFirmwareAnalyzer = new DeviceFirmwareAnalyzer(loggerFactory.CreateLogger<DeviceFirmwareAnalyzer>());
+        _mdnsScopeAnalyzer = new MdnsScopeAnalyzer(loggerFactory.CreateLogger<MdnsScopeAnalyzer>());
         _scorer = new AuditScorer(loggerFactory.CreateLogger<AuditScorer>());
     }
 
@@ -313,11 +320,14 @@ public class ConfigAuditEngine
         ExecutePhase3b_AnalyzeWirelessClients(ctx);
         ExecutePhase3a_ProtectCameraFallback(ctx);
         ExecutePhase3c_AnalyzeOfflineClients(ctx);
+        ExecutePhase3d_AnalyzeWirelessConfig(ctx);
         ExecutePhase4_AnalyzeNetworkConfiguration(ctx);
         ExecutePhase5_AnalyzeFirewallRules(ctx);
         await ExecutePhase5b_AnalyzeDnsSecurityAsync(ctx);
         ExecutePhase5c_AnalyzeUpnpSecurity(ctx);
         ExecutePhase5d_AnalyzeThreatExposure(ctx);
+        ExecutePhase5e_AnalyzeDeviceFirmware(ctx);
+        ExecutePhase5f_AnalyzeMdnsScope(ctx);
         ExecutePhase6_AnalyzeHardeningMeasures(ctx);
 
         // Build and score the final result
@@ -436,6 +446,7 @@ public class ConfigAuditEngine
             UpnpEnabled = request.UpnpEnabled,
             PortForwardRules = request.PortForwardRules,
             NetworkConfigs = request.NetworkConfigs,
+            WlanConfigs = request.WlanConfigs,
             FirewallZones = request.FirewallZones,
             ZoneLookup = zoneLookup,
             ExternalZoneId = externalZoneId,
@@ -906,6 +917,54 @@ public class ConfigAuditEngine
             ScoreImpact = scoreImpact,
             Metadata = metadata
         };
+    }
+
+    /// <summary>
+    /// Phase 3d: Analyze WLAN configurations from /rest/wlanconf for wireless security issues
+    /// (open/WEP SSIDs, legacy WPA1/TKIP, PMF state, guest isolation).
+    /// </summary>
+    private void ExecutePhase3d_AnalyzeWirelessConfig(AuditContext ctx)
+    {
+        if (ctx.WlanConfigs == null || ctx.WlanConfigs.Count == 0)
+        {
+            _logger.LogDebug("Phase 3d: Skipping wireless config analysis (no WLAN configs)");
+            return;
+        }
+
+        _logger.LogInformation("Phase 3d: Analyzing wireless configuration ({Count} WLANs)", ctx.WlanConfigs.Count);
+        var wlanIssues = _wirelessConfigAnalyzer.Analyze(ctx.WlanConfigs, ctx.Networks, ctx.NetworkConfigs);
+        ctx.AllIssues.AddRange(wlanIssues);
+        _logger.LogInformation("Found {IssueCount} wireless config issues", wlanIssues.Count);
+    }
+
+    /// <summary>
+    /// Phase 5e: Analyze device firmware state from /stat/device JSON.
+    /// Flags devices with available firmware updates and end-of-life models.
+    /// </summary>
+    private void ExecutePhase5e_AnalyzeDeviceFirmware(AuditContext ctx)
+    {
+        _logger.LogInformation("Phase 5e: Analyzing device firmware state");
+        var firmwareIssues = _deviceFirmwareAnalyzer.Analyze(ctx.DeviceData);
+        ctx.AllIssues.AddRange(firmwareIssues);
+        _logger.LogInformation("Found {IssueCount} device firmware issues", firmwareIssues.Count);
+    }
+
+    /// <summary>
+    /// Phase 5f: Analyze mDNS reflector scope across networks.
+    /// Flags mDNS enabled on networks the audit otherwise treats as isolated.
+    /// </summary>
+    private void ExecutePhase5f_AnalyzeMdnsScope(AuditContext ctx)
+    {
+        if (ctx.NetworkConfigs == null || ctx.NetworkConfigs.Count == 0)
+        {
+            _logger.LogDebug("Phase 5f: Skipping mDNS scope analysis (no network configs)");
+            return;
+        }
+
+        _logger.LogInformation("Phase 5f: Analyzing mDNS scope");
+        var mdnsIssues = _mdnsScopeAnalyzer.Analyze(ctx.NetworkConfigs);
+        ctx.AllIssues.AddRange(mdnsIssues);
+        _logger.LogInformation("Found {IssueCount} mDNS scope issues", mdnsIssues.Count);
     }
 
     private void ExecutePhase4_AnalyzeNetworkConfiguration(AuditContext ctx)

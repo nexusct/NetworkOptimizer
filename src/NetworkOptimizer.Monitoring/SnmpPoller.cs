@@ -500,6 +500,48 @@ public class SnmpPoller : ISnmpPoller
         return (hostname, description, uptime);
     }
 
+    /// <summary>
+    /// Reads per-port spanning-tree state from the Bridge MIB: dot1dStpPortState joined
+    /// to ifIndex via dot1dBasePortIfIndex, with interface names resolved from ifXTable.
+    /// Devices without Bridge MIB support (or with STP disabled) return an empty list;
+    /// walk failures log at debug and also yield an empty list so a non-compliant or
+    /// rebooting device never breaks the poll cycle.
+    /// </summary>
+    public async Task<List<StpPortInfo>> GetStpPortStatesAsync(IPAddress ip, string? hostname = null)
+    {
+        try
+        {
+            var ifIndexByStpPort = IndexByIfIndex(
+                await BulkWalkAsync(ip, UniFiOids.Dot1dBasePortIfIndex), UniFiOids.Dot1dBasePortIfIndex);
+            if (ifIndexByStpPort.Count == 0)
+                return new List<StpPortInfo>();
+
+            var stateByStpPort = IndexByIfIndex(
+                await BulkWalkAsync(ip, UniFiOids.Dot1dStpPortState), UniFiOids.Dot1dStpPortState);
+            var nameByIfIndex = IndexByIfIndex(
+                await BulkWalkAsync(ip, UniFiOids.IfName), UniFiOids.IfName);
+
+            var result = new List<StpPortInfo>();
+            foreach (var (stpPort, ifIndexStr) in ifIndexByStpPort)
+            {
+                if (!stateByStpPort.TryGetValue(stpPort, out var stateStr))
+                    continue;
+                if (!int.TryParse(ifIndexStr, out var ifIndex) || !int.TryParse(stateStr, out var stateCode))
+                    continue;
+
+                nameByIfIndex.TryGetValue(ifIndex.ToString(), out var ifName);
+                result.Add(new StpPortInfo(ifIndex, ifName, StpPortStateExtensions.FromCode(stateCode)));
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to get STP port states for {Ip}", ip);
+            return new List<StpPortInfo>();
+        }
+    }
+
     #endregion
 
     #region Private Helper Methods

@@ -456,6 +456,24 @@ public static class UniFiOids
 
     #endregion
 
+    #region Bridge MIB (Spanning Tree)
+
+    /// <summary>
+    /// dot1dBasePortIfIndex - maps an STP bridge port number to its ifIndex
+    /// (1.3.6.1.2.1.17.1.4.1.2), walkable column of dot1dBasePortTable.
+    /// </summary>
+    public const string Dot1dBasePortIfIndex = "1.3.6.1.2.1.17.1.4.1.2";
+
+    /// <summary>
+    /// dot1dStpPortState - per-STP-port state, indexed by STP bridge port number
+    /// (1.3.6.1.2.1.17.2.15.1.3): 1 disabled, 2 blocking, 3 listening, 4 learning,
+    /// 5 forwarding, 6 broken. Join with <see cref="Dot1dBasePortIfIndex"/> on the
+    /// STP port number to reach an ifIndex.
+    /// </summary>
+    public const string Dot1dStpPortState = "1.3.6.1.2.1.17.2.15.1.3";
+
+    #endregion
+
     /// <summary>
     /// Get OID for a specific interface index
     /// </summary>

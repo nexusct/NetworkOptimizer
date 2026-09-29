@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Globalization;
 using InfluxDB.Client;
 using InfluxDB.Client.Api.Domain;
@@ -1704,6 +1704,40 @@ from(bucket: ""{_longtermBucket}"")
     }
 
     /// <summary>
+    /// Per-port PoE telemetry from the UniFi API port_table. One point per PoE-capable
+    /// port per poll. Per-device totals/budget are NOT written here; they piggyback on
+    /// device_health via <see cref="WriteCustomFieldsAsync"/> (custom-OID pattern) so the
+    /// device summary lands on the same series as the rest of the health data.
+    /// </summary>
+    public Task WritePoePortAsync(
+        string deviceMac,
+        int portIdx,
+        string? portName,
+        string? poeMode,
+        bool poeEnabled,
+        double? powerW,
+        double? voltageV,
+        DateTime timestamp)
+    {
+        if (!IsConfigured) return Task.CompletedTask;
+        var point = PointData.Measurement("poe_port")
+            .Tag("device_mac", NormalizeMac(deviceMac))
+            .Tag("port", portIdx.ToString())
+            .Field("poe_enabled", poeEnabled)
+            .Timestamp(timestamp.ToUniversalTime(), WritePrecision.Ns);
+
+        // Names/modes are fields, not tags: both are user/firmware mutable, and tags
+        // would fork the series on every rename.
+        if (!string.IsNullOrEmpty(portName)) point = point.Field("port_name", portName);
+        if (!string.IsNullOrEmpty(poeMode)) point = point.Field("poe_mode", poeMode);
+        if (powerW.HasValue) point = point.Field("power_w", powerW.Value);
+        if (voltageV.HasValue) point = point.Field("voltage_v", voltageV.Value);
+
+        Enqueue(point, longterm: false);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
     /// A persisted device reboot record.
     /// </summary>
     public class DeviceRebootPoint
@@ -1824,6 +1858,111 @@ from(bucket: ""{_longtermBucket}"")
         results.Sort((a, b) => a.BootedAt.CompareTo(b.BootedAt));
 
         return results;
+    }
+
+    /// <summary>
+    /// Per-radio time series for access points, sourced from the UniFi API
+    /// radio_table_stats joined with radio_table config. One point per AP radio per poll.
+    /// </summary>
+    public Task WriteApRadioAsync(
+        string apMac,
+        string radioName,
+        string band,
+        int? channel,
+        int? channelWidth,
+        int? cuTotal,
+        int? cuSelfRx,
+        int? cuSelfTx,
+        int? interference,
+        double? txRetriesPct,
+        int? txPowerDbm,
+        int? satisfaction,
+        int? numSta,
+        DateTime timestamp)
+    {
+        if (!IsConfigured) return Task.CompletedTask;
+        var point = PointData.Measurement("ap_radio")
+            .Tag("device_mac", NormalizeMac(apMac))
+            .Tag("radio", radioName.ToLowerInvariant())
+            .Tag("band", band.ToLowerInvariant())
+            .Timestamp(timestamp.ToUniversalTime(), WritePrecision.Ns);
+
+        if (channel.HasValue) point = point.Field("channel", channel.Value);
+        if (channelWidth.HasValue) point = point.Field("channel_width", channelWidth.Value);
+        if (cuTotal.HasValue) point = point.Field("cu_total", cuTotal.Value);
+        if (cuSelfRx.HasValue) point = point.Field("cu_self_rx", cuSelfRx.Value);
+        if (cuSelfTx.HasValue) point = point.Field("cu_self_tx", cuSelfTx.Value);
+        if (interference.HasValue) point = point.Field("interference", interference.Value);
+        if (txRetriesPct.HasValue) point = point.Field("tx_retries_pct", txRetriesPct.Value);
+        if (txPowerDbm.HasValue) point = point.Field("tx_power_dbm", txPowerDbm.Value);
+        if (satisfaction.HasValue) point = point.Field("satisfaction", satisfaction.Value);
+        if (numSta.HasValue) point = point.Field("num_sta", numSta.Value);
+
+        Enqueue(point, longterm: false);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Per-network DHCP pool utilization. Pool size comes from the networkconf DHCP
+    /// range; active leases are counted from clients currently on that network with an
+    /// IP inside the pool range. One point per DHCP-enabled network per poll.
+    /// </summary>
+    public Task WriteDhcpPoolAsync(
+        string networkId,
+        string networkName,
+        int? vlan,
+        string? subnet,
+        string poolStart,
+        string poolStop,
+        long poolSize,
+        long activeLeases,
+        double utilizationPercent,
+        DateTime timestamp)
+    {
+        if (!IsConfigured) return Task.CompletedTask;
+        var point = PointData.Measurement("dhcp_pool")
+            // network_id is the stable identity (survives renames); name is a field.
+            .Tag("network_id", networkId)
+            .Field("network_name", networkName)
+            .Field("pool_start", poolStart)
+            .Field("pool_stop", poolStop)
+            .Field("pool_size", poolSize)
+            .Field("active_leases", activeLeases)
+            .Field("utilization_percent", utilizationPercent)
+            .Timestamp(timestamp.ToUniversalTime(), WritePrecision.Ns);
+
+        if (vlan.HasValue) point = point.Field("vlan", vlan.Value);
+        if (!string.IsNullOrEmpty(subnet)) point = point.Field("ip_subnet", subnet);
+
+        Enqueue(point, longterm: false);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Per-port spanning-tree state from the SNMP Bridge MIB (dot1dStpPortState).
+    /// One point per STP-participating port per poll. Devices without Bridge MIB
+    /// support simply produce no points.
+    /// </summary>
+    public Task WriteStpPortAsync(
+        string deviceMac,
+        string ifName,
+        int? portIdx,
+        string stpState,
+        int stateCode,
+        DateTime timestamp)
+    {
+        if (!IsConfigured) return Task.CompletedTask;
+        var point = PointData.Measurement("stp_port")
+            .Tag("device_mac", NormalizeMac(deviceMac))
+            .Tag("if_name", ifName)
+            .Field("stp_state", stpState)
+            .Field("state_code", stateCode)
+            .Timestamp(timestamp.ToUniversalTime(), WritePrecision.Ns);
+
+        if (portIdx.HasValue) point = point.Field("port_idx", portIdx.Value);
+
+        Enqueue(point, longterm: false);
+        return Task.CompletedTask;
     }
 
     // ---- Read API (Flux queries) ----

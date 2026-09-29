@@ -301,6 +301,28 @@ public static class DefaultAlertRules
             CooldownSeconds = 60 // 1 minute - recoveries are paired with outage events
         },
 
+        // --- PoE budget (enabled - the evaluator already gates on sustained breach + hysteresis) ---
+        new AlertRule
+        {
+            Name = "Monitoring: PoE Budget High",
+            IsEnabled = true,
+            EventTypePattern = "monitoring.poe_budget",
+            Source = "monitoring",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 1800 // 30 minutes
+        },
+
+        // --- WAN failover (enabled - a failover means the primary link failed) ---
+        new AlertRule
+        {
+            Name = "WAN: Failover",
+            IsEnabled = true,
+            EventTypePattern = "wan.failover",
+            Source = "wan",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 300 // 5 minutes - failback shortly after failover is its own event
+        },
+
         // --- SFP / PON threshold alerts (enabled - auto-managed for detected modules) ---
         new AlertRule
         {

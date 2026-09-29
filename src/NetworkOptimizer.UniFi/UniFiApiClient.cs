@@ -1098,6 +1098,70 @@ public class UniFiApiClient : IDisposable
         return result;
     }
 
+    /// <summary>
+    /// POST /api/s/{site}/cmd/devmgr - restart a device by MAC (cmd "restart").
+    /// MUTATES CONTROLLER STATE: reboots the target AP/switch/gateway, dropping all clients
+    /// and forwarding until it re-adopts. Callers must confirm intent with the operator
+    /// before invoking.
+    /// </summary>
+    /// <param name="mac">Device MAC address (lowercase, colon-separated).</param>
+    /// <returns>True when the controller accepted the command; false otherwise.</returns>
+    public async Task<bool> RestartDeviceAsync(string mac, CancellationToken cancellationToken = default)
+    {
+        var body = new Dictionary<string, object>
+        {
+            ["mac"] = mac,
+            ["cmd"] = "restart"
+        };
+        var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<object>>(
+            () => _httpClient!.PostAsync(BuildApiPath("cmd/devmgr"), content, cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogInformation("Restart command accepted for device {Mac}", mac);
+            return true;
+        }
+
+        _logger.LogWarning("Failed to restart device {Mac}", mac);
+        return false;
+    }
+
+    /// <summary>
+    /// POST /api/s/{site}/cmd/devmgr - trigger a firmware upgrade on a device by MAC
+    /// (cmd "upgrade"). The controller pushes the firmware version it currently considers
+    /// current for that device model.
+    /// MUTATES CONTROLLER STATE: the device downloads and flashes firmware, then reboots -
+    /// it is offline for several minutes and the operation cannot be cancelled once started.
+    /// Callers must confirm intent with the operator before invoking.
+    /// </summary>
+    /// <param name="mac">Device MAC address (lowercase, colon-separated).</param>
+    /// <returns>True when the controller accepted the command; false otherwise.</returns>
+    public async Task<bool> UpgradeDeviceAsync(string mac, CancellationToken cancellationToken = default)
+    {
+        var body = new Dictionary<string, object>
+        {
+            ["mac"] = mac,
+            ["cmd"] = "upgrade"
+        };
+        var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<object>>(
+            () => _httpClient!.PostAsync(BuildApiPath("cmd/devmgr"), content, cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogInformation("Firmware upgrade command accepted for device {Mac}", mac);
+            return true;
+        }
+
+        _logger.LogWarning("Failed to trigger firmware upgrade on device {Mac}", mac);
+        return false;
+    }
+
     #endregion
 
     #region Client Management APIs
@@ -1288,6 +1352,74 @@ public class UniFiApiClient : IDisposable
             _logger.LogWarning("Failed to retrieve client history: {StatusCode}", response.StatusCode);
             return new List<UniFiClientDetailResponse>();
         });
+    }
+
+    /// <summary>
+    /// POST /api/s/{site}/cmd/stamgr - block a client by MAC (cmd "block-sta").
+    /// MUTATES CONTROLLER STATE: the client is added to the blocked list and disconnected;
+    /// it stays blocked across reconnects until explicitly unblocked via
+    /// <see cref="UnblockClientAsync"/>. Callers must confirm intent with the operator.
+    /// </summary>
+    /// <param name="mac">Client MAC address (lowercase, colon-separated).</param>
+    /// <returns>True when the controller accepted the command; false otherwise.</returns>
+    public async Task<bool> BlockClientAsync(string mac, CancellationToken cancellationToken = default)
+    {
+        return await PostStaMgrCommandAsync("block-sta", mac, cancellationToken);
+    }
+
+    /// <summary>
+    /// POST /api/s/{site}/cmd/stamgr - unblock a previously blocked client (cmd "unblock-sta").
+    /// MUTATES CONTROLLER STATE: removes the client from the blocked list, allowing it to
+    /// associate again. Callers must confirm intent with the operator.
+    /// </summary>
+    /// <param name="mac">Client MAC address (lowercase, colon-separated).</param>
+    /// <returns>True when the controller accepted the command; false otherwise.</returns>
+    public async Task<bool> UnblockClientAsync(string mac, CancellationToken cancellationToken = default)
+    {
+        return await PostStaMgrCommandAsync("unblock-sta", mac, cancellationToken);
+    }
+
+    /// <summary>
+    /// POST /api/s/{site}/cmd/stamgr - kick a client to force reconnection (cmd "kick-sta").
+    /// MUTATES CONTROLLER STATE: the client is immediately disconnected from its AP; it may
+    /// reconnect right away (that is the point - e.g. to re-anchor a sticky client), but any
+    /// in-flight traffic is dropped. Callers must confirm intent with the operator.
+    /// </summary>
+    /// <param name="mac">Client MAC address (lowercase, colon-separated).</param>
+    /// <returns>True when the controller accepted the command; false otherwise.</returns>
+    public async Task<bool> ReconnectClientAsync(string mac, CancellationToken cancellationToken = default)
+    {
+        return await PostStaMgrCommandAsync("kick-sta", mac, cancellationToken);
+    }
+
+    /// <summary>
+    /// Shared helper for cmd/stamgr client lifecycle commands (block-sta, unblock-sta,
+    /// kick-sta). All of them take only a MAC and differ only by the cmd verb.
+    /// </summary>
+    private async Task<bool> PostStaMgrCommandAsync(
+        string cmd,
+        string mac,
+        CancellationToken cancellationToken = default)
+    {
+        var body = new Dictionary<string, object>
+        {
+            ["cmd"] = cmd,
+            ["mac"] = mac
+        };
+        var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<object>>(
+            () => _httpClient!.PostAsync(BuildApiPath("cmd/stamgr"), content, cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogInformation("Station command {Cmd} accepted for client {Mac}", cmd, mac);
+            return true;
+        }
+
+        _logger.LogWarning("Station command {Cmd} failed for client {Mac}", cmd, mac);
+        return false;
     }
 
     #endregion
@@ -1566,6 +1698,51 @@ public class UniFiApiClient : IDisposable
     }
 
     /// <summary>
+    /// GET rest/radiusprofile - Get all RADIUS profiles (802.1X authentication servers,
+    /// accounting settings, VLAN assignment). Read-only.
+    /// </summary>
+    public async Task<List<UniFiRadiusProfile>> GetRadiusProfilesAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching RADIUS profiles from site {Site}", _site);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiRadiusProfile>>(
+            () => _httpClient!.GetAsync(BuildApiPath("rest/radiusprofile"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogDebug("Retrieved {Count} RADIUS profiles", response.Data.Count);
+            return response.Data;
+        }
+
+        _logger.LogWarning("Failed to retrieve RADIUS profiles or received non-ok response");
+        return new List<UniFiRadiusProfile>();
+    }
+
+    /// <summary>
+    /// GET rest/apgroup - Get all AP groups. AP groups define which APs broadcast which
+    /// WLANs; resolves the ap_group_ids references on UniFiWlanConfig when
+    /// ap_group_mode != "all". Read-only.
+    /// </summary>
+    public async Task<List<UniFiApGroup>> GetApGroupsAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching AP groups from site {Site}", _site);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiApGroup>>(
+            () => _httpClient!.GetAsync(BuildApiPath("rest/apgroup"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogDebug("Retrieved {Count} AP groups", response.Data.Count);
+            return response.Data;
+        }
+
+        _logger.LogWarning("Failed to retrieve AP groups or received non-ok response");
+        return new List<UniFiApGroup>();
+    }
+
+    /// <summary>
     /// PUT rest/networkconf/{id} - Update network configuration
     /// Used to enable/disable networks, VPNs, etc.
     /// </summary>
@@ -1819,6 +1996,92 @@ public class UniFiApiClient : IDisposable
 
             return null;
         });
+    }
+
+    /// <summary>
+    /// POST stat/dpi - Get Deep Packet Inspection traffic totals grouped by application
+    /// or category. Uses POST (same verb pattern as GetIpsEventsAsync): the controller
+    /// expects a JSON body with the grouping type rather than a bare GET. Read-only.
+    /// </summary>
+    /// <param name="type">Grouping: "by_app" for per-application totals, "by_cat" for
+    /// per-category totals.</param>
+    public async Task<List<UniFiDpiStat>> GetDpiStatsAsync(
+        string type = "by_app",
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching DPI stats (type={Type}) from site {Site}", type, _site);
+
+        var body = new Dictionary<string, object>
+        {
+            ["type"] = type
+        };
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiDpiStat>>(
+            () =>
+            {
+                var content = new StringContent(
+                    JsonSerializer.Serialize(body),
+                    Encoding.UTF8,
+                    "application/json");
+                return _httpClient!.PostAsync(BuildApiPath("stat/dpi"), content, cancellationToken);
+            },
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok" && response.Data != null)
+        {
+            _logger.LogDebug("Retrieved {Count} DPI entries", response.Data.Count);
+            return response.Data;
+        }
+
+        _logger.LogWarning("Failed to retrieve DPI stats or received non-ok response");
+        return new List<UniFiDpiStat>();
+    }
+
+    /// <summary>
+    /// GET stat/alarm - Get active (unarchived) alarms raised by the controller:
+    /// device disconnects, rogue AP detections, IPS alerts, etc. Read-only.
+    /// Note: archived alarms are only returned by POST stat/alarm with
+    /// {"archived": true} - not exposed here.
+    /// </summary>
+    public async Task<List<UniFiAlarm>> GetAlarmsAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching alarms from site {Site}", _site);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiAlarm>>(
+            () => _httpClient!.GetAsync(BuildApiPath("stat/alarm"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogDebug("Retrieved {Count} alarms", response.Data.Count);
+            return response.Data;
+        }
+
+        _logger.LogWarning("Failed to retrieve alarms or received non-ok response");
+        return new List<UniFiAlarm>();
+    }
+
+    /// <summary>
+    /// GET stat/event - Get recent site events (client joins/leaves, device state changes,
+    /// admin actions). Read-only. The controller caps the result set (most recent events);
+    /// use the timestamp fields on UniFiSiteEvent to filter client-side.
+    /// </summary>
+    public async Task<List<UniFiSiteEvent>> GetSiteEventsAsync(CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching site events from site {Site}", _site);
+
+        var response = await ExecuteApiCallAsync<UniFiApiResponse<UniFiSiteEvent>>(
+            () => _httpClient!.GetAsync(BuildApiPath("stat/event"), cancellationToken),
+            cancellationToken);
+
+        if (response?.Meta.Rc == "ok")
+        {
+            _logger.LogDebug("Retrieved {Count} site events", response.Data.Count);
+            return response.Data;
+        }
+
+        _logger.LogWarning("Failed to retrieve site events or received non-ok response");
+        return new List<UniFiSiteEvent>();
     }
 
     #endregion

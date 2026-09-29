@@ -127,6 +127,12 @@ public class AuditRequest
     public List<UniFiNetworkConfig>? NetworkConfigs { get; init; }
 
     /// <summary>
+    /// Optional: WLAN configurations from /rest/wlanconf API.
+    /// Used for wireless security analysis (open/legacy security, PMF, guest isolation).
+    /// </summary>
+    public List<UniFiWlanConfig>? WlanConfigs { get; init; }
+
+    /// <summary>
     /// Optional: Firewall zones from /proxy/network/v2/api/site/{site}/firewall/zone API.
     /// Used to validate zone assumptions and identify DMZ/Hotspot networks.
     /// </summary>

@@ -92,7 +92,8 @@ public class PortSecurityAnalyzer
             new UnusedPortRule(),
             new PortIsolationRule(),
             new WiredSubnetMismatchRule(),
-            new AccessPortVlanRule()
+            new AccessPortVlanRule(),
+            new StormControlRule()
         };
     }
 

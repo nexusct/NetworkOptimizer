@@ -12,6 +12,12 @@
 
   <ItemGroup>
     <ProjectReference Include="..\NetworkOptimizer.Core\NetworkOptimizer.Core.csproj" />
+    <!-- Collection-layer dependencies for the UniFi poll-cycle collectors: typed UniFi
+         API models, the Influx write path, and the alert event bus. None of these
+         reference Monitoring, so the graph stays acyclic. -->
+    <ProjectReference Include="..\NetworkOptimizer.UniFi\NetworkOptimizer.UniFi.csproj" />
+    <ProjectReference Include="..\NetworkOptimizer.Storage\NetworkOptimizer.Storage.csproj" />
+    <ProjectReference Include="..\NetworkOptimizer.Alerts\NetworkOptimizer.Alerts.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -50,6 +50,20 @@ public static class IssueTypes
     public const string AccessPortVlan = "ACCESS-VLAN-001";
     public const string VlanSubnetMismatch = "WIFI-VLAN-SUBNET-001";
     public const string WiredSubnetMismatch = "PORT-SUBNET-001";
+    public const string StormControl = "STORM-CONTROL-001";
+
+    // Wireless (WLAN) Security
+    public const string WlanOpenSsid = "WLAN-OPEN-SSID";
+    public const string WlanLegacySecurity = "WLAN-LEGACY-SECURITY";
+    public const string WlanPmfDisabled = "WLAN-PMF-DISABLED";
+    public const string WlanGuestNoIsolation = "WLAN-GUEST-NO-ISOLATION";
+
+    // Device Firmware
+    public const string FirmwareOutdated = "FIRMWARE-OUTDATED";
+    public const string FirmwareEol = "FIRMWARE-EOL";
+
+    // Multicast/mDNS
+    public const string MdnsScope = "MDNS-SCOPE-001";
 
     // UPnP Security
     public const string UpnpEnabled = "UPNP_ENABLED";
