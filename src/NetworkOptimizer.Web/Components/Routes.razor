@@ -7,6 +7,7 @@
 @inject SiteContextService SiteContext
 @inject ICallerContext Caller
 @inject ISiteAccessFilter SiteAccess
+@inject IJSRuntime JS
 
 @if (_siteResolved)
 {
@@ -16,10 +17,10 @@
            when the install has authentication disabled, so nothing changes for those installs. *@
         <AuthorizeRouteView RouteData="routeData" DefaultLayout="typeof(Layout.MainLayout)">
             <NotAuthorized Context="refused">
-                @if (refused.User.IsConfinedToMfaEnrollment())
+                @if (refused.User.IsConfinedToAccountSetup())
                 {
-                    @* Refused only because enrolment is outstanding: that has somewhere to go. *@
-                    <MfaEnrollmentRedirect />
+                    @* Refused only because account setup is outstanding: that has somewhere to go. *@
+                    <AccountSetupRedirect />
                 }
                 else
                 {
@@ -88,5 +89,17 @@
         }
 
         _siteResolved = true;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        // Stands down js/circuit-start.js: a render reaching the browser proves the circuit started.
+        if (!firstRender) return;
+        try
+        {
+            await JS.InvokeVoidAsync("noCircuitStarted");
+        }
+        catch (JSDisconnectedException) { }
+        catch (JSException) { }
     }
 }

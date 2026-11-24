@@ -1,5 +1,6 @@
 using System.Text.Json;
 using NetworkOptimizer.Core.Models;
+using NetworkOptimizer.Monitoring.Providers;
 using NetworkOptimizer.UniFi.Models;
 
 namespace NetworkOptimizer.Audit.Models;
@@ -99,6 +100,12 @@ public class AuditRequest
     public List<string>? TrustedDnsRedirectTargets { get; init; }
 
     /// <summary>
+    /// Optional: leave Guest and Hotspot networks out of DNS coverage checks (Settings: Allow Guest / Hotspot Public DNS).
+    /// Off by default: guest DNS is checked like any other network's.
+    /// </summary>
+    public bool AllowGuestPublicDns { get; init; }
+
+    /// <summary>
     /// Optional: Custom port for third-party DNS management interface (Pi-hole, AdGuard Home, etc.)
     /// If not specified, auto-probes ports 80, 443, 8080, 3000
     /// </summary>
@@ -111,6 +118,12 @@ public class AuditRequest
     public string? PiholeManagementUrl { get; init; }
 
     /// <summary>
+    /// Optional: Opens the third-party DNS probes' connections inside the audited site's network.
+    /// Null probes from this server, which is right only when the server is on that network.
+    /// </summary>
+    public IDeviceDialer? Dialer { get; init; }
+
+    /// <summary>
     /// Optional: Whether UPnP is enabled on the gateway (from GetUpnpEnabledAsync)
     /// </summary>
     public bool? UpnpEnabled { get; init; }
@@ -119,6 +132,24 @@ public class AuditRequest
     /// Optional: Port forwarding rules including UPnP mappings (from GetPortForwardRulesAsync)
     /// </summary>
     public List<UniFiPortForwardRule>? PortForwardRules { get; init; }
+
+    /// <summary>
+    /// Optional: Console accounts (GetConsoleUsersAsync). Null when the connection cannot read them;
+    /// the unused local admin check is then skipped.
+    /// </summary>
+    public List<UniFiOsUser>? ConsoleUsers { get; init; }
+
+    /// <summary>
+    /// Optional: Console API keys (GetConsoleApiKeysAsync). Null when the connection cannot read them;
+    /// the unused API key check is then skipped.
+    /// </summary>
+    public List<UniFiOsApiKey>? ConsoleApiKeys { get; init; }
+
+    /// <summary>
+    /// Optional: The account Network Optimizer signs in as. It is in use by definition, so the unused
+    /// local admin check skips it whatever its last sign-in time says.
+    /// </summary>
+    public string? ConnectedUsername { get; init; }
 
     /// <summary>
     /// Optional: Network configurations from /rest/networkconf API.
@@ -150,4 +181,19 @@ public class AuditRequest
     /// When present, port forward issues targeting actively attacked ports get severity bumps.
     /// </summary>
     public ConfigAuditEngine.ThreatContext? ThreatContext { get; init; }
+
+    /// <summary>
+    /// Optional: The gateway's own firewall state, read over gateway SSH. Null when the site has no gateway SSH or
+    /// the read failed; the gateway firewall checks are then skipped.
+    /// </summary>
+    public GatewayFirewallSnapshot? GatewayFirewall { get; init; }
+
+    /// <summary>Optional: Each WAN's data-path interface on the gateway, for the gateway firewall checks.</summary>
+    public List<GatewayWanPath>? GatewayWanInterfaces { get; init; }
+
+    /// <summary>
+    /// Optional: What Threat Intelligence's gateway agent blocking should have in place on the gateway. Null when the
+    /// site does not block through a gateway agent.
+    /// </summary>
+    public GatewayBlocklistExpectation? GatewayBlocklist { get; init; }
 }

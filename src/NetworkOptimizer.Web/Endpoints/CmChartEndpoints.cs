@@ -6,10 +6,15 @@ namespace NetworkOptimizer.Web.Endpoints;
 
 /// <summary>
 /// REST endpoint for cable modem aggregate time-series data.
-/// Returns DS power, DS SNR, US power, and error counter deltas.
+/// Returns DS power, DS SNR, US power, and error counter deltas, plus, for modems that report
+/// them, the DOCSIS state, the modem's own event log, and event marks for the charts. Each modem
+/// also carries its latest poll's channels for the Channel Spectrum.
 /// </summary>
 public static class CmChartEndpoints
 {
+    /// <summary>Entries of a modem's own log sent for the table, newest first.</summary>
+    private const int MaxLogEntries = 50;
+
     public static void Map(WebApplication app)
     {
         // Gate 2 (design doc 06): the whole group carries authorization metadata, which is what
@@ -43,6 +48,36 @@ public static class CmChartEndpoints
 
             var configs = await cmService.GetConfigsAsync();
             var nameMap = configs.ToDictionary(c => c.Id.ToString(), c => c.Name);
+            var cached = await cmService.GetAllCachedStatsAsync();
+
+            // Marks come from the modem's logged events in the window. Notice/Information lines
+            // (profile changes and the like arrive every few minutes) are left to the log table so
+            // the marks stay the things worth looking at: recognised events and warnings or worse.
+            // Only modems that keep an event log are asked for marks: the rest have none, and the
+            // chart polls every few seconds.
+            var logging = configs
+                .Where(c => c.Provider == NetworkOptimizer.Web.Services.CableModemProviders.Uci.UciInformService.ProviderKey
+                            || (cached.TryGetValue(c.Id, out var s) && s.Events.Count > 0))
+                .Select(c => c.Id.ToString())
+                .ToHashSet();
+            var events = new List<object>();
+            foreach (var id in data.Keys.Where(k => nameMap.ContainsKey(k) && logging.Contains(k)))
+            {
+                var logged = await influx.QueryCableModemLogEventsAsync(id, queryFrom, queryTo, ct);
+                foreach (var e in logged.Where(e => e.Kind != null || MarkSeverity(e.Level) != "info"))
+                {
+                    events.Add(new
+                    {
+                        key = id,
+                        time = e.At.ToString("o"),
+                        kind = "alert",
+                        severity = MarkSeverity(e.Level),
+                        title = MarkTitle(e.Kind, e.Level),
+                        detail = e.Text,
+                        device = nameMap[id],
+                    });
+                }
+            }
 
             // Only surface modems that still have a config. Deleting a CM config
             // leaves its historical series in InfluxDB; without this filter those
@@ -55,6 +90,7 @@ public static class CmChartEndpoints
 
                 // Current state for the detail table, sent once per modem rather than per point.
                 var pts = kvp.Value;
+                var stats = int.TryParse(kvp.Key, out var cmIdNum) && cached.TryGetValue(cmIdNum, out var s) ? s : null;
 
                 return new
                 {
@@ -64,7 +100,44 @@ public static class CmChartEndpoints
                     {
                         lockedDsChannels = pts.Select(p => p.LockedDsChannels).LastOrDefault(v => v != null),
                         lockedUsChannels = pts.Select(p => p.LockedUsChannels).LastOrDefault(v => v != null),
+                        docsisMode = stats?.DocsisState?.Mode,
+                        docsisState = stats?.DocsisState?.State,
+                        reinitReason = stats?.DocsisState?.ReinitReason,
+                        firmware = stats?.FirmwareVersion,
+                        uptimeSeconds = stats?.UptimeSeconds,
                     },
+                    // The latest poll's channels for the spectrum. Per-channel values are cached, not
+                    // stored, so this is always the current state whatever window the charts show.
+                    spectrum = stats == null ? null : new
+                    {
+                        polledAt = stats.Timestamp.ToString("o"),
+                        ds = stats.DownstreamChannels.Select(c => new
+                        {
+                            id = c.ChannelId,
+                            freq = c.Frequency,
+                            pwr = c.Power,
+                            snr = c.Snr,
+                            mod = c.Modulation,
+                            locked = IsLocked(c.LockStatus),
+                            corr = c.Correctables,
+                            uncorr = c.Uncorrectables,
+                        }),
+                        us = stats.UpstreamChannels.Select(c => new
+                        {
+                            id = c.ChannelId,
+                            freq = c.Frequency,
+                            pwr = c.Power,
+                            type = c.ChannelType,
+                            mod = c.Modulation,
+                            locked = IsLocked(c.LockStatus),
+                        }),
+                    },
+                    log = (stats?.Events ?? []).AsEnumerable().Reverse().Take(MaxLogEntries).Select(e => new
+                    {
+                        time = e.Time?.ToString("o"),
+                        level = e.Level,
+                        text = e.Text,
+                    }),
                     data = kvp.Value.Select(p => new
                     {
                         time = p.Time.ToString("o"),
@@ -79,7 +152,27 @@ public static class CmChartEndpoints
                 };
             });
 
-            return Results.Ok(new { devices = result });
+            return Results.Ok(new { devices = result, events });
         });
     }
+
+    /// <summary>The lock test the aggregates use, so the spectrum and the channel counts agree.</summary>
+    private static bool IsLocked(string? lockStatus) =>
+        string.Equals(lockStatus, "Locked", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>DOCSIS log level to the mark layer's severity scale.</summary>
+    internal static string MarkSeverity(string? level) => (level ?? "").Trim().ToLowerInvariant() switch
+    {
+        "emergency" or "alert" or "critical" => "critical",
+        "error" or "warning" => "warning",
+        _ => "info",
+    };
+
+    private static string MarkTitle(string? kind, string? level) => kind switch
+    {
+        NetworkOptimizer.Monitoring.Models.CmEventKinds.T3Timeout => "T3 timeout",
+        NetworkOptimizer.Monitoring.Models.CmEventKinds.T4Timeout => "T4 timeout",
+        NetworkOptimizer.Monitoring.Models.CmEventKinds.RangingFailure => "Ranging failure",
+        _ => string.IsNullOrWhiteSpace(level) ? "DOCSIS event" : $"DOCSIS {level.Trim()}",
+    };
 }

@@ -24,6 +24,12 @@ public enum ApAgentState
     /// <summary>Answering with 401. The agent runs; the server holds the wrong token.</summary>
     Unauthorized,
 
+    /// <summary>
+    /// Answering with 401 because the AP's clock is outside the signature window. No token or
+    /// restart fixes it; the AP needs working NTP.
+    /// </summary>
+    ClockSkewed,
+
     /// <summary>The AP refused the connection: it is reachable and nothing is listening.</summary>
     NotListening,
 
@@ -57,6 +63,12 @@ public enum ApAgentAction
 
     /// <summary>Report the path problem. Redeploying cannot fix a blocked path, and SSH is blocked too.</summary>
     SurfacePathProblem,
+
+    /// <summary>
+    /// Report the AP's clock. Nothing on our side fixes it, and the probe is cheap, so it is not
+    /// backed off: the next pass sees the fix as soon as NTP corrects the clock.
+    /// </summary>
+    SurfaceClockProblem,
 
     /// <summary>Wait for the AP to come back. Do not burn SSH attempts on a device that is down.</summary>
     Wait,
@@ -101,6 +113,7 @@ public enum ApAgentReach
 /// <param name="Health">Parsed /health body, when one came back.</param>
 /// <param name="ExpectedBinaryVersion">The contract version this server ships.</param>
 /// <param name="Detail">Free-text reason carried through to the operator.</param>
+/// <param name="ClockOffset">The agent's clock minus ours, from the reply's Date header, when it carried one.</param>
 public sealed record ApAgentObservation(
     ApAgentReach Reach,
     int? HttpStatus = null,
@@ -108,7 +121,8 @@ public sealed record ApAgentObservation(
     bool SupportedArchitecture = true,
     ApAgentHealthPayload? Health = null,
     int ExpectedBinaryVersion = 0,
-    string? Detail = null);
+    string? Detail = null,
+    TimeSpan? ClockOffset = null);
 
 /// <summary>The fields of the AP Agent's GET /health the server acts on.</summary>
 /// <param name="Version">Agent release version.</param>
@@ -123,7 +137,8 @@ public sealed record ApAgentHealthPayload(
     DateTime LastProbeRun,
     DateTime CollectedAt,
     bool Degraded,
-    IReadOnlyList<string> Unavailable);
+    IReadOnlyList<string> Unavailable,
+    IReadOnlyList<string>? NativeVoluntaryVaps = null);
 
 /// <summary>The classifier's verdict: what the AP is doing, and what to do about it.</summary>
 /// <param name="State">The condition observed.</param>
@@ -149,7 +164,13 @@ public sealed class ApAgentSshStatus
     /// <summary>Firmware string from /usr/lib/version.</summary>
     public string? Firmware { get; set; }
 
-    /// <summary>Whether an AP Agent build exists for <see cref="Machine"/>.</summary>
+    /// <summary>"little" or "big" from the ELF header, read on MIPS only, where <c>uname -m</c> cannot tell.</summary>
+    public string? ByteOrder { get; set; }
+
+    /// <summary>The build this AP runs (<see cref="ApAgentPaths.BinaryNameFor"/>), or null when there is none.</summary>
+    public string? BinaryName { get; set; }
+
+    /// <summary>Whether an AP Agent build exists for <see cref="Machine"/> and <see cref="ByteOrder"/>.</summary>
     public bool SupportedArchitecture { get; set; }
 
     /// <summary>Whether the agent binary is present and executable on the AP.</summary>
@@ -229,6 +250,9 @@ public sealed class ApAgentFleetEntry
 
     /// <summary>Whether the server is deploying to (or otherwise working on) this AP right now.</summary>
     public bool DeployInProgress { get; set; }
+
+    /// <summary>Whether the server is removing the agent from this AP right now.</summary>
+    public bool RemoveInProgress { get; set; }
 
     /// <summary>The AP's last observed agent state.</summary>
     public ApAgentState State { get; set; } = ApAgentState.Unknown;

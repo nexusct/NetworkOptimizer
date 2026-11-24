@@ -461,7 +461,8 @@ public class FirewallRuleAnalyzerTests
         };
 
         // Act
-        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true);
+        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true,
+            cellularDevices: CreateCellularDevices());
 
         // Assert - 5G rule by IP satisfies the requirement
         issues.Should().BeEmpty();
@@ -506,7 +507,8 @@ public class FirewallRuleAnalyzerTests
         };
 
         // Act
-        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true);
+        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true,
+            cellularDevices: CreateCellularDevices());
 
         // Assert - 5G rule by MAC satisfies the requirement
         issues.Should().BeEmpty();
@@ -909,6 +911,56 @@ public class FirewallRuleAnalyzerTests
         issues.Should().Contain(i => i.Type == "MGMT_MISSING_UNIFI_ACCESS");
     }
 
+    [Theory]
+    [InlineData("CUSTOM", new[] { "INVALID" }, false)]
+    [InlineData("ALL", new string[0], true)]
+    [InlineData("CUSTOM", new[] { "NEW", "INVALID" }, true)]
+    public void AnalyzeManagementNetworkFirewallAccess_BlockAboveUniFiAllow_EclipsesOnlyWhenItBlocksNew(
+        string stateType, string[] states, bool expectMissing)
+    {
+        // A block on INVALID packets ahead of the UniFi allow leaves new HTTPS sessions to ui.com open
+        var mgmtNetworkId = "mgmt-network-123";
+        var externalZoneId = "external-zone-123";
+        var networks = new List<NetworkInfo>
+        {
+            CreateNetwork("Management", NetworkPurpose.Management, id: mgmtNetworkId, networkIsolationEnabled: true, internetAccessEnabled: false)
+        };
+        var rules = new List<FirewallRule>
+        {
+            new FirewallRule
+            {
+                Id = "block-external",
+                Name = "Block External",
+                Action = "DROP",
+                Enabled = true,
+                Index = 100,
+                SourceMatchingTarget = "NETWORK",
+                SourceNetworkIds = new List<string> { mgmtNetworkId },
+                DestinationMatchingTarget = "ANY",
+                DestinationZoneId = externalZoneId,
+                Protocol = "all",
+                ConnectionStateType = stateType,
+                ConnectionStates = [.. states]
+            },
+            new FirewallRule
+            {
+                Id = "allow-unifi",
+                Name = "Allow UniFi Access",
+                Action = "ALLOW",
+                Enabled = true,
+                Index = 200,
+                SourceMatchingTarget = "NETWORK",
+                SourceNetworkIds = new List<string> { mgmtNetworkId },
+                WebDomains = new List<string> { "ui.com" },
+                Protocol = "tcp"
+            }
+        };
+
+        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, externalZoneId: externalZoneId);
+
+        issues.Any(i => i.Type == "MGMT_MISSING_UNIFI_ACCESS").Should().Be(expectMissing);
+    }
+
     [Fact]
     public void AnalyzeManagementNetworkFirewallAccess_UniFiAccessRuleNotEclipsed_NoIssue()
     {
@@ -1244,6 +1296,80 @@ public class FirewallRuleAnalyzerTests
         issues.Should().NotContain(i => i.Type == "MGMT_MISSING_AFC_ACCESS");
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    public void AnalyzeManagementNetworkFirewallAccess_IpListBlockRule_EclipsesOnlyWhenInverted(bool matchOpposite, bool expectIssues)
+    {
+        // A block list (all protocols to listed External IPs) above the allows covers none of the
+        // allowed destinations; inverted, it blocks everything outside the list and does.
+        var mgmtNetworkId = "mgmt-network-123";
+        var externalZoneId = "external-zone-123";
+        var networks = new List<NetworkInfo>
+        {
+            CreateNetwork("Management", NetworkPurpose.Management, id: mgmtNetworkId, networkIsolationEnabled: true, internetAccessEnabled: false)
+        };
+        var rules = new List<FirewallRule>
+        {
+            new FirewallRule
+            {
+                Id = "block-list-outbound",
+                Name = "Block List (Outbound)",
+                Action = "BLOCK",
+                Enabled = true,
+                Index = 100,
+                SourceMatchingTarget = "ANY",
+                DestinationMatchingTarget = "IP",
+                DestinationIps = new List<string> { "198.51.100.0/24", "203.0.113.7" },
+                DestinationMatchOppositeIps = matchOpposite,
+                DestinationZoneId = externalZoneId,
+                Protocol = "all"
+            },
+            CreateFirewallRule("UniFi Cloud", action: "allow", index: 200,
+                sourceNetworkIds: new List<string> { mgmtNetworkId },
+                webDomains: new List<string> { "ui.com" }),
+            CreateFirewallRule("AFC Traffic", action: "allow", index: 201,
+                sourceNetworkIds: new List<string> { mgmtNetworkId },
+                webDomains: new List<string> { "afcapi.qcs.qualcomm.com" }),
+            new FirewallRule
+            {
+                Id = "allow-ntp",
+                Name = "Allow NTP",
+                Action = "ALLOW",
+                Enabled = true,
+                Index = 202,
+                SourceMatchingTarget = "NETWORK",
+                SourceNetworkIds = new List<string> { mgmtNetworkId },
+                DestinationZoneId = externalZoneId,
+                DestinationPort = "123",
+                Protocol = "udp"
+            },
+            CreateFirewallRule("Allow FW Download", action: "allow", index: 203,
+                sourceNetworkIds: new List<string> { mgmtNetworkId },
+                webDomains: new List<string> { "ubnt.com" }),
+            new FirewallRule
+            {
+                Id = "allow-5g",
+                Name = "5G Modem Registration",
+                Action = "ALLOW",
+                Enabled = true,
+                Index = 204,
+                SourceMatchingTarget = "NETWORK",
+                SourceNetworkIds = new List<string> { mgmtNetworkId },
+                WebDomains = new List<string> { "t-mobile.com" },
+                Protocol = "tcp"
+            }
+        };
+
+        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true, externalZoneId: externalZoneId);
+
+        var types = new[] { "MGMT_MISSING_UNIFI_ACCESS", "MGMT_MISSING_AFC_ACCESS", "MGMT_MISSING_NTP_ACCESS", "MGMT_MISSING_5G_ACCESS", "MGMT_MISSING_FIRMWARE_DOWNLOAD" };
+        if (expectIssues)
+            issues.Select(i => i.Type).Should().Contain(types);
+        else
+            issues.Select(i => i.Type).Should().NotContain(types);
+    }
+
     [Fact]
     public void AnalyzeManagementNetworkFirewallAccess_CidrBlockRuleEclipsesIpAllow_Reports5GIssue()
     {
@@ -1297,7 +1423,8 @@ public class FirewallRuleAnalyzerTests
                 webDomains: new List<string> { "ubnt.com" })
         };
 
-        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true, externalZoneId: externalZoneId);
+        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true,
+            externalZoneId: externalZoneId, cellularDevices: CreateCellularDevices());
 
         // 5G allow at 192.168.99.5 is eclipsed by block at 192.168.99.0/24
         issues.Should().Contain(i => i.Type == "MGMT_MISSING_5G_ACCESS");
@@ -1356,7 +1483,8 @@ public class FirewallRuleAnalyzerTests
                 webDomains: new List<string> { "ubnt.com" })
         };
 
-        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true, externalZoneId: externalZoneId);
+        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true,
+            externalZoneId: externalZoneId, cellularDevices: CreateCellularDevices());
 
         // 5G allow at 192.168.99.5 is NOT covered by block at 10.0.0.0/8
         issues.Should().NotContain(i => i.Type == "MGMT_MISSING_5G_ACCESS");
@@ -1418,7 +1546,8 @@ public class FirewallRuleAnalyzerTests
                 webDomains: new List<string> { "ubnt.com" })
         };
 
-        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true, externalZoneId: externalZoneId);
+        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true,
+            externalZoneId: externalZoneId, cellularDevices: CreateCellularDevices());
 
         issues.Should().NotContain(i => i.Type == "MGMT_MISSING_5G_ACCESS");
     }
@@ -1465,7 +1594,8 @@ public class FirewallRuleAnalyzerTests
             }
         };
 
-        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true, externalZoneId: externalZoneId);
+        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true,
+            externalZoneId: externalZoneId, cellularDevices: CreateCellularDevices());
 
         issues.Should().Contain(i => i.Type == "MGMT_MISSING_5G_ACCESS");
     }
@@ -1511,7 +1641,8 @@ public class FirewallRuleAnalyzerTests
             }
         };
 
-        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true, externalZoneId: externalZoneId);
+        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true,
+            externalZoneId: externalZoneId, cellularDevices: CreateCellularDevices());
 
         issues.Should().Contain(i => i.Type == "MGMT_MISSING_5G_ACCESS");
     }
@@ -1571,7 +1702,8 @@ public class FirewallRuleAnalyzerTests
                 webDomains: new List<string> { "ubnt.com" })
         };
 
-        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true, externalZoneId: externalZoneId);
+        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks, has5GDevice: true,
+            externalZoneId: externalZoneId, cellularDevices: CreateCellularDevices());
 
         // 192.168.99.5 is not in the exception list (192.168.50.0/24), so it's blocked
         issues.Should().Contain(i => i.Type == "MGMT_MISSING_5G_ACCESS");
@@ -1638,12 +1770,15 @@ public class FirewallRuleAnalyzerTests
     // Firmware needs fw-download.ubnt.com AND fw-update.ubnt.com. Either both are named, or a rule
     // covers ubnt.com itself, which is an effective wildcard over both.
     private List<FirewallRule> FirmwareAccessRules(string mgmtNetworkId, params string[] ubntDomains)
+        => FirmwareAccessRulesWithCloud(mgmtNetworkId, "ui.com", ubntDomains);
+
+    private List<FirewallRule> FirmwareAccessRulesWithCloud(string mgmtNetworkId, string cloudDomain, params string[] ubntDomains)
     {
         var rules = new List<FirewallRule>
         {
             CreateFirewallRule("Allow UniFi Access", action: "allow",
                 sourceNetworkIds: new List<string> { mgmtNetworkId },
-                webDomains: new List<string> { "ui.com" }),
+                webDomains: new List<string> { cloudDomain }),
             CreateFirewallRule("Allow AFC Traffic", action: "allow",
                 sourceNetworkIds: new List<string> { mgmtNetworkId },
                 webDomains: new List<string> { "afcapi.qcs.qualcomm.com" }),
@@ -1701,6 +1836,37 @@ public class FirewallRuleAnalyzerTests
         var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks);
 
         issues.Should().ContainSingle(issue => issue.Type == IssueTypes.MgmtMissingFirmwareDownload);
+    }
+
+    // The release-note download links come from dl.ui.com, which a rule for ui.com as a whole covers.
+    [Fact]
+    public void AnalyzeManagementNetworkFirewallAccess_UbntWithoutDlUi_FlagsFirmwareCheck()
+    {
+        var mgmtNetworkId = "mgmt-network-123";
+        var networks = new List<NetworkInfo>
+        {
+            CreateNetwork("Management", NetworkPurpose.Management, id: mgmtNetworkId, networkIsolationEnabled: true, internetAccessEnabled: false)
+        };
+        var rules = FirmwareAccessRulesWithCloud(mgmtNetworkId, "unifi.ui.com", "ubnt.com");
+
+        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks);
+
+        issues.Should().ContainSingle(issue => issue.Type == IssueTypes.MgmtMissingFirmwareDownload);
+    }
+
+    [Fact]
+    public void AnalyzeManagementNetworkFirewallAccess_UbntAndDlUi_SatisfiesFirmwareCheck()
+    {
+        var mgmtNetworkId = "mgmt-network-123";
+        var networks = new List<NetworkInfo>
+        {
+            CreateNetwork("Management", NetworkPurpose.Management, id: mgmtNetworkId, networkIsolationEnabled: true, internetAccessEnabled: false)
+        };
+        var rules = FirmwareAccessRulesWithCloud(mgmtNetworkId, "unifi.ui.com", "ubnt.com", "dl.ui.com");
+
+        var issues = _analyzer.AnalyzeManagementNetworkFirewallAccess(rules, networks);
+
+        issues.Should().NotContain(issue => issue.Type == IssueTypes.MgmtMissingFirmwareDownload);
     }
 
 #endregion
@@ -1934,6 +2100,145 @@ public class FirewallRuleAnalyzerTests
         issues.Should().HaveCount(4);
     }
 
+    private FirewallRule ParseIpVersionPolicy(
+        string id, string action, int index, string? ipVersion,
+        string sourceJson, string destJson, string protocol = "all")
+    {
+        var ipVersionJson = ipVersion == null ? "" : $@"""ip_version"": ""{ipVersion}"",";
+        return _analyzer.ParseFirewallPolicy(System.Text.Json.JsonDocument.Parse($@"{{
+            ""_id"": ""{id}"",
+            ""name"": ""{id}"",
+            ""action"": ""{action}"",
+            ""enabled"": true,
+            ""index"": {index},
+            {ipVersionJson}
+            ""protocol"": ""{protocol}"",
+            ""source"": {sourceJson},
+            ""destination"": {destJson}
+        }}").RootElement)!;
+    }
+
+    private const string AnyLanSource = @"{ ""matching_target"": ""ANY"", ""zone_id"": ""lan-zone"" }";
+    private const string AnyExternalDest = @"{ ""matching_target"": ""ANY"", ""zone_id"": ""external-zone"" }";
+
+    [Fact]
+    public void DetectShadowedRules_DnsLockdownSplitByIpVersion_NoCrossFamilySubvert()
+    {
+        // Issue #1231: per-family authorized-client allows ahead of per-family "NOT authorized"
+        // DoH blocks. An IPv4-only allow cannot subvert an IPv6-only block, and vice versa.
+        var rules = new List<FirewallRule>
+        {
+            ParseIpVersionPolicy("allow-dns-v4", "ALLOW", 10000, "IPV4",
+                @"{ ""matching_target"": ""IP"", ""ips"": [""192.0.2.10"", ""192.0.2.11""], ""zone_id"": ""lan-zone"" }",
+                @"{ ""matching_target"": ""ANY"", ""port"": ""53,443,853"", ""zone_id"": ""external-zone"" }",
+                protocol: "tcp_udp"),
+            ParseIpVersionPolicy("allow-dns-v6", "ALLOW", 10001, "IPV6",
+                @"{ ""matching_target"": ""IP"", ""ips"": [""2001:db8::10"", ""2001:db8::11""], ""zone_id"": ""lan-zone"" }",
+                @"{ ""matching_target"": ""ANY"", ""port"": ""53,443,853"", ""zone_id"": ""external-zone"" }",
+                protocol: "tcp_udp"),
+            ParseIpVersionPolicy("block-doh-v4", "BLOCK", 10002, "IPV4",
+                @"{ ""matching_target"": ""IP"", ""ips"": [""192.0.2.10"", ""192.0.2.11""], ""match_opposite_ips"": true, ""zone_id"": ""lan-zone"" }",
+                @"{ ""matching_target"": ""IP"", ""ips"": [""198.51.100.1"", ""198.51.100.2""], ""port"": ""443"", ""zone_id"": ""external-zone"" }",
+                protocol: "tcp"),
+            ParseIpVersionPolicy("block-doh-v6", "BLOCK", 10003, "IPV6",
+                @"{ ""matching_target"": ""IP"", ""ips"": [""2001:db8::10"", ""2001:db8::11""], ""match_opposite_ips"": true, ""zone_id"": ""lan-zone"" }",
+                @"{ ""matching_target"": ""IP"", ""ips"": [""2001:db8:ffff::1""], ""port"": ""443"", ""zone_id"": ""external-zone"" }",
+                protocol: "tcp")
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules, networkConfigs: null, externalZoneId: "external-zone");
+
+        issues.Should().NotContain(i => i.Type == IssueTypes.AllowSubvertsDeny);
+        issues.Should().NotContain(i => i.Type == IssueTypes.DenyShadowsAllow);
+    }
+
+    [Fact]
+    public void DetectShadowedRules_AutomaticBlockingsOwnPolicies_AreNotComparedWithEachOther()
+    {
+        var rules = new List<FirewallRule>
+        {
+            ParseIpVersionPolicy(ManagedFirewallPolicies.Blocklist, "BLOCK", 1, "IPV4", AnyLanSource, AnyExternalDest),
+            ParseIpVersionPolicy(ManagedFirewallPolicies.Exception, "ALLOW", 2, "IPV4", AnyLanSource, AnyExternalDest),
+            ParseIpVersionPolicy(ManagedFirewallPolicies.PublicListsOutbound, "BLOCK", 3, "IPV4", AnyLanSource, AnyExternalDest)
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules, networkConfigs: null, externalZoneId: "external-zone");
+
+        issues.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectShadowedRules_UserDenyBeforeAnException_IsStillReported()
+    {
+        var rules = new List<FirewallRule>
+        {
+            ParseIpVersionPolicy("block-all", "BLOCK", 1, "IPV4", AnyLanSource, AnyExternalDest),
+            ParseIpVersionPolicy(ManagedFirewallPolicies.Exception, "ALLOW", 2, "IPV4", AnyLanSource, AnyExternalDest)
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules, networkConfigs: null, externalZoneId: "external-zone");
+
+        issues.Should().ContainSingle(i => i.Type == IssueTypes.DenyShadowsAllow);
+    }
+
+    [Theory]
+    [InlineData("IPV4", "IPV4")]
+    [InlineData("IPV6", "IPV6")]
+    [InlineData("IPV4", "BOTH")]
+    [InlineData("BOTH", "IPV6")]
+    [InlineData(null, "IPV4")]
+    [InlineData(null, null)]
+    public void DetectShadowedRules_AllowBeforeDeny_SharedIpFamily_StillReturnsSubvertIssue(string? allowVersion, string? denyVersion)
+    {
+        var rules = new List<FirewallRule>
+        {
+            ParseIpVersionPolicy("allow-all", "ALLOW", 1, allowVersion, AnyLanSource, AnyExternalDest),
+            ParseIpVersionPolicy("block-all", "BLOCK", 2, denyVersion, AnyLanSource, AnyExternalDest)
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules, networkConfigs: null, externalZoneId: "external-zone");
+
+        issues.Should().ContainSingle(i => i.Type == IssueTypes.AllowSubvertsDeny);
+    }
+
+    [Theory]
+    [InlineData("IPV4", "IPV6")]
+    [InlineData("IPV6", "IPV4")]
+    public void DetectShadowedRules_AllowBeforeDeny_DisjointIpFamilies_ReturnsNoIssues(string allowVersion, string denyVersion)
+    {
+        var rules = new List<FirewallRule>
+        {
+            ParseIpVersionPolicy("allow-all", "ALLOW", 1, allowVersion, AnyLanSource, AnyExternalDest),
+            ParseIpVersionPolicy("block-all", "BLOCK", 2, denyVersion, AnyLanSource, AnyExternalDest)
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules, networkConfigs: null, externalZoneId: "external-zone");
+
+        issues.Should().BeEmpty();
+    }
+
+    [Theory]
+    [InlineData("IPV4", "IPV4", true)]
+    [InlineData("BOTH", "IPV6", true)]
+    [InlineData(null, "IPV4", true)]
+    [InlineData("IPV6", "IPV4", false)]
+    [InlineData("IPV4", "IPV6", false)]
+    public void DetectShadowedRules_DenyBeforeAllow_ShadowsOnlyWithinSharedIpFamily(string? denyVersion, string? allowVersion, bool expectShadow)
+    {
+        var rules = new List<FirewallRule>
+        {
+            ParseIpVersionPolicy("block-all", "BLOCK", 1, denyVersion, AnyLanSource, AnyExternalDest),
+            ParseIpVersionPolicy("allow-all", "ALLOW", 2, allowVersion, AnyLanSource, AnyExternalDest)
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules, networkConfigs: null, externalZoneId: "external-zone");
+
+        if (expectShadow)
+            issues.Should().ContainSingle(i => i.Type == IssueTypes.DenyShadowsAllow);
+        else
+            issues.Should().BeEmpty();
+    }
+
     [Fact]
     public void DetectShadowedRules_MacScopedDenyBeforeMacScopedAllow_SameDevice_ReturnsShadowedIssue()
     {
@@ -2007,6 +2312,337 @@ public class FirewallRuleAnalyzerTests
         var issues = _analyzer.DetectShadowedRules(rules);
 
         issues.Should().BeEmpty();
+    }
+
+    private const string AnyInternalSource = @"{ ""matching_target"": ""ANY"", ""zone_id"": ""internal-zone"" }";
+    private const string AnyGatewayDest = @"{ ""matching_target"": ""ANY"", ""zone_id"": ""gateway-zone"" }";
+
+    [Theory]
+    [InlineData("icmpv6", "IPV6")]
+    [InlineData("icmp", "IPV4")]
+    [InlineData("icmpv6", "BOTH")]
+    public void DetectShadowedRules_IcmpOnlyAllowBeforeAllProtocolDeny_IsExceptionPattern(string protocol, string ipVersion)
+    {
+        // An ICMP control-plane allow (ND, RA, ping) above a zone-wide block to the gateway, no ports on either
+        var rules = new List<FirewallRule>
+        {
+            ParseIpVersionPolicy("allow-icmp-control", "ALLOW", 10000, ipVersion, AnyInternalSource, AnyGatewayDest, protocol),
+            ParseIpVersionPolicy("block-gateway", "BLOCK", 10001, "BOTH", AnyInternalSource, AnyGatewayDest)
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules);
+
+        issues.Should().NotContain(i => i.Type == IssueTypes.AllowSubvertsDeny);
+        issues.Should().ContainSingle(i => i.Type == IssueTypes.AllowExceptionPattern);
+    }
+
+    [Theory]
+    [InlineData("tcp", "all")]
+    [InlineData("udp", "all")]
+    [InlineData("tcp_udp", "all")]
+    [InlineData("icmpv6", "icmpv6")]
+    public void DetectShadowedRules_PortlessAllowNotNarrowerByProtocol_IsStillReported(string allowProtocol, string denyProtocol)
+    {
+        var rules = new List<FirewallRule>
+        {
+            ParseIpVersionPolicy("allow-broad", "ALLOW", 10000, "BOTH", AnyInternalSource, AnyGatewayDest, allowProtocol),
+            ParseIpVersionPolicy("block-gateway", "BLOCK", 10001, "BOTH", AnyInternalSource, AnyGatewayDest, denyProtocol)
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules);
+
+        issues.Should().ContainSingle(i => i.Type == IssueTypes.AllowSubvertsDeny);
+    }
+
+    private static string InternalSourceFromPort(string port, bool opposite = false) =>
+        $@"{{ ""matching_target"": ""ANY"", ""port_matching_type"": ""SPECIFIC"", ""port"": ""{port}"", ""match_opposite_ports"": {(opposite ? "true" : "false")}, ""zone_id"": ""internal-zone"" }}";
+
+    [Fact]
+    public void DetectShadowedRules_SourcePortOnlyAllow_SaysTheSenderPicksThePort()
+    {
+        // An "Allow mDNS reply" shape: from source port 5353, any protocol, any port into the Gateway zone
+        var rules = new List<FirewallRule>
+        {
+            ParseIpVersionPolicy("Allow mDNS reply", "ALLOW", 10000, "BOTH", InternalSourceFromPort("5353"), AnyGatewayDest),
+            ParseIpVersionPolicy("Block Other Gateway Access", "BLOCK", 10001, "BOTH", AnyInternalSource, AnyGatewayDest)
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules);
+
+        var issue = issues.Should().ContainSingle(i => i.Type == IssueTypes.AllowSubvertsDeny).Subject;
+        issue.Severity.Should().Be(AuditSeverity.Recommended);
+        issue.ScoreImpact.Should().Be(2);
+        issue.Message.Should().Be("Allow rule 'Allow mDNS reply' lets traffic from source port 5353 past deny rule 'Block Other Gateway Access', on any port and protocol");
+        issue.RecommendedAction.Should().Be("A source port is chosen by the sender, so any device can use it to reach what the deny blocks. Set the allow's protocol and destination port (for mDNS replies: UDP, destination port 5353).");
+    }
+
+    [Fact]
+    public void DetectShadowedRules_SourcePortOnlyAllowWithAProtocol_OmitsProtocolAndTheMdnsExample()
+    {
+        var rules = new List<FirewallRule>
+        {
+            ParseIpVersionPolicy("allow-from-1900", "ALLOW", 10000, "BOTH", InternalSourceFromPort("1900"), AnyGatewayDest, "udp"),
+            ParseIpVersionPolicy("block-gateway", "BLOCK", 10001, "BOTH", AnyInternalSource, AnyGatewayDest)
+        };
+
+        var issue = _analyzer.DetectShadowedRules(rules).Should().ContainSingle(i => i.Type == IssueTypes.AllowSubvertsDeny).Subject;
+
+        issue.Message.Should().Be("Allow rule 'allow-from-1900' lets traffic from source port 1900 past deny rule 'block-gateway', on any port");
+        issue.RecommendedAction.Should().Be("A source port is chosen by the sender, so any device can use it to reach what the deny blocks. Set the allow's protocol and destination port to the traffic it is meant for.");
+    }
+
+    [Fact]
+    public void DetectShadowedRules_SourcePortAllowWithADestinationPort_IsAnException()
+    {
+        // The recommended fix: UDP to destination port 5353 is a narrow exception, not a Rule Order Issue
+        var rules = new List<FirewallRule>
+        {
+            ParseIpVersionPolicy("Allow mDNS reply", "ALLOW", 10000, "BOTH", InternalSourceFromPort("5353"),
+                @"{ ""matching_target"": ""ANY"", ""port_matching_type"": ""SPECIFIC"", ""port"": ""5353"", ""zone_id"": ""gateway-zone"" }", "udp"),
+            ParseIpVersionPolicy("Block Other Gateway Access", "BLOCK", 10001, "BOTH", AnyInternalSource, AnyGatewayDest)
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules);
+
+        issues.Should().NotContain(i => i.Type == IssueTypes.AllowSubvertsDeny);
+        issues.Should().ContainSingle(i => i.Type == IssueTypes.AllowExceptionPattern);
+    }
+
+    [Fact]
+    public void DetectShadowedRules_AllowWithAnUndescribableNarrowing_KeepsTheRuleOrderText()
+    {
+        // "Every source port but 5353" is not a source-port-only allow, and its slice cannot be named
+        var rules = new List<FirewallRule>
+        {
+            ParseIpVersionPolicy("allow-broad", "ALLOW", 10000, "BOTH", InternalSourceFromPort("5353", opposite: true), AnyGatewayDest),
+            ParseIpVersionPolicy("block-gateway", "BLOCK", 10001, "BOTH", AnyInternalSource, AnyGatewayDest)
+        };
+
+        var issue = _analyzer.DetectShadowedRules(rules).Should().ContainSingle(i => i.Type == IssueTypes.AllowSubvertsDeny).Subject;
+
+        issue.ScoreImpact.Should().Be(5);
+        issue.Message.Should().Be("Allow rule 'allow-broad' may subvert deny rule 'block-gateway'");
+        issue.RecommendedAction.Should().Be("Review rule order - the deny rule may never match due to the earlier allow rule.");
+        issue.Metadata!["subversion"].Should().Be("unknown");
+        issue.Metadata.Should().NotContainKey("slice");
+    }
+
+    [Fact]
+    public void DetectShadowedRules_AllowCoveringTheWholeDeny_SaysTheDenyNeverMatches()
+    {
+        var rules = new List<FirewallRule>
+        {
+            ParseIpVersionPolicy("allow-broad", "ALLOW", 10000, "BOTH", AnyInternalSource, AnyGatewayDest),
+            ParseIpVersionPolicy("block-gateway", "BLOCK", 10001, "BOTH", AnyInternalSource, AnyGatewayDest)
+        };
+
+        var issue = _analyzer.DetectShadowedRules(rules).Should().ContainSingle(i => i.Type == IssueTypes.AllowSubvertsDeny).Subject;
+
+        issue.Severity.Should().Be(AuditSeverity.Recommended);
+        issue.ScoreImpact.Should().Be(5);
+        issue.Message.Should().Be("Allow rule 'allow-broad' matches all traffic deny rule 'block-gateway' blocks, so the deny rule never matches");
+        issue.RecommendedAction.Should().Be("Move the deny rule above the allow rule, or narrow the allow rule to the traffic it is meant for.");
+        issue.Metadata!["subversion"].Should().Be("total");
+    }
+
+    [Fact]
+    public void DetectShadowedRules_DnsPortAllowBeforeAnyDeny_NamesTheSliceTaken()
+    {
+        // TCP/UDP 53 from two clients to any destination, ahead of an all-protocol deny on a network to
+        // specific addresses: destination scoring calls the allow broader, but it takes only port 53.
+        var allow = new FirewallRule
+        {
+            Id = "allow-dns", Name = "[TEMP] DNS Bypass", Enabled = true, Index = 10000, Action = "ALLOW",
+            Protocol = "tcp_udp", DestinationPort = "53",
+            SourceMatchingTarget = "CLIENT", SourceClientMacs = ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"],
+            DestinationMatchingTarget = "ANY", SourceZoneId = "internal-zone", DestinationZoneId = "external-zone"
+        };
+        var deny = new FirewallRule
+        {
+            Id = "block-trackers", Name = "Block Torrent Trackers", Enabled = true, Index = 10001, Action = "BLOCK",
+            Protocol = "all",
+            SourceMatchingTarget = "CLIENT", SourceClientMacs = ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:03"],
+            DestinationMatchingTarget = "IP", DestinationIps = ["203.0.113.10", "203.0.113.11"],
+            SourceZoneId = "internal-zone", DestinationZoneId = "external-zone"
+        };
+
+        var issue = _analyzer.DetectShadowedRules([allow, deny]).Should().ContainSingle(i => i.Type == IssueTypes.AllowSubvertsDeny).Subject;
+
+        // One port is a deliberate exception: still shown for review, but it costs no points
+        issue.Severity.Should().Be(AuditSeverity.Recommended);
+        issue.ScoreImpact.Should().Be(0);
+        issue.Message.Should().Be("Allow rule '[TEMP] DNS Bypass' takes TCP/UDP port 53 traffic from 2 clients out of deny rule 'Block Torrent Trackers'");
+        issue.RecommendedAction.Should().Be("The deny rule still blocks everything else. If it should block this traffic too, move it above the allow rule.");
+        issue.Metadata!["subversion"].Should().Be("partial");
+        issue.Metadata["slice"].Should().Be("TCP/UDP port 53 traffic from 2 clients");
+        // The pre-slice text stays the dismissal identity, so an existing Acknowledge still applies
+        issue.Metadata["dismissal_scope"].Should().Be("Allow rule '[TEMP] DNS Bypass' may subvert deny rule 'Block Torrent Trackers'");
+    }
+
+    [Fact]
+    public void DetectShadowedRules_PartialSliceOnManyPortsOrNoPorts_KeepsItsPoints()
+    {
+        var clients = new List<string> { "aa:bb:cc:dd:ee:01" };
+        FirewallRule Allow(string? protocol, string? port) => new()
+        {
+            Id = "allow", Name = "allow", Enabled = true, Index = 10000, Action = "ALLOW", Protocol = protocol, DestinationPort = port,
+            SourceMatchingTarget = "CLIENT", SourceClientMacs = clients, SourceZoneId = "internal-zone", DestinationZoneId = "external-zone"
+        };
+        var deny = new FirewallRule
+        {
+            Id = "deny", Name = "deny", Enabled = true, Index = 10001, Action = "BLOCK", Protocol = "all",
+            SourceMatchingTarget = "CLIENT", SourceClientMacs = ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:03"],
+            DestinationMatchingTarget = "IP", DestinationIps = ["203.0.113.10"],
+            SourceZoneId = "internal-zone", DestinationZoneId = "external-zone"
+        };
+
+        foreach (var (protocol, port) in new (string?, string?)[] { ("all", null), ("tcp", "1-1024") })
+        {
+            var issue = _analyzer.DetectShadowedRules([Allow(protocol, port), deny])
+                .Should().ContainSingle(i => i.Type == IssueTypes.AllowSubvertsDeny).Subject;
+            issue.Metadata!["subversion"].Should().Be("partial");
+            issue.ScoreImpact.Should().Be(5);
+        }
+    }
+
+    [Fact]
+    public void DetectShadowedRules_SourcePortOnlyAllow_CarriesNoDismissalOverride()
+    {
+        // Its message never changed, so the message itself stays the identity
+        var rules = new List<FirewallRule>
+        {
+            ParseIpVersionPolicy("Allow mDNS reply", "ALLOW", 10000, "BOTH", InternalSourceFromPort("5353"), AnyGatewayDest),
+            ParseIpVersionPolicy("Block Other Gateway Access", "BLOCK", 10001, "BOTH", AnyInternalSource, AnyGatewayDest)
+        };
+
+        var issue = _analyzer.DetectShadowedRules(rules).Should().ContainSingle(i => i.Type == IssueTypes.AllowSubvertsDeny).Subject;
+
+        issue.Metadata.Should().NotContainKey("dismissal_scope");
+    }
+
+    [Fact]
+    public void DetectShadowedRules_InvertedIcmpAllowBeforeAllProtocolDeny_IsStillReported()
+    {
+        // match_opposite_protocol turns "icmpv6" into everything except ICMPv6
+        var allow = _analyzer.ParseFirewallPolicy(System.Text.Json.JsonDocument.Parse($@"{{
+            ""_id"": ""allow-not-icmpv6"",
+            ""name"": ""allow-not-icmpv6"",
+            ""action"": ""ALLOW"",
+            ""enabled"": true,
+            ""index"": 10000,
+            ""ip_version"": ""BOTH"",
+            ""protocol"": ""icmpv6"",
+            ""match_opposite_protocol"": true,
+            ""source"": {AnyInternalSource},
+            ""destination"": {AnyGatewayDest}
+        }}").RootElement)!;
+        var rules = new List<FirewallRule>
+        {
+            allow,
+            ParseIpVersionPolicy("block-gateway", "BLOCK", 10001, "BOTH", AnyInternalSource, AnyGatewayDest)
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules);
+
+        issues.Should().ContainSingle(i => i.Type == IssueTypes.AllowSubvertsDeny);
+    }
+
+    private FirewallRule ParseStatefulInternalPolicy(string id, string action, int index, string stateType, params string[] states)
+    {
+        var statesJson = string.Join(", ", states.Select(s => $@"""{s}"""));
+        var json = System.Text.Json.JsonDocument.Parse($@"{{
+            ""_id"": ""{id}"",
+            ""name"": ""{id}"",
+            ""action"": ""{action}"",
+            ""enabled"": true,
+            ""index"": {index},
+            ""protocol"": ""all"",
+            ""connection_state_type"": ""{stateType}"",
+            ""connection_states"": [{statesJson}],
+            ""source"": {{ ""matching_target"": ""ANY"", ""zone_id"": ""internal-zone"" }},
+            ""destination"": {{ ""matching_target"": ""ANY"", ""zone_id"": ""internal-zone"" }}
+        }}").RootElement;
+        return _analyzer.ParseFirewallPolicy(json)!;
+    }
+
+    [Theory]
+    [InlineData("ALL")]
+    [InlineData("RESPOND_ONLY", "RELATED", "ESTABLISHED")]
+    public void DetectShadowedRules_InvalidOnlyDenyBeforeAllow_IsNotReported(string allowStateType, params string[] allowStates)
+    {
+        // A zone-wide "Block Invalid" drops only INVALID packets, so no later allow is ineffective
+        var rules = new List<FirewallRule>
+        {
+            ParseStatefulInternalPolicy("block-invalid", "BLOCK", 10000, "CUSTOM", "INVALID"),
+            ParseStatefulInternalPolicy("allow-admin", "ALLOW", 10001, allowStateType, allowStates)
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules);
+
+        issues.Should().NotContain(i => i.Type == IssueTypes.DenyShadowsAllow);
+    }
+
+    [Fact]
+    public void DetectShadowedRules_ReturnTrafficAllowBeforeInvalidOnlyDeny_IsNotReported()
+    {
+        // Return traffic and INVALID packets never overlap, so neither rule affects the other
+        var rules = new List<FirewallRule>
+        {
+            ParseStatefulInternalPolicy("allow-return", "ALLOW", 10000, "RESPOND_ONLY", "RELATED", "ESTABLISHED"),
+            ParseStatefulInternalPolicy("block-invalid", "BLOCK", 10001, "CUSTOM", "INVALID")
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules);
+
+        issues.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectShadowedRules_AllStateAllowBeforeInvalidOnlyDeny_IsStillReported()
+    {
+        // The allow admits INVALID packets of its traffic that the deny would drop
+        var rules = new List<FirewallRule>
+        {
+            ParseStatefulInternalPolicy("allow-admin", "ALLOW", 10000, "ALL"),
+            ParseStatefulInternalPolicy("block-invalid", "BLOCK", 10001, "CUSTOM", "INVALID")
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules);
+
+        issues.Should().ContainSingle(i => i.Type == IssueTypes.AllowSubvertsDeny);
+    }
+
+    [Fact]
+    public void DetectShadowedRules_NewOnlyDenyBeforeReturnTrafficAllow_IsNotReported()
+    {
+        var rules = new List<FirewallRule>
+        {
+            ParseStatefulInternalPolicy("block-new", "BLOCK", 10000, "CUSTOM", "NEW"),
+            ParseStatefulInternalPolicy("allow-return", "ALLOW", 10001, "RESPOND_ONLY", "RELATED", "ESTABLISHED")
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules);
+
+        issues.Should().NotContain(i => i.Type == IssueTypes.DenyShadowsAllow);
+    }
+
+    [Theory]
+    [InlineData("ALL", "ALL", new string[0], new string[0])]
+    [InlineData("CUSTOM", "ALL", new[] { "NEW", "ESTABLISHED", "RELATED", "INVALID" }, new string[0])]
+    [InlineData("CUSTOM", "CUSTOM", new[] { "NEW", "INVALID" }, new[] { "NEW" })]
+    [InlineData("ALL", "RESPOND_ONLY", new string[0], new[] { "RELATED", "ESTABLISHED" })]
+    public void DetectShadowedRules_DenyCoversEveryAllowedState_IsReported(
+        string denyStateType, string allowStateType, string[] denyStates, string[] allowStates)
+    {
+        var rules = new List<FirewallRule>
+        {
+            ParseStatefulInternalPolicy("block-broad", "BLOCK", 10000, denyStateType, denyStates),
+            ParseStatefulInternalPolicy("allow-later", "ALLOW", 10001, allowStateType, allowStates)
+        };
+
+        var issues = _analyzer.DetectShadowedRules(rules);
+
+        issues.Should().ContainSingle(i => i.Type == IssueTypes.DenyShadowsAllow);
     }
 
     [Fact]
@@ -3800,6 +4436,37 @@ public class FirewallRuleAnalyzerTests
 
         // Even with 6 networks, custom zone suppresses BROAD_RULE
         issues.Should().BeEmpty();
+    }
+
+    private static FirewallZoneLookup LanAndExternalZones() => new(new[]
+    {
+        new UniFiFirewallZone { Id = "z-int", Name = "Internal", ZoneKey = "internal", IsDefaultZone = true },
+        new UniFiFirewallZone { Id = "z-srv", Name = "Servers", ZoneKey = "", IsDefaultZone = false },
+        new UniFiFirewallZone { Id = "z-ext", Name = "External", ZoneKey = "external", IsDefaultZone = true },
+    });
+
+    private static FirewallRule AnyAnyAllow(string src, string dst) => new()
+    {
+        Id = $"{src}-{dst}", Name = $"Allow {src} to {dst}", Action = "ALLOW", Enabled = true, Index = 10000, Protocol = "all",
+        SourceMatchingTarget = "ANY", SourceZoneId = src, DestinationMatchingTarget = "ANY", DestinationZoneId = dst,
+    };
+
+    [Theory]
+    [InlineData("z-int", "z-srv")]
+    [InlineData("z-srv", "z-srv")]
+    public void DetectPermissiveRules_AllowBetweenLanZones_IsTheOperatorsZoneDesign(string src, string dst)
+    {
+        var issues = _analyzer.DetectPermissiveRules([AnyAnyAllow(src, dst)], [], LanAndExternalZones());
+
+        issues.Should().BeEmpty("the isolation rules judge an allow between LAN zones");
+    }
+
+    [Fact]
+    public void DetectPermissiveRules_AnyAnyFromExternal_StaysCritical()
+    {
+        var issues = _analyzer.DetectPermissiveRules([AnyAnyAllow("z-ext", "z-int")], [], LanAndExternalZones());
+
+        issues.Should().ContainSingle(i => i.Type == "PERMISSIVE_RULE" && i.Severity == AuditSeverity.Critical);
     }
 
     [Fact]
@@ -9924,6 +10591,9 @@ public class FirewallRuleAnalyzerTests
 
     #region Helper Methods
 
+    private static List<CellularModemIdentity> CreateCellularDevices() =>
+        [new("192.168.99.5", "aa:bb:cc:dd:ee:ff")];
+
     private static NetworkInfo CreateNetwork(
         string name,
         NetworkPurpose purpose,
@@ -9982,6 +10652,107 @@ public class FirewallRuleAnalyzerTests
             Protocol = protocol,
             Predefined = predefined
         };
+    }
+
+    #endregion
+
+    #region Internet block helpers
+
+    private const string InternetExternalZone = "zone-external";
+
+    private static NetworkInfo InternetNet(bool internetAccess = true) => new()
+    {
+        Id = "net-mgmt", Name = "Management", VlanId = 99, Subnet = "203.0.113.0/24", Gateway = "203.0.113.1",
+        FirewallZoneId = "zone-mgmt", InternetAccessEnabled = internetAccess
+    };
+
+    private static FirewallRule ToExternal(string id, string action, int index, string protocol = "all", string? port = null) => new()
+    {
+        Id = id, Name = id, Enabled = true, Action = action, Protocol = protocol, Index = index,
+        SourceZoneId = "zone-mgmt", SourceMatchingTarget = "ANY",
+        DestinationZoneId = InternetExternalZone, DestinationMatchingTarget = "ANY", DestinationPort = port
+    };
+
+    [Fact]
+    public void InternetHelpers_InternetAccessOff_BlocksEverything_EvenWithoutRules()
+    {
+        FirewallRuleAnalyzer.IsInternetBlocked(InternetNet(false), null, null).Should().BeTrue();
+        FirewallRuleAnalyzer.IsInternetTrafficBlocked(InternetNet(false), [], InternetExternalZone, "53", "udp").Should().BeTrue();
+    }
+
+    [Fact]
+    public void InternetHelpers_NoRulesOrNoExternalZone_AreNotBlocked()
+    {
+        FirewallRuleAnalyzer.IsInternetBlocked(InternetNet(), [], InternetExternalZone).Should().BeFalse();
+        FirewallRuleAnalyzer.IsInternetBlocked(InternetNet(), [ToExternal("block", "drop", 1)], null).Should().BeFalse();
+        FirewallRuleAnalyzer.IsInternetTrafficBlocked(InternetNet(), [ToExternal("block", "drop", 1)], "", "53", "udp").Should().BeFalse();
+    }
+
+    [Fact]
+    public void InternetHelpers_BroadDeny_IsAnInternetBlock_AndBlocksEachPort()
+    {
+        var rules = new List<FirewallRule> { ToExternal("block", "drop", 1) };
+
+        FirewallRuleAnalyzer.IsInternetBlocked(InternetNet(), rules, InternetExternalZone).Should().BeTrue();
+        FirewallRuleAnalyzer.IsInternetTrafficBlocked(InternetNet(), rules, InternetExternalZone, "853", "tcp").Should().BeTrue();
+    }
+
+    [Fact]
+    public void InternetHelpers_PortDeny_BlocksThatPortOnly_AndIsNoInternetBlock()
+    {
+        var rules = new List<FirewallRule> { ToExternal("block-dns", "drop", 1, "udp", "53") };
+
+        FirewallRuleAnalyzer.IsInternetBlocked(InternetNet(), rules, InternetExternalZone).Should().BeFalse();
+        FirewallRuleAnalyzer.IsInternetTrafficBlocked(InternetNet(), rules, InternetExternalZone, "53", "udp").Should().BeTrue();
+        FirewallRuleAnalyzer.IsInternetTrafficBlocked(InternetNet(), rules, InternetExternalZone, "53", "tcp").Should().BeFalse();
+        FirewallRuleAnalyzer.IsInternetTrafficBlocked(InternetNet(), rules, InternetExternalZone, "853", "udp").Should().BeFalse();
+    }
+
+    [Fact]
+    public void InternetHelpers_EarlierPortAllow_OpensThatPortThroughABroadDeny()
+    {
+        var rules = new List<FirewallRule> { ToExternal("block", "drop", 2), ToExternal("allow-dns", "accept", 1, "udp", "53") };
+
+        FirewallRuleAnalyzer.IsInternetBlocked(InternetNet(), rules, InternetExternalZone).Should().BeTrue("the broad deny wins for all traffic");
+        FirewallRuleAnalyzer.IsInternetTrafficBlocked(InternetNet(), rules, InternetExternalZone, "53", "udp").Should().BeFalse();
+        FirewallRuleAnalyzer.IsInternetTrafficBlocked(InternetNet(), rules, InternetExternalZone, "853", "tcp").Should().BeTrue();
+    }
+
+    [Fact]
+    public void InternetHelpers_EarlierAllowWithUnknownPorts_MayOpenAnyPort()
+    {
+        var allow = new FirewallRule
+        {
+            Id = "allow-group", Name = "allow-group", Enabled = true, Action = "accept", Protocol = "udp", Index = 1,
+            SourceZoneId = "zone-mgmt", SourceMatchingTarget = "ANY", DestinationZoneId = InternetExternalZone,
+            DestinationMatchingTarget = "ANY", HasUnresolvedDestinationPortGroup = true,
+        };
+        var rules = new List<FirewallRule> { allow, ToExternal("block", "drop", 2) };
+
+        FirewallRuleAnalyzer.IsInternetTrafficBlocked(InternetNet(), rules, InternetExternalZone, "53", "udp").Should().BeFalse("its ports are unknown");
+        FirewallRuleAnalyzer.IsInternetTrafficBlocked(InternetNet(), rules, InternetExternalZone, "853", "tcp").Should().BeTrue("a UDP allow cannot open TCP");
+    }
+
+    [Fact]
+    public void InternetHelpers_BlockWithUnknownPorts_IsNotCredited()
+    {
+        var block = new FirewallRule
+        {
+            Id = "block-group", Name = "block-group", Enabled = true, Action = "drop", Protocol = "udp", Index = 1,
+            SourceZoneId = "zone-mgmt", SourceMatchingTarget = "ANY", DestinationZoneId = InternetExternalZone,
+            DestinationMatchingTarget = "ANY", HasUnresolvedDestinationPortGroup = true,
+        };
+
+        FirewallRuleAnalyzer.IsInternetTrafficBlocked(InternetNet(), [block], InternetExternalZone, "53", "udp").Should().BeFalse();
+    }
+
+    [Fact]
+    public void InternetHelpers_EarlierBroadAllow_OverridesALaterDeny()
+    {
+        var rules = new List<FirewallRule> { ToExternal("allow", "accept", 1), ToExternal("block", "drop", 2) };
+
+        FirewallRuleAnalyzer.IsInternetBlocked(InternetNet(), rules, InternetExternalZone).Should().BeFalse();
+        FirewallRuleAnalyzer.IsInternetTrafficBlocked(InternetNet(), rules, InternetExternalZone, "53", "udp").Should().BeFalse();
     }
 
     #endregion

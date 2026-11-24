@@ -64,6 +64,30 @@ public class DohProviderRegistryTests : IDisposable
         result.Should().BeNull();
     }
 
+    [Theory]
+    [InlineData("dns.nextdns.io", "NextDNS")]
+    [InlineData("dns.nextdns.io.", "NextDNS")]
+    [InlineData("dns2.nextdns.io", "NextDNS")]
+    [InlineData("security.cloudflare-dns.com", "Cloudflare")]
+    [InlineData("dns.google", "Google")]
+    [InlineData("dns.controld.com", "ControlD")]
+    public void IdentifyProviderFromResolverHost_ResolverHost_ReturnsProvider(string host, string expected)
+    {
+        DohProviderRegistry.IdentifyProviderFromResolverHost(host)!.Name.Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("my.nextdns.io")]
+    [InlineData("api.nextdns.io")]
+    [InlineData("controld.example.com")]
+    [InlineData("dnsnextdns.io")]
+    [InlineData("")]
+    [InlineData(null)]
+    public void IdentifyProviderFromResolverHost_NotAResolverHost_ReturnsNull(string? host)
+    {
+        DohProviderRegistry.IdentifyProviderFromResolverHost(host).Should().BeNull();
+    }
+
     [Fact]
     public void IdentifyProvider_EmptyHostname_ReturnsNull()
     {
@@ -152,6 +176,23 @@ public class DohProviderRegistryTests : IDisposable
 
         result.Should().NotBeNull();
         result!.Name.Should().Be(expectedProvider);
+    }
+
+    [Theory]
+    [InlineData("76.76.2.11")]
+    [InlineData("76.76.10.11")]
+    public void IdentifyProviderFromIp_ControlDRanges_ReturnsControlD(string ip)
+    {
+        DohProviderRegistry.IdentifyProviderFromIp(ip)!.Name.Should().Be("ControlD");
+    }
+
+    [Theory]
+    [InlineData("76.76.21.21")]   // Vercel (tailscale.com)
+    [InlineData("76.76.19.19")]   // Twingate
+    [InlineData("76.76.0.1")]     // CleanBrowsing infrastructure, not a listed resolver
+    public void IdentifyProviderFromIp_OtherOwnersIn7676_ReturnsNull(string ip)
+    {
+        DohProviderRegistry.IdentifyProviderFromIp(ip).Should().BeNull();
     }
 
     [Fact]
@@ -402,9 +443,32 @@ public class DohProviderRegistryTests : IDisposable
     [Fact]
     public void IdentifyProviderFromIp_UnknownIpv6_ReturnsNull()
     {
-        var result = DohProviderRegistry.IdentifyProviderFromIp("2001:4860:4860::8888");
+        var result = DohProviderRegistry.IdentifyProviderFromIp("2001:db8::1");
 
         result.Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData("2606:4700:4700::1111", "Cloudflare")]
+    [InlineData("2606:4700:4700::1003", "Cloudflare")]
+    [InlineData("2001:4860:4860::8888", "Google")]
+    [InlineData("2001:4860:4860:0:0:0:0:8844", "Google")]
+    [InlineData("2620:fe::fe", "Quad9")]
+    [InlineData("2620:FE::FE:10", "Quad9")]
+    [InlineData("2620:119:35::35", "OpenDNS")]
+    [InlineData("2620:119:53::53", "OpenDNS")]
+    public void IdentifyProviderFromIp_PublishedIpv6Resolver_ReturnsProvider(string ip, string expectedProvider)
+    {
+        DohProviderRegistry.IdentifyProviderFromIp(ip)!.Name.Should().Be(expectedProvider);
+    }
+
+    [Theory]
+    [InlineData("2606:4700:4700::1114")]
+    [InlineData("2620:119:35::123")]
+    [InlineData("2620:fe::")]
+    public void IdentifyProviderFromIp_NeighborOfPublishedIpv6Resolver_ReturnsNull(string ip)
+    {
+        DohProviderRegistry.IdentifyProviderFromIp(ip).Should().BeNull();
     }
 
     #endregion

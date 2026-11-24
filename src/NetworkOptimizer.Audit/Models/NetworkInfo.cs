@@ -64,7 +64,13 @@ public enum NetworkPurpose
     /// <summary>
     /// Unknown or unclassified network
     /// </summary>
-    Unknown
+    Unknown,
+
+    /// <summary>
+    /// Network the operator manages UniFi from (admin workstations), as opposed to Management,
+    /// where the devices live. Set only by a purpose override, never by name.
+    /// </summary>
+    ManagementAccess
 }
 
 /// <summary>
@@ -89,6 +95,7 @@ public static class NetworkPurposeExtensions
         NetworkPurpose.Media => "Media",
         NetworkPurpose.Gaming => "Gaming",
         NetworkPurpose.Unknown => "Unclassified",
+        NetworkPurpose.ManagementAccess => "Management Access",
         _ => purpose.ToString()
     };
 }
@@ -195,4 +202,82 @@ public class NetworkInfo
     /// When true, native VLAN exemptions are bypassed so audit rules apply based on the overridden purpose.
     /// </summary>
     public bool HasPurposeOverride { get; init; }
+
+    /// <summary>
+    /// Whether IPv6 is enabled on this network (ipv6_interface_type set and not "none").
+    /// </summary>
+    public bool HasIpv6 { get; init; }
+
+    /// <summary>
+    /// The network's IPv6 prefixes in CIDR form (e.g., "2001:db8:1::/64"). A static network carries
+    /// its configured prefix; a prefix-delegated one carries it only when read from the gateway.
+    /// </summary>
+    public List<string>? Ipv6Subnets { get; init; }
+
+    /// <summary>
+    /// The gateway's own IPv6 addresses on this network: the host part of ipv6_subnet / ipv6_subnets
+    /// ("2001:db8:1::1/64" gives "2001:db8:1::1"). <see cref="Ipv6Subnets"/> drops it by normalizing.
+    /// </summary>
+    public List<string>? Ipv6GatewayAddresses { get; init; }
+
+    /// <summary>
+    /// Custom IPv6 DNS servers handed out over DHCPv6 and RA RDNSS (dhcpdv6_dns_1..4 with
+    /// dhcpdv6_dns_auto false). Null when IPv6 is off or the network hands out the gateway.
+    /// </summary>
+    public List<string>? Ipv6DnsServers { get; init; }
+
+    /// <summary>
+    /// Whether IPv6 traffic from or to this network can be evaluated. Requires a known prefix, since
+    /// address-based rules cannot be matched to the network without one.
+    /// </summary>
+    /// <remarks>
+    /// Deliberate: without a prefix the audit makes no IPv6 claim for the network, in either
+    /// direction. Do not report it as a gap. rest/networkconf never carries a delegated prefix
+    /// (only the gateway network_table does), so this is expected for PD networks read from there.
+    /// </remarks>
+    public bool IsIpv6Evaluable => HasIpv6 && Ipv6Subnets is { Count: > 0 };
+
+    /// <summary>
+    /// The address families whose traffic this network carries and the audit can evaluate.
+    /// Always IPv4; IPv6 when <see cref="IsIpv6Evaluable"/>.
+    /// </summary>
+    public IEnumerable<IpFamily> EvaluableFamilies => IsIpv6Evaluable
+        ? [IpFamily.IPv4, IpFamily.IPv6]
+        : [IpFamily.IPv4];
+
+    /// <summary>
+    /// The subnets that address-based rules are matched against for the given family.
+    /// </summary>
+    public IReadOnlyList<string> SubnetsFor(IpFamily family) => family == IpFamily.IPv6
+        ? Ipv6Subnets ?? []
+        : string.IsNullOrEmpty(Subnet) ? [] : [Subnet];
+
+    /// <summary>
+    /// Copy of this network with a different purpose. Keeps every other field, so callers that
+    /// reclassify a network cannot drop one.
+    /// </summary>
+    public NetworkInfo WithPurpose(NetworkPurpose purpose, bool hasPurposeOverride) => new()
+    {
+        Id = Id,
+        Name = Name,
+        VlanId = VlanId,
+        Purpose = purpose,
+        Subnet = Subnet,
+        Gateway = Gateway,
+        DnsServers = DnsServers,
+        AllowsRouting = AllowsRouting,
+        DhcpEnabled = DhcpEnabled,
+        NetworkIsolationEnabled = NetworkIsolationEnabled,
+        InternetAccessEnabled = InternetAccessEnabled,
+        IsUniFiGuestNetwork = IsUniFiGuestNetwork,
+        FirewallZoneId = FirewallZoneId,
+        NetworkGroup = NetworkGroup,
+        UpnpLanEnabled = UpnpLanEnabled,
+        Enabled = Enabled,
+        HasPurposeOverride = hasPurposeOverride,
+        HasIpv6 = HasIpv6,
+        Ipv6Subnets = Ipv6Subnets,
+        Ipv6GatewayAddresses = Ipv6GatewayAddresses,
+        Ipv6DnsServers = Ipv6DnsServers
+    };
 }

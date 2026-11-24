@@ -10,6 +10,8 @@
 @inject IIperf3SpeedTestService SpeedTestService
 @inject IUwnSpeedTestService WanSpeedTestService
 @inject IGatewayWanSpeedTestService GatewayWanTestService
+@inject ITailscaleDirectory Tailscale
+@inject IClientIcons ClientIcons
 @inject IAdminAuthService AdminAuthService
 @inject ThreatDashboardService ThreatService
 @inject NavigationManager NavigationManager
@@ -20,11 +22,14 @@
 @inject IDashboardLayoutAdminService LayoutAdmin
 @implements IDisposable
 @rendermode InteractiveServer
+@inject IDisplayTimeZone DisplayTime
 
 <PageTitle>Dashboard - Network Optimizer</PageTitle>
 <NavigationLock OnBeforeInternalNavigation="OnBeforeInternalNavigation" ConfirmExternalNavigation="_editMode" />
 
 <div class="page-header">
+    @* Shows only when this tab has an earlier in-app page: a cold start (a PWA launch, a new tab) has none. *@
+    <PageBackButton />
     @* Site name next to the header (muted) when multi-site is enabled, including the
        main site, so each per-site tab is identifiable at a glance. *@
     <h1>
@@ -51,7 +56,7 @@
     <p class="page-description">Network overview and health status</p>
 </div>
 
-<SitesOverviewCard />
+<SitesHealthPanel />
 
 @if (!string.IsNullOrEmpty(_editToast))
 {
@@ -62,7 +67,7 @@
 {
     <div class="connection-banner password-warning-banner">
         <div class="banner-content">
-            <span class="banner-icon">!</span>
+            <span class="banner-icon"><AppIcon Name="warning" /></span>
             <div class="banner-text">
                 <strong>Using Auto-Generated Password</strong>
                 <span>Set a permanent admin password in Settings to secure your installation.</span>
@@ -72,76 +77,7 @@
     </div>
 }
 
-@if (!ConnectionService.IsConnected && ConnectionService.IsInitialized)
-{
-    @if (ConnectionService.IsAwaitingAgent)
-    {
-        <div class="connection-banner">
-            <div class="banner-content">
-                <span class="banner-icon">!</span>
-                <div class="banner-text">
-                    <strong>Waiting for the site's agent</strong>
-                    <span>@ConnectionService.LastError</span>
-                </div>
-                <button class="btn btn-primary" @onclick="RefreshConnectionAsync" disabled="@_refreshingConnection">
-                    @if (_refreshingConnection)
-                    {
-                        <span class="spinner-sm"></span>
-                        <span>Refreshing...</span>
-                    }
-                    else
-                    {
-                        <span>Refresh</span>
-                    }
-                </button>
-            </div>
-        </div>
-    }
-    else if (ConnectionService.IsConsoleUnresponsive)
-    {
-        <div class="connection-banner">
-            <div class="banner-content">
-                <span class="banner-icon">!</span>
-                <div class="banner-text">
-                    <strong>Console isn't responding</strong>
-                    <span>@ConnectionService.LastError</span>
-                </div>
-                <button class="btn btn-primary" @onclick="RefreshConnectionAsync" disabled="@_refreshingConnection">
-                    @if (_refreshingConnection)
-                    {
-                        <span class="spinner-sm"></span>
-                        <span>Refreshing...</span>
-                    }
-                    else
-                    {
-                        <span>Refresh</span>
-                    }
-                </button>
-            </div>
-        </div>
-    }
-    else
-    {
-        <div class="connection-banner @(!string.IsNullOrEmpty(ConnectionService.LastError) ? "connection-error" : "")">
-            <div class="banner-content">
-                <span class="banner-icon">!</span>
-                <div class="banner-text">
-                    @if (!string.IsNullOrEmpty(ConnectionService.LastError))
-                    {
-                        <strong>Connection Error</strong>
-                        <span>@ConnectionService.LastError</span>
-                    }
-                    else
-                    {
-                        <strong>Not Connected</strong>
-                        <span>Connect to your UniFi Console (Controller) to view network data.</span>
-                    }
-                </div>
-                <a href="/settings?tab=connection#console-connection" class="btn btn-primary">@(!string.IsNullOrEmpty(ConnectionService.LastError) ? "Check Settings" : "Connect Now")</a>
-            </div>
-        </div>
-    }
-}
+<NetworkOptimizer.Web.Components.Shared.ConsoleConnectionBanner Prominent="true" />
 
 <NetworkOptimizer.Web.Components.Shared.UpdateChecker />
 <NetworkOptimizer.Web.Components.Shared.SponsorshipBanner />
@@ -164,7 +100,7 @@
     </div>
 }
 
-<div class="dashboard-grid">
+<div class="dashboard-grid" data-card-index-merge>
     @if (_layout != null)
     {
         @* Visible top-level cards *@
@@ -172,7 +108,11 @@
         {
             if (IsStackedChild(card.Id)) continue;
 
-            var hasStack = card.StackedCards.Count > 0;
+            var hostShown = IsCardShown(card.Id);
+            var shownChildren = card.StackedCards.Where(IsCardShown).ToList();
+            if (!hostShown && shownChildren.Count == 0) continue;
+
+            var hasStack = (hostShown ? 1 : 0) + shownChildren.Count > 1;
 
             <div class="dashboard-card-wrapper @(_editMode ? "dashboard-card-editing" : "") @(card.FullWidth ? "card-span-2" : "")">
                 @if (_editMode)
@@ -183,8 +123,11 @@
                 @if (hasStack)
                 {
                     <div class="card-stack">
-                        @RenderCard(card.Id)
-                        @foreach (var childId in card.StackedCards)
+                        @if (hostShown)
+                        {
+                            @RenderCard(card.Id)
+                        }
+                        @foreach (var childId in shownChildren)
                         {
                             @if (_editMode)
                             {
@@ -201,7 +144,7 @@
                 }
                 else
                 {
-                    @RenderCard(card.Id)
+                    @RenderCard(hostShown ? card.Id : shownChildren[0])
                 }
 
                 @if (_editMode)
@@ -226,7 +169,7 @@
         {
             <SiteAdminOnly>
                 <div class="dashboard-card-wrapper">
-                    <div class="card add-card-placeholder" @onclick="EnterEditModeFromPlaceholder" data-tooltip="Add widgets or edit layout" data-tooltip-hover-only>
+                    <div class="card add-card-placeholder" @onclick="EnterEditModeFromPlaceholder" data-tooltip="Add widgets or edit layout" data-tooltip-hover-only data-card-index="Add Widgets / Edit Layout" data-card-index-side-only>
                         <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
                     </div>
                 </div>
@@ -280,6 +223,7 @@
 @code {
     private string _siteName = "";
     private bool _loading = true;
+    private bool _wifiLoading = true;
     private bool _speedTestLoading = true;
     private bool _wanTestLoading = true;
     private bool _threatLoading = true;
@@ -300,17 +244,25 @@
     private List<ThreatTrendPoint> _threatTrend = [];
     private List<Services.DeviceInfo> devices = new();
     private List<Iperf3Result> _recentSpeedTests = new();
+    /// <summary>The site's tailnet, which names a Tailscale device that has no device name of its own.</summary>
+    private TailnetSnapshot _tailnet = TailnetSnapshot.Empty;
+    /// <summary>The site's client icons, for the LAN Speed Test card. Empty until loaded.</summary>
+    private ClientIconMap _clientIcons = ClientIconMap.Empty;
     private List<Iperf3Result> _recentWanTests = new();
     private int? _wifiHealthScore;
     private string? _wifiHealthGrade;
     private List<HealthIssue> _wifiHealthIssues = new();
     private int _sqmPanelKey = 0;
     private int _alertsListKey = 0;
+    private AlertsList? _alertsList;
+    private int _activeAlertsKey = 0;
     private AdminPasswordSource _passwordSource = AdminPasswordSource.None;
     private ApexChartOptions<ThreatTrendPoint> _threatSparklineOptions = CreateThreatSparklineOptions();
 
     protected override async Task OnInitializedAsync()
     {
+        _ = ClientIcons.LoadIntoAsync(map => InvokeAsync(() => { _clientIcons = map; StateHasChanged(); }));
+        ChartTimeFormat.ApplyTimeAxis(_threatSparklineOptions.Xaxis.Labels, DisplayTime);
         NavigationManager.LocationChanged += OnLocationChanged;
         ConnectionService.OnConnectionChanged += OnConnectionChanged;
         PtrState.RefreshCallback = () => Task.WhenAll(
@@ -333,9 +285,37 @@
         StartDeviceRefreshTimer();
     }
 
+    // Cards and stat tiles that read the UniFi Console (its devices, the audit, the gateway). A site
+    // with no console hides them outside edit mode; the layout itself is left alone.
+    private static readonly HashSet<string> ConsoleCards =
+    [
+        DashboardCards.SecurityPosture, DashboardCards.SqmStatus, DashboardCards.CellularStats,
+        DashboardCards.WiFiOptimizer, DashboardCards.RecentAlerts, DashboardCards.DeviceStatus,
+        DashboardCards.LiveView,
+    ];
+
+    private static readonly HashSet<string> ConsoleStatItems =
+    [
+        DashboardStatItems.TotalDevices, DashboardStatItems.SecurityScore, DashboardStatItems.SqmStatus,
+        DashboardStatItems.ActiveAlerts, DashboardStatItems.WiFiHealth,
+    ];
+
+    private bool HidesConsoleCards => ConnectionService.HasNoConsole && !_editMode;
+
+    private IEnumerable<string> ShownStatItems =>
+        _layout?.StatItems.Where(s => !HidesConsoleCards || !ConsoleStatItems.Contains(s)) ?? [];
+
+    private bool IsCardShown(string cardId) => cardId switch
+    {
+        _ when !HidesConsoleCards => true,
+        DashboardCards.StatsRow => ShownStatItems.Any(),
+        _ => !ConsoleCards.Contains(cardId),
+    };
+
     private RenderFragment RenderCard(string cardId) => cardId switch
     {
         DashboardCards.StatsRow => RenderStatsRow,
+        DashboardCards.ActiveAlerts => RenderActiveAlerts,
         DashboardCards.SecurityPosture => RenderSecurityPosture,
         DashboardCards.SqmStatus => RenderSqmStatus,
         DashboardCards.ThreatTrends => RenderThreatTrends,
@@ -360,7 +340,7 @@
         <div class="stats-row @(_editMode ? "stats-row-editing" : "")">
             @if (_layout != null)
             {
-                @foreach (var statId in _layout.StatItems)
+                @foreach (var statId in ShownStatItems)
                 {
                     <div class="stat-item-wrapper @(_editMode ? "stat-item-editing" : "")">
                         @if (_editMode)
@@ -509,7 +489,7 @@
             <img src="/icons/wifi-optimizer.png" alt="" class="stat-icon-img" />
             <div class="stat-content">
                 <div class="stat-value">
-                    @if (_loading)
+                    @if (_wifiLoading)
                     {
                         <span class="spinner-sm"></span>
                     }
@@ -532,7 +512,7 @@
 
     private RenderFragment RenderSecurityPosture => __builder =>
     {
-        <div class="card clickable-card" @onclick="@(() => NavigationManager.NavigateTo("/audit"))">
+        <div class="card clickable-card" data-card-index-fold="Security Posture & Findings" @onclick="@(() => NavigationManager.NavigateTo("/audit"))">
             <div class="card-header">
                 <a href="/audit" class="card-title-link" @onclick:stopPropagation><h2 class="card-title">Security Posture</h2></a>
             </div>
@@ -618,7 +598,7 @@
                                          Items="_threatTrend"
                                          Name="Events"
                                          SeriesType="SeriesType.Area"
-                                         XValue="e => e.Hour"
+                                         XValue="e => DisplayTime.ToChart(e.Hour)"
                                          YValue="e => (decimal)e.Count"
                                          OrderBy="e => e.X" />
                     </ApexChart>
@@ -712,14 +692,14 @@
                         <div class="speed-test-list">
                             @foreach (var test in _recentWanTests)
                             {
-                                <div class="speed-test-row">
+                                <a class="speed-test-row speed-test-row-link" href="@SpeedTestLinks.WanResult(test)" @onclick:stopPropagation>
                                     <span class="speed-test-device">@(test.WanName ?? test.WanNetworkGroup ?? "WAN")</span>
                                     <span class="speed-test-speeds">
                                         <span class="speed-down">↓@test.DownloadMbps.ToString("F0")</span>
                                         <span class="speed-up">↑@test.UploadMbps.ToString("F0")</span>
                                     </span>
-                                    <span class="speed-test-time">@test.TestTime.ToLocalTime().ToString("MMM d, h:mm tt")</span>
-                                </div>
+                                    <span class="speed-test-time">@test.TestTime.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DayTime, DisplayFormat.Culture)</span>
+                                </a>
                             }
                         </div>
                     }
@@ -749,25 +729,39 @@
                         <div class="speed-test-list">
                             @foreach (var test in _recentSpeedTests)
                             {
-                                <div class="speed-test-row">
-                                    @if (!string.IsNullOrEmpty(test.DeviceName))
+                                <a class="speed-test-row speed-test-row-link" href="@SpeedTestLinks.LanResult(test.Id)" @onclick:stopPropagation>
+                                    @if ((!string.IsNullOrEmpty(test.DeviceName) ? test.DeviceName : _tailnet.NameFor(test.DeviceHost)) is { } deviceName)
                                     {
-                                        <span class="speed-test-device">@test.DeviceName</span>
+                                        <span class="speed-test-device"><ResultClientIcon Host="@test.DeviceHost" Mac="@test.ClientMac" Tailnet="_tailnet" Icons="_clientIcons" />@deviceName</span>
                                     }
                                     else if (!string.IsNullOrEmpty(test.DeviceHost))
                                     {
-                                        <span class="speed-test-device"><code>@test.DeviceHost</code></span>
+                                        <span class="speed-test-device"><ResultClientIcon Host="@test.DeviceHost" Mac="@test.ClientMac" Tailnet="_tailnet" Icons="_clientIcons" /><code>@test.DeviceHost</code></span>
                                     }
                                     else
                                     {
                                         <span class="speed-test-device">Unknown</span>
                                     }
                                     <span class="speed-test-speeds">
-                                        <span class="speed-down">↓@test.DownloadMbps.ToString("F0")</span>
-                                        <span class="speed-up">↑@test.UploadMbps.ToString("F0")</span>
+                                        @if (test.DownloadMbps > 0)
+                                        {
+                                            <span class="speed-down">↓@test.DownloadMbps.ToString("F0")</span>
+                                        }
+                                        else
+                                        {
+                                            <span class="text-muted">-</span>
+                                        }
+                                        @if (test.UploadMbps > 0)
+                                        {
+                                            <span class="speed-up">↑@test.UploadMbps.ToString("F0")</span>
+                                        }
+                                        else
+                                        {
+                                            <span class="text-muted">-</span>
+                                        }
                                     </span>
-                                    <span class="speed-test-time">@test.TestTime.ToLocalTime().ToString("MMM d, h:mm tt")</span>
-                                </div>
+                                    <span class="speed-test-time">@test.TestTime.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DayTime, DisplayFormat.Culture)</span>
+                                </a>
                             }
                         </div>
                     }
@@ -785,7 +779,7 @@
             </div>
             <div class="card-body">
                 <NetworkOptimizer.Web.Components.Shared.WiFi.WiFiDashboardPanel
-                    Loading="_loading"
+                    Loading="_wifiLoading"
                     Score="_wifiHealthScore"
                     Issues="_wifiHealthIssues" />
             </div>
@@ -794,13 +788,26 @@
 
     private RenderFragment RenderRecentAlerts => __builder =>
     {
-        <div class="card clickable-card" id="recent-alerts" @onclick="@(() => NavigationManager.NavigateTo("/audit"))">
+        <div class="card clickable-card" id="recent-alerts" data-card-index-fold="Security Posture & Findings" @onclick="@(() => NavigationManager.NavigateTo("/audit"))">
             <div class="card-header">
                 <a href="/audit" class="card-title-link" @onclick:stopPropagation><h2 class="card-title">Recent Security Findings</h2></a>
                 <a href="/audit" class="card-action" @onclick:stopPropagation>View All →</a>
             </div>
             <div class="card-body">
-                <AlertsList @key="_alertsListKey" MaxItems="5" OnAlertDismissed="OnAlertDismissed" />
+                <AlertsList @key="_alertsListKey" @ref="_alertsList" MaxItems="5" OnAlertDismissed="OnAlertDismissed" />
+            </div>
+        </div>
+    };
+
+    private RenderFragment RenderActiveAlerts => __builder =>
+    {
+        <div class="card clickable-card" id="active-alerts" data-tour="dashboard-active-alerts" @onclick="@(() => NavigationManager.NavigateTo("/alerts?tab=active"))">
+            <div class="card-header">
+                <a href="/alerts?tab=active" class="card-title-link" @onclick:stopPropagation><h2 class="card-title">Active Alerts</h2></a>
+                <a href="/alerts?tab=active" class="card-action" @onclick:stopPropagation>View All →</a>
+            </div>
+            <div class="card-body">
+                <ActiveAlertsPanel @key="_activeAlertsKey" />
             </div>
         </div>
     };
@@ -830,7 +837,7 @@
                     <div class="device-grid">
                         @foreach (var device in devices)
                         {
-                            <DeviceCard Device="@device" />
+                            <DeviceCard Device="@device" FallbackImageUrl="@_clientIcons.DeviceCatalogUrlFor(device.Mac)" />
                         }
                     </div>
                 }
@@ -1159,24 +1166,6 @@
         catch { /* component may be disposed */ }
     }
 
-    private bool _refreshingConnection;
-
-    // "Refresh" on the agent-wait banner: re-attempt the console connection now (the
-    // agent may have just come online). On success, ReconnectAsync fires
-    // OnConnectionChanged, which reloads the dashboard; otherwise the banner stays.
-    private async Task RefreshConnectionAsync()
-    {
-        _refreshingConnection = true;
-        try
-        {
-            await ConnectionService.ReconnectAsync();
-        }
-        finally
-        {
-            _refreshingConnection = false;
-        }
-    }
-
     private async Task LoadAllDataAsync()
     {
         try
@@ -1203,6 +1192,7 @@
         {
             _sqmPanelKey++;
             _alertsListKey++;
+            _activeAlertsKey++;
             await Task.WhenAll(
                 LoadDashboardData(),
                 LoadSpeedTestData(),
@@ -1227,6 +1217,7 @@
         {
             var results = await SpeedTestService.GetRecentResultsAsync(25);
             _recentSpeedTests = results.Where(r => r.Success).Take(5).ToList();
+            _tailnet = await Tailscale.GetPeersAsync();
         }
         catch { }
         finally { _speedTestLoading = false; }
@@ -1255,8 +1246,8 @@
     private System.Threading.Timer? _deviceRefreshTimer;
 
     /// <summary>
-    /// Keeps Device Status current while the user sits on the page. Refreshes without the loading
-    /// flag so the card updates in place instead of flashing its spinner every cycle.
+    /// Keeps Device Status, Security Posture, and Recent Security Findings current while the user sits on the page.
+    /// Refreshes without the loading flag so the cards update in place instead of flashing their spinners every cycle.
     /// </summary>
     private void StartDeviceRefreshTimer()
     {
@@ -1267,6 +1258,7 @@
                 await InvokeAsync(async () =>
                 {
                     await LoadDashboardData(showLoading: false);
+                    if (_alertsList != null) await _alertsList.RefreshIfNewAuditAsync();
                     StateHasChanged();
                 });
             }
@@ -1276,7 +1268,11 @@
 
     private async Task LoadDashboardData(bool showLoading = true)
     {
-        if (showLoading) _loading = true;
+        if (showLoading)
+        {
+            _loading = true;
+            _wifiLoading = true;
+        }
         try
         {
             var data = await DashboardService.GetDashboardDataAsync();
@@ -1288,11 +1284,27 @@
             warningIssues = data.WarningIssues;
             lastAuditTime = data.LastAuditTime;
             devices = data.Devices;
-            _wifiHealthScore = data.WiFiHealthScore;
-            _wifiHealthGrade = data.WiFiHealthGrade;
-            _wifiHealthIssues = data.WiFiHealthIssues;
         }
-        finally { if (showLoading) _loading = false; }
+        finally
+        {
+            if (showLoading) _loading = false;
+            // A cold Wi-Fi score reads several console reports: render the other cards first.
+            // The reads keep their order; only the render moves ahead of the Wi-Fi score.
+            await InvokeAsync(StateHasChanged);
+            await LoadWiFiHealth(showLoading);
+        }
+    }
+
+    private async Task LoadWiFiHealth(bool showLoading)
+    {
+        try
+        {
+            var wifi = await DashboardService.GetWiFiHealthAsync();
+            _wifiHealthScore = wifi.Score;
+            _wifiHealthGrade = wifi.Grade;
+            _wifiHealthIssues = wifi.Issues;
+        }
+        finally { if (showLoading) _wifiLoading = false; }
     }
 
     private async Task OnAlertDismissed()
@@ -1347,12 +1359,12 @@
             Tooltip = new Tooltip
             {
                 Theme = Mode.Dark,
-                X = new TooltipX { Format = "HH:mm" }
+                X = new TooltipX { Format = "HH:mm", Formatter = ChartTimeFormat.TooltipTime }
             },
             Xaxis = new XAxis
             {
                 Type = XAxisType.Datetime,
-                Labels = new XAxisLabels { DatetimeUTC = false }
+                Labels = new XAxisLabels()
             },
             Yaxis = new List<YAxis> { new YAxis { Min = 0 } }
         };

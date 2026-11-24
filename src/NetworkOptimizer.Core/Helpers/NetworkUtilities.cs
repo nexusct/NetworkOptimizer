@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text.RegularExpressions;
@@ -318,6 +318,41 @@ public static class NetworkUtilities
     }
 
     /// <summary>
+    /// Whether an address falls in a firewall address entry as UniFi stores them: one address, a range
+    /// ("10.0.1.10-10.0.1.20"), or a CIDR. The two ends of a range must be the same family as the address.
+    /// </summary>
+    /// <param name="ipAddress">The address to check.</param>
+    /// <param name="entry">The entry from a policy's or group's address list.</param>
+    public static bool IsIpInEntry(string ipAddress, string? entry)
+    {
+        if (string.IsNullOrWhiteSpace(entry) || !IPAddress.TryParse(ipAddress.Trim(), out var ip))
+            return false;
+        entry = entry.Trim();
+        if (entry.Contains('/'))
+            return IsIpInSubnet(ip, entry);
+
+        var dash = entry.IndexOf('-');
+        if (dash > 0)
+        {
+            if (!IPAddress.TryParse(entry[..dash].Trim(), out var low) || !IPAddress.TryParse(entry[(dash + 1)..].Trim(), out var high))
+                return false;
+            var (a, lo, hi) = (ip.GetAddressBytes(), low.GetAddressBytes(), high.GetAddressBytes());
+            if (a.Length != lo.Length || a.Length != hi.Length)
+                return false;
+            return Compare(a, lo) >= 0 && Compare(a, hi) <= 0;
+        }
+
+        return IPAddress.TryParse(entry, out var single) && single.Equals(ip);
+
+        static int Compare(byte[] x, byte[] y)
+        {
+            for (var i = 0; i < x.Length; i++)
+                if (x[i] != y[i]) return x[i].CompareTo(y[i]);
+            return 0;
+        }
+    }
+
+    /// <summary>
     /// For an octet-aligned CIDR (/8, /16, /24), returns the IP prefix string suitable for
     /// SQL LIKE matching (e.g. "10." for /8, "192.168.1." for /24).
     /// Returns null for exact IPs (no slash), invalid input, /32, or non-octet-aligned masks.
@@ -500,6 +535,25 @@ public static class NetworkUtilities
     }
 
     /// <summary>
+    /// Whether an address is in Tailscale's default tailnet ranges: 100.64.0.0/10 (shared with carrier
+    /// CGNAT) or fd7a:115c:a1e0::/48. A tailnet with a custom IP pool needs its device list to be known.
+    /// </summary>
+    /// <param name="ipAddress">The address; an IPv4-mapped IPv6 form is read as its IPv4 address.</param>
+    public static bool IsTailscaleAddress(string? ipAddress) =>
+        IPAddress.TryParse(ipAddress, out var ip) && IsTailscaleAddress(ip);
+
+    /// <inheritdoc cref="IsTailscaleAddress(string?)"/>
+    public static bool IsTailscaleAddress(IPAddress ip)
+    {
+        if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+        var b = ip.GetAddressBytes();
+        if (ip.AddressFamily == AddressFamily.InterNetwork)
+            return b[0] == 100 && b[1] >= 64 && b[1] <= 127;
+        return ip.AddressFamily == AddressFamily.InterNetworkV6
+            && b[0] == 0xfd && b[1] == 0x7a && b[2] == 0x11 && b[3] == 0x5c && b[4] == 0xa1 && b[5] == 0xe0;
+    }
+
+    /// <summary>
     /// Check if an IP address is a public/routable address.
     /// </summary>
     /// <param name="ipAddress">IP address string to check</param>
@@ -514,16 +568,35 @@ public static class NetworkUtilities
 
     /// <summary>
     /// Check if an IP address is a public/routable address.
+    /// IPv4: anything not private. IPv6: global unicast (2000::/3) only, so multicast,
+    /// unspecified, and other special ranges are neither public nor private.
     /// </summary>
     /// <param name="ip">Parsed IP address to check</param>
     /// <returns>True if the IP is public/routable, false if private</returns>
     public static bool IsPublicIpAddress(IPAddress ip)
     {
-        // Only handle IPv4
+        if (ip.IsIPv4MappedToIPv6)
+            ip = ip.MapToIPv4();
+
+        if (ip.AddressFamily == AddressFamily.InterNetworkV6)
+            return (ip.GetAddressBytes()[0] & 0xE0) == 0x20;
+
         if (ip.AddressFamily != AddressFamily.InterNetwork)
             return false;
 
         return !IsPrivateIpAddress(ip);
+    }
+
+    /// <summary>
+    /// Check if two IP address strings name the same address, regardless of format
+    /// (IPv6 compressed vs expanded, hex case). False when either does not parse.
+    /// </summary>
+    public static bool IpAddressesAreEqual(string? ip1, string? ip2)
+    {
+        if (!IPAddress.TryParse(ip1, out var addr1) || !IPAddress.TryParse(ip2, out var addr2))
+            return false;
+
+        return addr1.Equals(addr2);
     }
 
     /// <summary>
@@ -708,75 +781,98 @@ public static class NetworkUtilities
         return result;
     }
 
+    /// <summary>A well-known port: its service name, and whether the service is a UDP amplification vector.</summary>
+    public sealed record WellKnownPort(int Port, string Name, bool Amplification = false);
+
     /// <summary>
-    /// Well-known port-to-service name map. Single source of truth used by
-    /// threat dashboard, drilldowns, and any future port labeling.
-    /// Returns the friendly service name, or null if the port is not in the map.
+    /// Well-known ports. Single source of truth used by threat dashboard, drilldowns, WAN Flood Protection's
+    /// reflection rule, and any future port labeling.
     /// </summary>
-    public static string? GetPortServiceName(int port)
-    {
-        return port switch
-        {
-            20 => "FTP Data",
-            21 => "FTP",
-            22 => "SSH",
-            23 => "Telnet",
-            25 => "SMTP",
-            53 => "DNS",
-            80 => "HTTP",
-            110 => "POP3",
-            111 => "RPC",
-            123 => "NTP",
-            135 => "MS-RPC",
-            137 => "NetBIOS-NS",
-            138 => "NetBIOS-DGM",
-            139 => "NetBIOS",
-            143 => "IMAP",
-            161 => "SNMP",
-            162 => "SNMP Trap",
-            389 => "LDAP",
-            443 => "HTTPS",
-            445 => "SMB",
-            465 => "SMTPS",
-            500 => "IKE",
-            502 => "Modbus",
-            587 => "SMTP Submit",
-            636 => "LDAPS",
-            993 => "IMAPS",
-            995 => "POP3S",
-            1080 => "SOCKS",
-            1433 => "MSSQL",
-            1434 => "MSSQL Browser",
-            1521 => "Oracle",
-            1723 => "PPTP",
-            1883 => "MQTT",
-            2049 => "NFS",
-            2222 => "SSH-Alt",
-            2375 => "Docker",
-            2376 => "Docker TLS",
-            3306 => "MySQL",
-            3389 => "RDP",
-            4500 => "IPSec NAT-T",
-            5060 => "SIP",
-            5405 => "Corosync",
-            5406 => "Corosync",
-            5432 => "PostgreSQL",
-            5672 => "AMQP",
-            5900 => "VNC",
-            6379 => "Redis",
-            6443 => "Kubernetes",
-            8006 => "Proxmox",
-            8080 => "HTTP-Alt",
-            8086 => "InfluxDB",
-            8443 => "HTTPS-Alt",
-            8883 => "MQTT-TLS",
-            9200 => "Elasticsearch",
-            9300 => "Elasticsearch",
-            11211 => "Memcached",
-            27017 => "MongoDB",
-            _ => null
-        };
-    }
+    public static readonly IReadOnlyList<WellKnownPort> WellKnownPorts =
+    [
+        new(19, "Chargen", Amplification: true),
+        new(20, "FTP Data"),
+        new(21, "FTP"),
+        new(22, "SSH"),
+        new(23, "Telnet"),
+        new(25, "SMTP"),
+        new(53, "DNS", Amplification: true),
+        new(69, "TFTP", Amplification: true),
+        new(80, "HTTP"),
+        new(110, "POP3"),
+        new(111, "RPC", Amplification: true),
+        new(123, "NTP", Amplification: true),
+        new(135, "MS-RPC"),
+        new(137, "NetBIOS-NS", Amplification: true),
+        new(138, "NetBIOS-DGM"),
+        new(139, "NetBIOS"),
+        new(143, "IMAP"),
+        new(161, "SNMP", Amplification: true),
+        new(162, "SNMP Trap"),
+        new(389, "LDAP", Amplification: true),
+        new(443, "HTTPS"),
+        new(445, "SMB"),
+        new(465, "SMTPS"),
+        new(500, "IKE"),
+        new(502, "Modbus"),
+        new(587, "SMTP Submit"),
+        new(636, "LDAPS"),
+        new(853, "DNS over TLS"),
+        new(993, "IMAPS"),
+        new(995, "POP3S"),
+        new(1080, "SOCKS"),
+        new(1194, "OpenVPN"),
+        new(1433, "MSSQL"),
+        new(1434, "MSSQL Browser"),
+        new(1521, "Oracle"),
+        new(1723, "PPTP"),
+        new(1883, "MQTT"),
+        new(1900, "SSDP", Amplification: true),
+        new(2049, "NFS"),
+        new(2222, "SSH-Alt"),
+        new(2375, "Docker"),
+        new(2376, "Docker TLS"),
+        new(3283, "Apple Remote Desktop", Amplification: true),
+        new(3306, "MySQL"),
+        new(3389, "RDP"),
+        new(3478, "STUN"),
+        new(3702, "WS-Discovery", Amplification: true),
+        new(4500, "IPSec NAT-T"),
+        new(5060, "SIP"),
+        new(5349, "STUN over TLS"),
+        new(5353, "mDNS", Amplification: true),
+        new(5405, "Corosync"),
+        new(5406, "Corosync"),
+        new(5432, "PostgreSQL"),
+        new(5672, "AMQP"),
+        new(5900, "VNC"),
+        new(6379, "Redis"),
+        new(6443, "Kubernetes"),
+        new(8006, "Proxmox"),
+        new(8080, "HTTP-Alt"),
+        new(8086, "InfluxDB"),
+        new(8443, "HTTPS-Alt"),
+        new(8883, "MQTT-TLS"),
+        new(9200, "Elasticsearch"),
+        new(9300, "Elasticsearch"),
+        new(10001, "Ubiquiti Discovery", Amplification: true),
+        new(11211, "Memcached", Amplification: true),
+        new(22067, "Syncthing Relay"),
+        new(27017, "MongoDB"),
+        new(37810, "DVR Discovery", Amplification: true),
+        new(51820, "WireGuard"),
+    ];
+
+    private static readonly Dictionary<int, string> PortNames = WellKnownPorts.ToDictionary(p => p.Port, p => p.Name);
+
+    /// <summary>
+    /// UDP services that answer a small forged request with a much larger reply, so attackers use them to reflect
+    /// floods. A NEW packet from one of these ports is never a reply to the site.
+    /// </summary>
+    public static readonly IReadOnlyList<int> AmplificationPorts = WellKnownPorts.Where(p => p.Amplification).Select(p => p.Port).ToList();
+
+    /// <summary>Returns the friendly service name of a well-known port, or null if the port is not in the map.</summary>
+    public static string? GetPortServiceName(int port) => PortNames.GetValueOrDefault(port);
 
     /// <summary>
     /// Parse CIDR notation into network address and prefix length.
@@ -848,6 +944,15 @@ public static class NetworkUtilities
 
         return PortSeparatorIndex(value) >= 0 ? value : $"{value}:{declared}";
     }
+
+    /// <summary>
+    /// A host as it goes into a URL: an IPv6 literal gets brackets ("2001:db8::1" gives
+    /// "[2001:db8::1]"); an IPv4 literal, a hostname, or an already-bracketed literal is returned as is.
+    /// </summary>
+    public static string UrlHost(string host) =>
+        !host.StartsWith('[') && IPAddress.TryParse(host, out var ip) && ip.AddressFamily == AddressFamily.InterNetworkV6
+            ? $"[{host}]"
+            : host;
 
     /// <summary>
     /// The host part of a URL authority, dropping any ":port". Null/empty in, null out.
@@ -959,5 +1064,20 @@ public static class NetworkUtilities
     {
         if (string.IsNullOrWhiteSpace(dataPathIfName)) return false;
         return Regex.IsMatch(dataPathIfName.Trim(), @"^gre\d+$", RegexOptions.IgnoreCase);
+    }
+
+    /// <summary>
+    /// True when a WAN's data-path interface name is a kernel WWAN device - "wwan0" - as the
+    /// cellular modem built into a UDR-5G-Max presents. Linux names only mobile-broadband network
+    /// devices this way (qmi_wwan, cdc_mbim, mhi_net), so a match identifies the medium as cellular.
+    ///
+    /// These are raw-IP, NOARP interfaces: the gateway has no Ethernet neighbor on them, and unlike
+    /// <see cref="IsUniFiCellularModemTunnel"/> there is no tunnel endpoint hop, so hop 1 is the carrier.
+    /// FALSE says nothing about the medium, for the same reasons as that method. Anchored likewise.
+    /// </summary>
+    public static bool IsWwanInterface(string? dataPathIfName)
+    {
+        if (string.IsNullOrWhiteSpace(dataPathIfName)) return false;
+        return Regex.IsMatch(dataPathIfName.Trim(), @"^wwan\d+$", RegexOptions.IgnoreCase);
     }
 }

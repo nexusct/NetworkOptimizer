@@ -1,3 +1,4 @@
+using NetworkOptimizer.Core.Enums;
 using NetworkOptimizer.UniFi;
 using NetworkOptimizer.UniFi.Models;
 using NetworkOptimizer.Web.Services.Ssh;
@@ -6,27 +7,30 @@ namespace NetworkOptimizer.Web.Services.Firmware;
 
 /// <summary>
 /// The real <see cref="IFirmwareCommandClient"/>: the site's UniFi console for API commands,
-/// the site's device SSH service for the direct device upgrade path, and the gateway SSH
-/// service for console-level SSH fallbacks. All are already tunnel-routed, so an
-/// agent-connected site needs nothing extra here.
+/// the site's device SSH service for a standalone gateway's direct upgrade, the SSH router for
+/// every other device's, and the gateway SSH service for console-level SSH fallbacks. All are
+/// already tunnel-routed, so an agent-connected site needs nothing extra here.
 /// </summary>
 public class FirmwareCommandClient : IFirmwareCommandClient
 {
     private readonly UniFiConnectionService _connection;
     private readonly IUniFiSshService _ssh;
     private readonly IGatewaySshService _gatewaySsh;
+    private readonly DeviceSshRouter _router;
     private readonly ILogger<FirmwareCommandClient> _logger;
     private readonly string _siteSlug;
 
     /// <param name="siteConnections">Per-site console connections.</param>
     /// <param name="sshRegistry">Per-site device SSH services.</param>
     /// <param name="gatewaySshRegistry">Per-site gateway SSH services.</param>
+    /// <param name="sshRouters">Per-site SSH routers, for every non-gateway SSH upgrade.</param>
     /// <param name="logger">Logger.</param>
     /// <param name="siteSlug">Site this client commands.</param>
     public FirmwareCommandClient(
         SiteConnectionRegistry siteConnections,
         UniFiSshRegistry sshRegistry,
         GatewaySshRegistry gatewaySshRegistry,
+        DeviceSshRouterRegistry sshRouters,
         ILogger<FirmwareCommandClient> logger,
         string siteSlug = SiteManagementService.DefaultSiteSlug)
     {
@@ -34,6 +38,7 @@ public class FirmwareCommandClient : IFirmwareCommandClient
         _connection = siteConnections.GetFor(_siteSlug);
         _ssh = sshRegistry.GetFor(_siteSlug);
         _gatewaySsh = gatewaySshRegistry.GetFor(_siteSlug);
+        _router = sshRouters.GetFor(_siteSlug);
         _logger = logger;
     }
 
@@ -115,7 +120,8 @@ public class FirmwareCommandClient : IFirmwareCommandClient
 
     /// <inheritdoc />
     public async Task<FirmwareCommandResult> TriggerSshUpgradeAsync(
-        string host, string firmwareUrl, bool isGateway, CancellationToken cancellationToken = default)
+        string deviceMac, string host, string firmwareUrl, DeviceType role, bool isGateway,
+        CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(host))
             return FirmwareCommandResult.Failed("No device address for the SSH upgrade path.");
@@ -127,9 +133,23 @@ public class FirmwareCommandClient : IFirmwareCommandClient
 
         try
         {
-            // UniFi OS gateways have no `upgrade` shell command; theirs is ubnt-systool.
-            var command = isGateway ? $"ubnt-systool fwupdate '{firmwareUrl}'" : $"upgrade '{firmwareUrl}'";
-            var (success, output) = await _ssh.RunCommandAsync(host, command, null, TimeSpan.FromMinutes(5), cancellationToken);
+            // UniFi OS gateways have no `upgrade` shell command; theirs is ubnt-systool. On an AP
+            // `upgrade` is only an /etc/profile alias for `mca-cli-op upgrade`, which a
+            // non-interactive SSH command never loads (exit 127), so the target is called directly.
+            var command = isGateway
+                ? $"ubnt-systool fwupdate '{firmwareUrl}'"
+                : $"if command -v mca-cli-op >/dev/null 2>&1; then mca-cli-op upgrade '{firmwareUrl}'; else upgrade '{firmwareUrl}'; fi";
+            var timeout = TimeSpan.FromMinutes(5);
+            // A gateway step is a standalone UXG / USG (a Cloud Gateway never becomes a device step):
+            // an adopted device, so Device SSH is its login. Never route it through Gateway SSH,
+            // which is optional and may not be set up.
+            var (success, output) = role == DeviceType.Gateway
+                ? await _ssh.RunCommandAsync(host, command, null, timeout, cancellationToken)
+                : await _router.RunAsync(
+                    // Off a non-gateway step, isGateway marks an Express (UX, UX7) adopted as an AP: gateway
+                    // hardware. Passed rather than looked up, since the console may be mid-update.
+                    new DeviceSshTarget(deviceMac, host, role, isGateway ? DeviceType.Gateway : role),
+                    command, timeout, cancellationToken);
             if (success)
                 return FirmwareCommandResult.Ok(output);
 
@@ -244,7 +264,11 @@ public class FirmwareCommandClient : IFirmwareCommandClient
         if (console != null)
         {
             availability.CurrentUniFiOsChannel = console.Firmware?.ReleaseChannel;
-            availability.AvailableUniFiOsChannels = console.Firmware?.Channels ?? [];
+            // A channel the console holds a build for is offered, whether or not channels lists it.
+            availability.AvailableUniFiOsChannels = (console.Firmware?.Channels ?? [])
+                .Concat(console.Firmware?.LatestByChannel?.Keys ?? Enumerable.Empty<string>())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
             availability.CurrentNetworkAppChannel = console.NetworkApplication?.ReleaseChannel;
             availability.CurrentNetworkAppVersion = console.NetworkApplication?.Version;
         }
@@ -266,19 +290,22 @@ public class FirmwareCommandClient : IFirmwareCommandClient
             : "none";
 
         _logger.LogInformation(
-            "Channels on site {Site}: devices={Device} (offers {DeviceOptions}), network={App} ({AppVersion}), os={Os}, osByChannel=[{OsByChannel}]",
+            "Channels on site {Site}: devices={Device} (offers {DeviceOptions}), network={App} ({AppVersion}, offers {AppOptions}), os={Os} (offers {OsOptions}), osByChannel=[{OsByChannel}]",
             _siteSlug,
             availability.CurrentDeviceChannel ?? "unknown",
-            availability.AvailableDeviceChannels.Count > 0
-                ? string.Join("/", availability.AvailableDeviceChannels)
-                : "unreadable",
+            OptionsSummary(availability.AvailableDeviceChannels),
             availability.CurrentNetworkAppChannel ?? "unknown",
             availability.CurrentNetworkAppVersion ?? "unknown",
+            OptionsSummary(availability.AvailableNetworkAppChannels),
             availability.CurrentUniFiOsChannel ?? "unknown",
+            OptionsSummary(availability.AvailableUniFiOsChannels),
             osByChannelSummary);
 
         return availability;
     }
+
+    private static string OptionsSummary(List<string> options) =>
+        options.Count > 0 ? string.Join("/", options) : "unreadable";
 
     /// <inheritdoc />
     public async Task<bool?> GetAutoUpgradeEnabledAsync(CancellationToken cancellationToken = default)
@@ -294,6 +321,40 @@ public class FirmwareCommandClient : IFirmwareCommandClient
         {
             _logger.LogWarning(ex, "Reading the console auto-upgrade flag failed for site {Site}", _siteSlug);
             return null;
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> DisableDeviceAutoUpgradeAsync(CancellationToken cancellationToken = default)
+    {
+        var client = await ConnectedClientAsync(cancellationToken);
+        if (client == null) return false;
+
+        try
+        {
+            return await client.SetDeviceAutoUpgradeAsync(false, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Turning off device auto-upgrade failed for site {Site}", _siteSlug);
+            return false;
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> DisableConsoleAutoUpdateAsync(string scheduleKey, CancellationToken cancellationToken = default)
+    {
+        var client = await ConnectedClientAsync(cancellationToken);
+        if (client == null) return false;
+
+        try
+        {
+            return await client.DisableConsoleAutoUpdateAsync(scheduleKey, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Turning off the {Schedule} auto-update failed for site {Site}", scheduleKey, _siteSlug);
+            return false;
         }
     }
 
@@ -321,7 +382,13 @@ public class FirmwareCommandClient : IFirmwareCommandClient
         if (networkAppChannel == null && unifiOsChannel == null) return true;
 
         var client = await ConnectedClientAsync(cancellationToken);
-        if (client == null) return false;
+        if (client == null)
+        {
+            _logger.LogWarning(
+                "Cannot set the console update channels on site {Site} (Network application: {App}, UniFi OS: {Os}): the UniFi Console is not connected",
+                _siteSlug, networkAppChannel ?? "unchanged", unifiOsChannel ?? "unchanged");
+            return false;
+        }
 
         try
         {
@@ -453,20 +520,26 @@ public class FirmwareCommandClient : IFirmwareCommandClient
 
     /// <inheritdoc />
     public async Task<FirmwareCommandResult> TriggerSshNetworkAppUpdateAsync(
-        string debUrl, CancellationToken cancellationToken = default)
+        string debUrl, IReadOnlyList<string>? companionUrls = null, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(debUrl))
             return FirmwareCommandResult.Failed("No .deb URL for the SSH Network app update.");
+        if (!IsPlainPackageUrl(debUrl))
+            return FirmwareCommandResult.Failed("The Network package URL is not a usable https link.");
 
         try
         {
-            var command = $"curl -fsSo /tmp/unifi-update.deb '{debUrl}' && apt-get install -y /tmp/unifi-update.deb && rm -f /tmp/unifi-update.deb";
-            var (success, output) = await _gatewaySsh.RunCommandAsync(command, timeout: TimeSpan.FromMinutes(5), cancellationToken: cancellationToken);
-            if (success)
+            // Detached: the download and install take minutes, and nothing should wait on them (the
+            // wizard's Start Now did). The rollout's own step watches the version, and reads the log
+            // for the reason when the script ends on a failure.
+            var script = NetworkOptimizer.Core.Helpers.GatewayFile.ToBase64(NetworkInstallCommand(debUrl, companionUrls));
+            var command = DetachedLaunchCommand(script, NetworkInstallScript, NetworkInstallLog);
+            var (success, output) = await _gatewaySsh.RunCommandAsync(command, timeout: TimeSpan.FromSeconds(60), cancellationToken: cancellationToken);
+            if (success && output.Contains("started", StringComparison.Ordinal))
                 return FirmwareCommandResult.Ok(output);
 
             return FirmwareCommandResult.Failed(
-                string.IsNullOrWhiteSpace(output) ? "The SSH Network app update failed." : output.Trim());
+                string.IsNullOrWhiteSpace(output) ? "The SSH Network app update could not be started." : output.Trim());
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -475,29 +548,344 @@ public class FirmwareCommandClient : IFirmwareCommandClient
         }
     }
 
+    /// <summary>
+    /// The Network install, with the companions it was released with. Network 11.x depends on exact
+    /// versions of packages that ship beside it (unifi-matter-controller 0.0.9 for 11.0.81), which a
+    /// console installs in the same batch; apt cannot fetch them on its own. Only the companions the
+    /// package's own Depends names are fetched, so another app updated in that batch never is.
+    /// </summary>
+    internal static string NetworkInstallCommand(string debUrl, IReadOnlyList<string>? companionUrls)
+    {
+        const string dir = "/tmp/netopt-network";
+        const string fail = "{ echo \"NETOPT_EXIT 1\"; exit 1; }";
+        var command = new System.Text.StringBuilder();
+        command.Append($"rm -rf {dir}; mkdir -p {dir} && curl -fsSo {dir}/unifi.deb '{debUrl}' || {fail}; ");
+
+        var companions = (companionUrls ?? [])
+            .Select(u => (Url: u, Name: CompanionName(u)))
+            .Where(c => c.Name != null && IsPlainPackageUrl(c.Url))
+            .ToList();
+        if (companions.Count > 0)
+        {
+            command.Append($"deps=$(dpkg-deb -f {dir}/unifi.deb Depends); ");
+            foreach (var (url, name) in companions)
+                command.Append($"echo \"$deps\" | grep -qE '(^|[ ,]){name}( |,|$)' && {{ curl -fsSo {dir}/{name}.deb '{url}' || {fail}; }}; ");
+        }
+
+        command.Append($"apt-get install -y {dir}/*.deb; rc=$?; rm -rf {dir}; echo \"NETOPT_EXIT $rc\"; exit $rc");
+        return command.ToString();
+    }
+
+    /// <summary>
+    /// Writes a base64 script to the gateway and starts it detached, returning as soon as it runs.
+    /// Only nohup goes in the background: backgrounding "write &amp;&amp; nohup" keeps a subshell on the
+    /// session's stdout until the install ends, so the session never closes and the start times out.
+    /// </summary>
+    internal static string DetachedLaunchCommand(string base64Script, string scriptPath, string logPath) =>
+        $"echo {base64Script} | base64 -d > {scriptPath} || exit 1; "
+        + $"nohup sh {scriptPath} > {logPath} 2>&1 < /dev/null & echo started";
+
+    private const string NetworkInstallScript = "/tmp/netopt-network.sh";
+    private const string NetworkInstallLog = "/tmp/netopt-network.log";
+
+    /// <inheritdoc />
+    public async Task<NetworkInstallLog?> ReadSshNetworkInstallLogAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var (success, output) = await _gatewaySsh.RunCommandAsync(
+                $"tail -c 4000 {NetworkInstallLog} 2>/dev/null", timeout: TimeSpan.FromSeconds(30), cancellationToken: cancellationToken);
+            return success ? ParseNetworkInstallLog(output) : null;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "Could not read the Network install log on site {Site}", _siteSlug);
+            return null;
+        }
+    }
+
+    /// <summary>The script's exit code, once it has written one, and the output before it.</summary>
+    internal static NetworkInstallLog ParseNetworkInstallLog(string? output)
+    {
+        var text = output ?? string.Empty;
+        var match = System.Text.RegularExpressions.Regex.Match(text, @"NETOPT_EXIT (\d+)");
+        return new NetworkInstallLog(match.Success ? int.Parse(match.Groups[1].Value) : null, text[..(match.Success ? match.Index : text.Length)]);
+    }
+
+    /// <summary>The package name a console package URL is filed under (<c>/data/&lt;name&gt;/...</c>).</summary>
+    private static string? CompanionName(string url)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(url, @"^https://fw-download\.ubnt\.com/data/([a-z0-9-]+)/[^/]+\.deb$");
+        return match.Success ? match.Groups[1].Value : null;
+    }
+
+    /// <summary>An https package URL with nothing a shell could read as anything but the URL.</summary>
+    private static bool IsPlainPackageUrl(string url) =>
+        System.Text.RegularExpressions.Regex.IsMatch(url, @"^https://[A-Za-z0-9.-]+/[A-Za-z0-9._~/+-]+\.deb$");
+
+    private const string OsInstallScript = "/tmp/netopt-unifi-os.sh";
+    private const string OsInstallLog = "/tmp/netopt-unifi-os.log";
+
     /// <inheritdoc />
     public async Task<FirmwareCommandResult> TriggerSshUniFiOsUpdateAsync(
-        string firmwareUrl, CancellationToken cancellationToken = default)
+        string firmwareUrl, string attemptId, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(firmwareUrl))
             return FirmwareCommandResult.Failed("No firmware URL for the SSH UniFi OS update.");
         if (!NetworkOptimizer.Core.Helpers.UrlSafety.IsSafeHttpUrl(firmwareUrl))
             return FirmwareCommandResult.Failed("The firmware image URL is not a usable http(s) URL.");
+        if (string.IsNullOrWhiteSpace(attemptId) || !attemptId.All(char.IsAsciiLetterOrDigit))
+            return FirmwareCommandResult.Failed("The install attempt id must be alphanumeric.");
 
         try
         {
-            var (success, output) = await _gatewaySsh.RunCommandAsync(
-                $"ubnt-systool fwupdate '{firmwareUrl}'", timeout: TimeSpan.FromMinutes(5), cancellationToken: cancellationToken);
-            if (success)
+            // Detached, as the Network install is: the download and write take minutes, and the
+            // writer must outlive the SSH session that started it. The start line is what tells a
+            // later read that this attempt reached the gateway when the session itself dropped.
+            var script = NetworkOptimizer.Core.Helpers.GatewayFile.ToBase64(
+                $"echo \"NETOPT_START {attemptId}\"; ubnt-systool fwupdate '{firmwareUrl}'; echo \"NETOPT_EXIT $?\"");
+            var command = DetachedLaunchCommand(script, OsInstallScript, OsInstallLog);
+            var (success, output) = await _gatewaySsh.RunCommandAsync(command, timeout: TimeSpan.FromSeconds(60), cancellationToken: cancellationToken);
+            if (success && output.Contains("started", StringComparison.Ordinal))
                 return FirmwareCommandResult.Ok(output);
 
             return FirmwareCommandResult.Failed(
-                string.IsNullOrWhiteSpace(output) ? "The SSH UniFi OS update failed." : output.Trim());
+                string.IsNullOrWhiteSpace(output) ? "The SSH UniFi OS update could not be started." : output.Trim());
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogWarning(ex, "SSH UniFi OS update for site {Site} threw", _siteSlug);
             return FirmwareCommandResult.Failed($"The SSH UniFi OS update failed: {ex.Message}");
         }
+    }
+
+    /// <inheritdoc />
+    public async Task<UniFiOsInstallLog?> ReadSshUniFiOsInstallLogAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var (success, output) = await _gatewaySsh.RunCommandAsync(
+                $"tail -c 4000 {OsInstallLog} 2>/dev/null", timeout: TimeSpan.FromSeconds(30), cancellationToken: cancellationToken);
+            return success ? ParseUniFiOsInstallLog(output) : null;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "Could not read the UniFi OS install log on site {Site}", _siteSlug);
+            return null;
+        }
+    }
+
+    /// <summary>The attempt that wrote the log, its exit code once it has one, and the output between.</summary>
+    internal static UniFiOsInstallLog ParseUniFiOsInstallLog(string? output)
+    {
+        var text = output ?? string.Empty;
+        var start = System.Text.RegularExpressions.Regex.Match(text, @"NETOPT_START (\w+)");
+        var exit = System.Text.RegularExpressions.Regex.Match(text, @"NETOPT_EXIT (\d+)");
+        var from = start.Success ? start.Index + start.Length : 0;
+        var to = exit.Success ? exit.Index : text.Length;
+        return new UniFiOsInstallLog(
+            start.Success ? start.Groups[1].Value : null,
+            exit.Success ? int.Parse(exit.Groups[1].Value) : null,
+            text[from..Math.Max(from, to)].Trim());
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> HasGatewaySshAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var settings = await _gatewaySsh.GetSettingsAsync();
+            return settings != null && settings.Enabled && settings.HasCredentials && !string.IsNullOrEmpty(settings.Host);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "Could not read gateway SSH settings for site {Site}", _siteSlug);
+            return false;
+        }
+    }
+
+    // UniFi OS answers an unregistered /proxy path with its login page (200 text/html), and answers
+    // a registered one itself (401 JSON) even while Network is stopped. So the route says only
+    // whether UniFi OS knows Network; Network's own port says whether it is up.
+    private const string NetworkRouteCommand =
+        "echo \"NETOPT_STATUS $(curl -s -m 5 http://127.0.0.1:8081/status 2>/dev/null | tr -d '\\r\\n')\"; "
+        + "echo \"NETOPT_ROUTE $(curl -sk -m 5 -o /dev/null -w '%{content_type}' https://127.0.0.1/proxy/network/status 2>/dev/null)\"";
+
+    /// <inheritdoc />
+    public async Task<NetworkRouteState?> ProbeNetworkRouteAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var (success, output) = await _gatewaySsh.RunCommandAsync(
+                NetworkRouteCommand, timeout: TimeSpan.FromSeconds(30), cancellationToken: cancellationToken);
+            return success ? ParseNetworkRoute(output) : null;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "Could not read the UniFi Network route on site {Site}", _siteSlug);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Unrouted only on both signals together: Network says it is running, and UniFi OS serves its
+    /// login page for the route. Anything unrecognized reads as not ready, which acts on nothing.
+    /// </summary>
+    internal static NetworkRouteState ParseNetworkRoute(string? output)
+    {
+        string? status = null;
+        string? route = null;
+        foreach (var raw in (output ?? string.Empty).Split('\n'))
+        {
+            var line = raw.TrimEnd('\r');
+            if (line.StartsWith("NETOPT_STATUS ", StringComparison.Ordinal))
+                status = line["NETOPT_STATUS ".Length..];
+            else if (line.StartsWith("NETOPT_ROUTE ", StringComparison.Ordinal))
+                route = line["NETOPT_ROUTE ".Length..].Trim();
+        }
+
+        UniFiNetworkStatus? parsed = null;
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(status))
+                parsed = System.Text.Json.JsonSerializer.Deserialize<UniFiNetworkStatus>(status);
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            // A truncated or non-JSON answer reads as not ready below.
+        }
+
+        if (parsed?.IsRunning != true)
+            return NetworkRouteState.NotReady;
+        if (route != null && route.StartsWith("application/json", StringComparison.OrdinalIgnoreCase))
+            return NetworkRouteState.Routed;
+        if (route != null && route.StartsWith("text/html", StringComparison.OrdinalIgnoreCase))
+            return NetworkRouteState.Unrouted;
+        return NetworkRouteState.NotReady;
+    }
+
+    /// <inheritdoc />
+    public async Task<FirmwareCommandResult> RestartNetworkApplicationAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var (success, output) = await _gatewaySsh.RunCommandAsync(
+                "systemctl restart --no-block unifi && echo restarting", timeout: TimeSpan.FromSeconds(30), cancellationToken: cancellationToken);
+            return success && output.Contains("restarting", StringComparison.Ordinal)
+                ? FirmwareCommandResult.Ok(output)
+                : FirmwareCommandResult.Failed(string.IsNullOrWhiteSpace(output) ? "UniFi Network could not be restarted over SSH." : output.Trim());
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "SSH restart of UniFi Network on site {Site} threw", _siteSlug);
+            return FirmwareCommandResult.Failed($"The SSH restart of UniFi Network failed: {ex.Message}");
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<FirmwareCommandResult> RebootConsoleAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            // Backgrounded with a short delay, as the health check reboot remedy is, so the session
+            // gets its answer back before the console goes away.
+            var (success, output) = await _gatewaySsh.RunCommandAsync(
+                "( sleep 2; reboot ) >/dev/null 2>&1 & echo rebooting", timeout: TimeSpan.FromSeconds(30), cancellationToken: cancellationToken);
+            return success && output.Contains("rebooting", StringComparison.Ordinal)
+                ? FirmwareCommandResult.Ok(output)
+                : FirmwareCommandResult.Failed(string.IsNullOrWhiteSpace(output) ? "The Console could not be rebooted over SSH." : output.Trim());
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "SSH reboot of the console on site {Site} threw", _siteSlug);
+            return FirmwareCommandResult.Failed($"The SSH reboot of the Console failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>One read per site per window: every preview and Deploy Known Firmware asks for it.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime At, ConsoleNetworkPackages Read)> NetworkPackageReads =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly TimeSpan NetworkPackageReadWindow = TimeSpan.FromMinutes(10);
+
+    // uos.log records each download as "Downloading runnable package_name=<name> url=<url>", and each
+    // install as "Install downloaded packages package_paths={".../<name>_<file>.deb", ...}": the batch
+    // is what says which packages a Network build was installed with.
+    private const string NetworkPackagesCommand =
+        ". /etc/os-release; echo \"PLATFORM uos-deb${VERSION_ID%%.*}-$(dpkg --print-architecture)\"; "
+        + "grep -hoE 'url=https://fw-download\\.ubnt\\.com/data/[a-z0-9-]+/[^ ]+\\.deb|package_paths=\\{[^}]*\\}' "
+        + "/data/unifi-core/logs/uos.log* 2>/dev/null | tail -400";
+
+    /// <inheritdoc />
+    public async Task<ConsoleNetworkPackages?> ReadConsoleNetworkPackagesAsync(bool fresh = false, CancellationToken cancellationToken = default)
+    {
+        if (!fresh && NetworkPackageReads.TryGetValue(_siteSlug, out var cached) && DateTime.UtcNow - cached.At < NetworkPackageReadWindow)
+            return cached.Read;
+        if (!await HasGatewaySshAsync(cancellationToken))
+            return null;
+
+        try
+        {
+            var (success, output) = await _gatewaySsh.RunCommandAsync(
+                NetworkPackagesCommand, timeout: TimeSpan.FromSeconds(30), cancellationToken: cancellationToken);
+            if (!success) return null;
+
+            var read = ParseConsoleNetworkPackages(output);
+            NetworkPackageReads[_siteSlug] = (DateTime.UtcNow, read);
+            return read;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "Could not read the console's Network packages on site {Site}", _siteSlug);
+            return null;
+        }
+    }
+
+    /// <summary>Parses <see cref="NetworkPackagesCommand"/>'s output.</summary>
+    internal static ConsoleNetworkPackages ParseConsoleNetworkPackages(string? output)
+    {
+        string? platform = null;
+        var urlByFile = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var batches = new List<List<string>>();
+        foreach (var raw in (output ?? string.Empty).Split('\n'))
+        {
+            var line = raw.Trim();
+            if (line.StartsWith("PLATFORM ", StringComparison.Ordinal))
+            {
+                var value = line["PLATFORM ".Length..].Trim().ToLowerInvariant();
+                platform = System.Text.RegularExpressions.Regex.IsMatch(value, @"^uos-deb\d+-(amd64|arm64)$") ? value : null;
+            }
+            else if (line.StartsWith("url=", StringComparison.Ordinal))
+            {
+                var url = line["url=".Length..];
+                if (NetworkOptimizer.Core.Helpers.UrlSafety.IsSafeHttpUrl(url)) urlByFile[url[(url.LastIndexOf('/') + 1)..]] = url;
+            }
+            else if (line.StartsWith("package_paths=", StringComparison.Ordinal))
+            {
+                // Downloaded as "<name>_<file>"; the file is the URL's last segment.
+                batches.Add(System.Text.RegularExpressions.Regex.Matches(line, "\"[^\"]*/([a-z0-9-]+)_([^\"/]+\\.deb)\"")
+                    .Select(m => m.Groups[2].Value).ToList());
+            }
+        }
+
+        var downloaded = new List<NetworkOptimizer.Storage.Models.SharedNetworkAppPackage>();
+        foreach (var url in urlByFile.Values)
+        {
+            if (FirmwareUrlParser.NetworkPackage(url) is not { } package) continue;
+
+            var file = url[(url.LastIndexOf('/') + 1)..];
+            var companions = batches.LastOrDefault(b => b.Contains(file, StringComparer.OrdinalIgnoreCase))?
+                .Where(f => !string.Equals(f, file, StringComparison.OrdinalIgnoreCase) && urlByFile.ContainsKey(f))
+                .Select(f => urlByFile[f])
+                .ToList();
+            downloaded.Add(new NetworkOptimizer.Storage.Models.SharedNetworkAppPackage
+            {
+                Platform = package.Platform,
+                Version = package.Version,
+                Url = url,
+                CompanionUrlsJson = companions is { Count: > 0 } ? System.Text.Json.JsonSerializer.Serialize(companions) : null,
+            });
+        }
+        return new ConsoleNetworkPackages(platform, downloaded);
     }
 }

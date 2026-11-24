@@ -30,6 +30,8 @@ public class ConfigAuditEngine
     private readonly FirewallRuleAnalyzer _firewallAnalyzer;
     private readonly DnsSecurityAnalyzer _dnsAnalyzer;
     private readonly UpnpSecurityAnalyzer _upnpAnalyzer;
+    private readonly ConsoleAccessAnalyzer _consoleAccessAnalyzer;
+    private readonly GatewayFirewallAnalyzer _gatewayFirewallAnalyzer;
     private readonly WirelessConfigAnalyzer _wirelessConfigAnalyzer;
     private readonly DeviceFirmwareAnalyzer _deviceFirmwareAnalyzer;
     private readonly MdnsScopeAnalyzer _mdnsScopeAnalyzer;
@@ -54,10 +56,18 @@ public class ConfigAuditEngine
         public List<int>? DnatExcludedVlanIds { get; init; }
         public int? PiholeManagementPort { get; init; }  // Used for all third-party DNS (Pi-hole, AdGuard Home, etc.)
         public string? PiholeManagementUrl { get; init; }
+        public Monitoring.Providers.IDeviceDialer? Dialer { get; init; }
         public List<string>? TrustedDnsRedirectTargets { get; init; }
+        public bool AllowGuestPublicDns { get; init; }
         public bool? UpnpEnabled { get; init; }
         public List<UniFiPortForwardRule>? PortForwardRules { get; init; }
         public List<UniFiNetworkConfig>? NetworkConfigs { get; init; }
+        public List<UniFiOsUser>? ConsoleUsers { get; init; }
+        public List<UniFiOsApiKey>? ConsoleApiKeys { get; init; }
+        public string? ConnectedUsername { get; init; }
+        public GatewayFirewallSnapshot? GatewayFirewall { get; init; }
+        public List<GatewayWanPath>? GatewayWanInterfaces { get; init; }
+        public GatewayBlocklistExpectation? GatewayBlocklist { get; init; }
         public List<UniFiWlanConfig>? WlanConfigs { get; init; }
 
         // Populated by phases
@@ -66,6 +76,8 @@ public class ConfigAuditEngine
         public List<WirelessClientInfo> WirelessClients { get; set; } = [];
         public List<OfflineClientInfo> OfflineClients { get; set; } = [];
         public Dictionary<string, string?> ApNameToModel { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>Access points by MAC with their current name and model; names an offline client's last AP after a rename.</summary>
+        public Dictionary<string, (string Name, string? ModelName)> ApsByMac { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public List<AuditIssue> AllIssues { get; } = [];
         public List<string> HardeningMeasures { get; set; } = [];
         public DnsSecurityResult? DnsSecurityResult { get; set; }
@@ -165,6 +177,8 @@ public class ConfigAuditEngine
             new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(3) });
         _dnsAnalyzer = new DnsSecurityAnalyzer(loggerFactory.CreateLogger<DnsSecurityAnalyzer>(), thirdPartyDetector);
         _upnpAnalyzer = new UpnpSecurityAnalyzer(loggerFactory.CreateLogger<UpnpSecurityAnalyzer>());
+        _consoleAccessAnalyzer = new ConsoleAccessAnalyzer(loggerFactory.CreateLogger<ConsoleAccessAnalyzer>());
+        _gatewayFirewallAnalyzer = new GatewayFirewallAnalyzer(loggerFactory.CreateLogger<GatewayFirewallAnalyzer>());
         _wirelessConfigAnalyzer = new WirelessConfigAnalyzer(loggerFactory.CreateLogger<WirelessConfigAnalyzer>());
         _deviceFirmwareAnalyzer = new DeviceFirmwareAnalyzer(loggerFactory.CreateLogger<DeviceFirmwareAnalyzer>());
         _mdnsScopeAnalyzer = new MdnsScopeAnalyzer(loggerFactory.CreateLogger<MdnsScopeAnalyzer>());
@@ -326,8 +340,10 @@ public class ConfigAuditEngine
         await ExecutePhase5b_AnalyzeDnsSecurityAsync(ctx);
         ExecutePhase5c_AnalyzeUpnpSecurity(ctx);
         ExecutePhase5d_AnalyzeThreatExposure(ctx);
-        ExecutePhase5e_AnalyzeDeviceFirmware(ctx);
-        ExecutePhase5f_AnalyzeMdnsScope(ctx);
+        ExecutePhase5e_AnalyzeConsoleAccess(ctx);
+        ExecutePhase5f_AnalyzeGatewayFirewall(ctx);
+        ExecutePhase5g_AnalyzeDeviceFirmware(ctx);
+        ExecutePhase5h_AnalyzeMdnsScope(ctx);
         ExecutePhase6_AnalyzeHardeningMeasures(ctx);
 
         // Build and score the final result
@@ -408,7 +424,7 @@ public class ConfigAuditEngine
             _logger.LogInformation("Firewall zone data available: {ZoneCount} zones", request.FirewallZones.Count);
 
         // Determine external zone ID from WAN network or legacy rules
-        var externalZoneId = DetermineExternalZoneId(request.NetworkConfigs, request.FirewallRules);
+        var externalZoneId = DetermineExternalZoneId(request.NetworkConfigs, request.FirewallRules, zoneLookup, _logger);
 
         // Validate zone assumptions if we have both zone lookup and external zone ID
         if (zoneLookup.HasZoneData && externalZoneId != null)
@@ -442,10 +458,18 @@ public class ConfigAuditEngine
             DnatExcludedVlanIds = request.DnatExcludedVlanIds,
             PiholeManagementPort = request.PiholeManagementPort,
             PiholeManagementUrl = request.PiholeManagementUrl,
+            Dialer = request.Dialer,
             TrustedDnsRedirectTargets = request.TrustedDnsRedirectTargets,
+            AllowGuestPublicDns = request.AllowGuestPublicDns,
             UpnpEnabled = request.UpnpEnabled,
             PortForwardRules = request.PortForwardRules,
             NetworkConfigs = request.NetworkConfigs,
+            ConsoleUsers = request.ConsoleUsers,
+            ConsoleApiKeys = request.ConsoleApiKeys,
+            ConnectedUsername = request.ConnectedUsername,
+            GatewayFirewall = request.GatewayFirewall,
+            GatewayWanInterfaces = request.GatewayWanInterfaces,
+            GatewayBlocklist = request.GatewayBlocklist,
             WlanConfigs = request.WlanConfigs,
             FirewallZones = request.FirewallZones,
             ZoneLookup = zoneLookup,
@@ -459,8 +483,11 @@ public class ConfigAuditEngine
     /// Determine the External/WAN firewall zone ID from network configurations or firewall rules.
     /// First tries to find zone ID from WAN network configs (v2 zone-based).
     /// Falls back to synthetic legacy zone ID for legacy systems without zone IDs.
+    /// A WAN zone ID that matches no zone (UniFi Network's data left it dangling) yields the zone list's External zone;
+    /// the Gateway Firewall check reports the inconsistency.
     /// </summary>
-    private string? DetermineExternalZoneId(List<UniFiNetworkConfig>? networkConfigs, List<FirewallRule>? firewallRules)
+    internal static string? DetermineExternalZoneId(List<UniFiNetworkConfig>? networkConfigs, List<FirewallRule>? firewallRules,
+        FirewallZoneLookup zoneLookup, ILogger logger)
     {
         // Try to find zone ID from network configs first (v2 zone-based systems)
         if (networkConfigs != null && networkConfigs.Count > 0)
@@ -470,7 +497,14 @@ public class ConfigAuditEngine
 
             if (wanNetwork?.FirewallZoneId != null)
             {
-                _logger.LogDebug("Determined External Zone ID from WAN network '{Name}': {ZoneId}",
+                if (zoneLookup.HasZoneData && zoneLookup.GetZoneById(wanNetwork.FirewallZoneId) == null
+                    && zoneLookup.GetExternalZoneId() is { } external)
+                {
+                    logger.LogWarning("WAN network '{Name}' points at firewall zone {ZoneId}, which does not exist; using the External zone {External}",
+                        wanNetwork.Name, wanNetwork.FirewallZoneId, external);
+                    return external;
+                }
+                logger.LogDebug("Determined External Zone ID from WAN network '{Name}': {ZoneId}",
                     wanNetwork.Name, wanNetwork.FirewallZoneId);
                 return wanNetwork.FirewallZoneId;
             }
@@ -479,12 +513,12 @@ public class ConfigAuditEngine
             // Use synthetic legacy zone ID for firewall rule analysis
             if (wanNetwork != null)
             {
-                _logger.LogDebug("WAN network '{Name}' has no firewall_zone_id (legacy system), using synthetic legacy zone ID",
+                logger.LogDebug("WAN network '{Name}' has no firewall_zone_id (legacy system), using synthetic legacy zone ID",
                     wanNetwork.Name);
                 return FirewallRuleParser.LegacyExternalZoneId;
             }
 
-            _logger.LogDebug("No WAN network found in {Count} network configs", networkConfigs.Count);
+            logger.LogDebug("No WAN network found in {Count} network configs", networkConfigs.Count);
         }
 
         // Fall back to synthetic legacy zone ID if any rules already use it
@@ -493,7 +527,7 @@ public class ConfigAuditEngine
                 r.DestinationZoneId == FirewallRuleParser.LegacyExternalZoneId ||
                 r.SourceZoneId == FirewallRuleParser.LegacyExternalZoneId))
         {
-            _logger.LogDebug("Using synthetic legacy External Zone ID from firewall rules");
+            logger.LogDebug("Using synthetic legacy External Zone ID from firewall rules");
             return FirewallRuleParser.LegacyExternalZoneId;
         }
 
@@ -626,8 +660,11 @@ public class ConfigAuditEngine
             .Where(ap => !string.IsNullOrEmpty(ap.Name))
             .GroupBy(ap => ap.Name, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => g.First().ModelName, StringComparer.OrdinalIgnoreCase);
+        ctx.ApsByMac = apLookup
+            .Where(kv => !string.IsNullOrEmpty(kv.Value.Name))
+            .ToDictionary(kv => kv.Key, kv => (kv.Value.Name, kv.Value.ModelName), StringComparer.OrdinalIgnoreCase);
 
-        ctx.WirelessClients = ctx.SecurityEngine.ExtractWirelessClients(ctx.Clients, ctx.Networks, apLookup);
+        ctx.WirelessClients =ctx.SecurityEngine.ExtractWirelessClients(ctx.Clients, ctx.Networks, apLookup);
         var wirelessIssues = ctx.SecurityEngine.AnalyzeWirelessClients(ctx.WirelessClients, ctx.Networks);
         ctx.AllIssues.AddRange(wirelessIssues);
         _logger.LogInformation("Found {IssueCount} wireless client issues from {ClientCount} detected devices",
@@ -718,8 +755,12 @@ public class ConfigAuditEngine
         NetworkInfo lastNetwork,
         DeviceDetectionResult detection)
     {
+        // The history keeps the AP's name from the client's last visit; the AP's MAC names it as it is now.
+        string? currentUplinkName = null;
         string? lastUplinkModelName = null;
-        if (!string.IsNullOrEmpty(historyClient.LastUplinkName))
+        if (!string.IsNullOrEmpty(historyClient.LastUplinkMac) && ctx.ApsByMac.TryGetValue(historyClient.LastUplinkMac, out var ap))
+            (currentUplinkName, lastUplinkModelName) = ap;
+        else if (!string.IsNullOrEmpty(historyClient.LastUplinkName))
             ctx.ApNameToModel.TryGetValue(historyClient.LastUplinkName, out lastUplinkModelName);
 
         ctx.OfflineClients.Add(new OfflineClientInfo
@@ -727,6 +768,7 @@ public class ConfigAuditEngine
             HistoryClient = historyClient,
             LastNetwork = lastNetwork,
             Detection = detection,
+            CurrentUplinkName = currentUplinkName,
             LastUplinkModelName = lastUplinkModelName
         });
     }
@@ -768,7 +810,7 @@ public class ConfigAuditEngine
             return;
 
         var isRecent = historyClient.LastSeen >= twoWeeksAgo;
-        var displayName = historyClient.DisplayName ?? historyClient.Name ?? historyClient.Hostname ?? historyClient.Mac;
+        var displayName = UniFi.ClientNames.For(historyClient) ?? historyClient.Mac;
 
         // Different messaging for allowed vs not-allowed devices
         string message;
@@ -813,7 +855,7 @@ public class ConfigAuditEngine
             return;
 
         var isRecent = historyClient.LastSeen >= twoWeeksAgo;
-        var displayName = historyClient.DisplayName ?? historyClient.Name ?? historyClient.Hostname ?? historyClient.Mac;
+        var displayName = UniFi.ClientNames.For(historyClient) ?? historyClient.Mac;
 
         var ruleId = isCloudCamera ? "OFFLINE-CLOUD-CAMERA-VLAN" : "OFFLINE-CAMERA-VLAN";
         var message = isCloudCamera
@@ -845,7 +887,7 @@ public class ConfigAuditEngine
             return;
 
         var isRecent = historyClient.LastSeen >= twoWeeksAgo;
-        var displayName = historyClient.DisplayName ?? historyClient.Name ?? historyClient.Hostname ?? historyClient.Mac;
+        var displayName = UniFi.ClientNames.For(historyClient) ?? historyClient.Mac;
 
         // Different messaging for allowed vs not-allowed devices
         string message;
@@ -938,30 +980,30 @@ public class ConfigAuditEngine
     }
 
     /// <summary>
-    /// Phase 5e: Analyze device firmware state from /stat/device JSON.
+    /// Phase 5g: Analyze device firmware state from /stat/device JSON.
     /// Flags devices with available firmware updates and end-of-life models.
     /// </summary>
-    private void ExecutePhase5e_AnalyzeDeviceFirmware(AuditContext ctx)
+    private void ExecutePhase5g_AnalyzeDeviceFirmware(AuditContext ctx)
     {
-        _logger.LogInformation("Phase 5e: Analyzing device firmware state");
+        _logger.LogInformation("Phase 5g: Analyzing device firmware state");
         var firmwareIssues = _deviceFirmwareAnalyzer.Analyze(ctx.DeviceData);
         ctx.AllIssues.AddRange(firmwareIssues);
         _logger.LogInformation("Found {IssueCount} device firmware issues", firmwareIssues.Count);
     }
 
     /// <summary>
-    /// Phase 5f: Analyze mDNS reflector scope across networks.
+    /// Phase 5h: Analyze mDNS reflector scope across networks.
     /// Flags mDNS enabled on networks the audit otherwise treats as isolated.
     /// </summary>
-    private void ExecutePhase5f_AnalyzeMdnsScope(AuditContext ctx)
+    private void ExecutePhase5h_AnalyzeMdnsScope(AuditContext ctx)
     {
         if (ctx.NetworkConfigs == null || ctx.NetworkConfigs.Count == 0)
         {
-            _logger.LogDebug("Phase 5f: Skipping mDNS scope analysis (no network configs)");
+            _logger.LogDebug("Phase 5h: Skipping mDNS scope analysis (no network configs)");
             return;
         }
 
-        _logger.LogInformation("Phase 5f: Analyzing mDNS scope");
+        _logger.LogInformation("Phase 5h: Analyzing mDNS scope");
         var mdnsIssues = _mdnsScopeAnalyzer.Analyze(ctx.NetworkConfigs);
         ctx.AllIssues.AddRange(mdnsIssues);
         _logger.LogInformation("Found {IssueCount} mDNS scope issues", mdnsIssues.Count);
@@ -1006,14 +1048,19 @@ public class ConfigAuditEngine
 
         // Check if there's a 5G/LTE device on the network
         // Check all raw devices since 5G modems may not have port tables (not in Switches)
-        var has5GDevice = ctx.DeviceData.ValueKind is JsonValueKind.Array or JsonValueKind.Object &&
-            ctx.DeviceData.UnwrapDataArray().Any(d =>
+        var cellularDevices = ctx.DeviceData.ValueKind is JsonValueKind.Array or JsonValueKind.Object
+            ? ctx.DeviceData.UnwrapDataArray().Where(d =>
                 UniFi.UniFiProductDatabase.IsCellularModem(
                     d.GetStringOrNull("model"),
                     d.GetStringOrNull("shortname"),
-                    d.GetStringOrNull("type")));
+                    d.GetStringOrNull("type")))
+                .Select(d => new CellularModemIdentity(d.GetStringOrNull("ip"), d.GetStringOrNull("mac")))
+                .ToList()
+            : [];
+        var has5GDevice = cellularDevices.Count > 0;
 
-        var mgmtFirewallIssues = _firewallAnalyzer.AnalyzeManagementNetworkFirewallAccess(firewallRules, ctx.Networks, has5GDevice, ctx.ExternalZoneId);
+        var mgmtFirewallIssues = _firewallAnalyzer.AnalyzeManagementNetworkFirewallAccess(
+            firewallRules, ctx.Networks, has5GDevice, ctx.ExternalZoneId, cellularDevices);
 
         // Analyze internet access with firewall rules to detect both methods of blocking:
         // 1. internet_access_enabled=false in network config
@@ -1026,7 +1073,12 @@ public class ConfigAuditEngine
         // 2. Firewall rule blocking network -> other internal networks
         var networkIsolationIssues = _vlanAnalyzer.AnalyzeNetworkIsolation(ctx.Networks, gatewayName, firewallRules, ctx.ZoneLookup);
 
+        var wanExposureIssues = WanGatewayExposureAnalyzer.Analyze(firewallRules, ctx.ExternalZoneId,
+            ctx.ZoneLookup?.GetZoneByKey(FirewallZoneKeys.Gateway)?.Id,
+            WanGatewayExposureAnalyzer.ReadDirectRemoteConnection(ctx.SettingsData));
+
         ctx.AllIssues.AddRange(firewallIssues);
+        ctx.AllIssues.AddRange(wanExposureIssues);
         ctx.AllIssues.AddRange(mgmtFirewallIssues);
         ctx.AllIssues.AddRange(internetAccessIssues);
         ctx.AllIssues.AddRange(networkIsolationIssues);
@@ -1056,7 +1108,7 @@ public class ConfigAuditEngine
                 .Where(g => !string.IsNullOrEmpty(g.Id))
                 .ToDictionary(g => g.Id, g => g);
             ctx.DnsSecurityResult = await _dnsAnalyzer.AnalyzeAsync(
-                ctx.SettingsData, ctx.FirewallRules, ctx.Switches, ctx.Networks, ctx.DeviceData, ctx.PiholeManagementPort, ctx.NatRulesData, ctx.DnatExcludedVlanIds, ctx.ExternalZoneId, ctx.ZoneLookup, firewallGroupsDict, ctx.PiholeManagementUrl, ctx.NetworkConfigs, ctx.TrustedDnsRedirectTargets);
+                ctx.SettingsData, ctx.FirewallRules, ctx.Switches, ctx.Networks, ctx.DeviceData, ctx.PiholeManagementPort, ctx.NatRulesData, ctx.DnatExcludedVlanIds, ctx.ExternalZoneId, ctx.ZoneLookup, firewallGroupsDict, ctx.PiholeManagementUrl, ctx.NetworkConfigs, ctx.TrustedDnsRedirectTargets, ctx.Dialer, ctx.AllowGuestPublicDns);
             ctx.AllIssues.AddRange(ctx.DnsSecurityResult.Issues);
             ctx.HardeningMeasures.AddRange(ctx.DnsSecurityResult.HardeningNotes);
             _logger.LogInformation("Found {IssueCount} DNS security issues", ctx.DnsSecurityResult.Issues.Count);
@@ -1166,6 +1218,51 @@ public class ConfigAuditEngine
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Phase 5e: unused console API keys and local admin accounts. Each list is null when the
+    /// connection could not read it, and that half is skipped.
+    /// </summary>
+    private void ExecutePhase5e_AnalyzeConsoleAccess(AuditContext ctx)
+    {
+        if (ctx.ConsoleUsers == null && ctx.ConsoleApiKeys == null)
+            return;
+
+        _logger.LogInformation("Phase 5e: Analyzing console access");
+        ctx.AllIssues.AddRange(_consoleAccessAnalyzer.Analyze(
+            ctx.ConsoleUsers, ctx.ConsoleApiKeys, DateTimeOffset.UtcNow, ctx.ConnectedUsername));
+    }
+
+    /// <summary>
+    /// Phase 5f: the gateway's own firewall against UniFi Network's configuration. Skipped when the gateway
+    /// could not be read over SSH.
+    /// </summary>
+    private void ExecutePhase5f_AnalyzeGatewayFirewall(AuditContext ctx)
+    {
+        if (ctx.GatewayFirewall == null)
+            return;
+
+        _logger.LogInformation("Phase 5f: Analyzing the gateway's firewall");
+        var gatewayName = ctx.Switches.FirstOrDefault(s => s.IsGateway)?.Name ?? "Gateway";
+        ctx.AllIssues.AddRange(_gatewayFirewallAnalyzer.Analyze(ctx.GatewayFirewall, ctx.FirewallRules, ctx.FirewallZones,
+            ctx.NetworkConfigs, ctx.GatewayWanInterfaces, ctx.GatewayBlocklist, gatewayName));
+
+        // Phase 5 already reported the ports a policy opens; the gateway's own accepts confirm those and raise the rest.
+        // Zone-based only: Phase 5 does not read legacy WAN_LOCAL rules, so their accepts would all read as unexplained.
+        if (ctx.FirewallZones is not { Count: > 0 })
+            return;
+        var configExposures = ctx.AllIssues.Where(i => i.Type == IssueTypes.GatewayWanManagementExposed).ToList();
+        var explained = configExposures.SelectMany(PortsOf).ToHashSet(StringComparer.Ordinal);
+        var (wanIssues, accepted) = _gatewayFirewallAnalyzer.AnalyzeWanManagementAccess(ctx.GatewayFirewall, explained);
+        foreach (var issue in configExposures.Where(i => PortsOf(i).Any(accepted.Contains)))
+            issue.Metadata![WanGatewayExposureAnalyzer.EnforcedKey] = true;
+        ctx.AllIssues.AddRange(wanIssues);
+
+        static IEnumerable<string> PortsOf(AuditIssue issue) =>
+            issue.Metadata?.GetValueOrDefault(WanGatewayExposureAnalyzer.PortsKey) is string ports
+                ? ports.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                : [];
     }
 
     /// <summary>
@@ -1343,6 +1440,7 @@ public class ConfigAuditEngine
             DoqBlocked = dnsSecurityResult.HasDoqBlockRule,
             DoqProvidesFullCoverage = dnsSecurityResult.DoqProvidesFullCoverage,
             DohBypassBlocked = dnsSecurityResult.HasDohBlockRule,
+            DohProvidesFullCoverage = dnsSecurityResult.DohProvidesFullCoverage,
             Doh3Blocked = dnsSecurityResult.HasDoh3BlockRule,
             WanDnsServers = dnsSecurityResult.WanDnsServers.ToList(),
             WanDnsPtrResults = dnsSecurityResult.WanDnsPtrResults.ToList(),

@@ -58,6 +58,16 @@ public sealed class TunnelClient
     // side: worst case a frame is re-sent, never dropped.
     private volatile bool _ackless;
 
+    private long? _openedAtTicks;
+
+    /// <summary>
+    /// From the server hello to the last message the server sent: how long this tunnel carried
+    /// traffic. Null when it never opened. A silent tail (the watchdog's 150 s) does not count.
+    /// </summary>
+    public TimeSpan? HealthyFor => _openedAtTicks is { } openedAt
+        ? TimeSpan.FromMilliseconds(Volatile.Read(ref _lastInboundTicks) - openedAt)
+        : null;
+
     /// <summary>Invoked whenever the server pushes a new probe configuration.</summary>
     public Action<ProbeConfig>? OnProbeConfig { get; set; }
 
@@ -66,6 +76,18 @@ public sealed class TunnelClient
 
     /// <summary>Invoked whenever the server pushes a new conntrack accounting configuration.</summary>
     public Action<ConntrackConfig>? OnConntrackConfig { get; set; }
+
+    /// <summary>Invoked whenever the server grants, renews, or ends a Live Traffic lease.</summary>
+    public Action<LiveTrafficConfig>? OnLiveTrafficConfig { get; set; }
+
+    /// <summary>Invoked whenever the server pushes the set of UCIs to capture informs from.</summary>
+    public Action<UciCaptureConfig>? OnUciCaptureConfig { get; set; }
+
+    /// <summary>Invoked whenever the server pushes the gateway blocklist.</summary>
+    public Action<GatewayBlocklistSet>? OnGatewayBlocklist { get; set; }
+
+    /// <summary>Invoked whenever the server pushes the WAN Flood Protection config.</summary>
+    public Action<WanFloodConfig>? OnWanFloodConfig { get; set; }
 
     /// <summary>Server pushes the WAN speed-test server list for the /wan/ redirect router.</summary>
     public Action<WanSpeedTestConfig>? OnWanSpeedTestConfig { get; set; }
@@ -97,6 +119,18 @@ public sealed class TunnelClient
     /// buffer; anything unacked replays on the next connection.
     /// </summary>
     public Action<long>? OnResultAck { get; set; }
+
+    /// <summary>Change Control hands over (or replaces) a plan's revert.</summary>
+    public Action<ConfigRevertArm>? OnConfigRevertArm { get; set; }
+
+    /// <summary>Change Control confirms, cancels, or acknowledges a revert report.</summary>
+    public Action<ConfigRevertConfirm>? OnConfigRevertConfirm { get; set; }
+
+    /// <summary>Raised once the server hello has arrived.</summary>
+    public Action? OnOpened { get; set; }
+
+    /// <summary>Whether the tunnel is open (hello received, not yet torn down).</summary>
+    public bool IsOpen { get; private set; }
 
     /// <summary>Queues a message for the stream pump. Safe from any thread.</summary>
     public bool TrySend(AgentMessage message) => _outbound.Writer.TryWrite(message);
@@ -142,6 +176,9 @@ public sealed class TunnelClient
             // SYN retries for ~2 minutes per attempt, stretching the reconnect
             // cadence from ~30s to minutes while the server is coming back up.
             ConnectTimeout = TimeSpan.FromSeconds(15),
+            // Races IPv6 and IPv4 so a black-holed IPv6 path cannot spend the whole
+            // ConnectTimeout before IPv4 is tried.
+            ConnectCallback = DualStackConnector.ConnectAsync,
         };
         if (ignoreSslErrors)
         {
@@ -151,7 +188,12 @@ public sealed class TunnelClient
             };
         }
 
-        using var grpcChannel = GrpcChannel.ForAddress(tunnelUrl, new GrpcChannelOptions { HttpHandler = handler });
+        // Above gRPC's 4 MB default: a gateway blocklist with large public lists is one message.
+        using var grpcChannel = GrpcChannel.ForAddress(tunnelUrl, new GrpcChannelOptions
+        {
+            HttpHandler = handler,
+            MaxReceiveMessageSize = 32 * 1024 * 1024,
+        });
         var client = new AgentTunnel.AgentTunnelClient(grpcChannel);
         // The linked source scopes the whole call (not just the pump/heartbeat)
         // so the inbound-silence watchdog can abort a black-holed read loop.
@@ -198,8 +240,12 @@ public sealed class TunnelClient
         }
 
         Console.WriteLine($"Tunnel open for site '{siteSlug}' (heartbeat every {heartbeatInterval.TotalSeconds:0}s)");
+        IsOpen = true;
+        OnOpened?.Invoke();
 
-        Volatile.Write(ref _lastInboundTicks, Environment.TickCount64);
+        var openedAt = Environment.TickCount64;
+        Volatile.Write(ref _lastInboundTicks, openedAt);
+        _openedAtTicks = openedAt;
         var pumpTask = PumpOutboundAsync(call.RequestStream, linked.Token);
         var heartbeatTask = HeartbeatLoopAsync(heartbeatInterval, linked.Token);
         var watchdogTask = WatchInboundSilenceAsync(linked, linked.Token);
@@ -221,6 +267,18 @@ public sealed class TunnelClient
                         break;
                     case ServerMessage.PayloadOneofCase.ConntrackConfig:
                         OnConntrackConfig?.Invoke(message.ConntrackConfig);
+                        break;
+                    case ServerMessage.PayloadOneofCase.LiveTrafficConfig:
+                        OnLiveTrafficConfig?.Invoke(message.LiveTrafficConfig);
+                        break;
+                    case ServerMessage.PayloadOneofCase.UciCaptureConfig:
+                        OnUciCaptureConfig?.Invoke(message.UciCaptureConfig);
+                        break;
+                    case ServerMessage.PayloadOneofCase.GatewayBlocklist:
+                        OnGatewayBlocklist?.Invoke(message.GatewayBlocklist);
+                        break;
+                    case ServerMessage.PayloadOneofCase.WanFloodConfig:
+                        OnWanFloodConfig?.Invoke(message.WanFloodConfig);
                         break;
                     case ServerMessage.PayloadOneofCase.WanSpeedtestConfig:
                         OnWanSpeedTestConfig?.Invoke(message.WanSpeedtestConfig);
@@ -265,11 +323,18 @@ public sealed class TunnelClient
                     case ServerMessage.PayloadOneofCase.ResultAck:
                         OnResultAck?.Invoke((long)message.ResultAck.Sequence);
                         break;
+                    case ServerMessage.PayloadOneofCase.ConfigRevertArm:
+                        OnConfigRevertArm?.Invoke(message.ConfigRevertArm);
+                        break;
+                    case ServerMessage.PayloadOneofCase.ConfigRevertConfirm:
+                        OnConfigRevertConfirm?.Invoke(message.ConfigRevertConfirm);
+                        break;
                 }
             }
         }
         finally
         {
+            IsOpen = false;
             linked.Cancel();
             _outbound.Writer.TryComplete();
             try { await Task.WhenAll(pumpTask, heartbeatTask, watchdogTask); } catch (OperationCanceledException) { }

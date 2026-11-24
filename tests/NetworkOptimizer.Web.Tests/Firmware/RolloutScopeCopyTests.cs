@@ -1,4 +1,5 @@
 using FluentAssertions;
+using NetworkOptimizer.Web.Services;
 using NetworkOptimizer.Web.Services.Firmware;
 using Xunit;
 
@@ -78,5 +79,104 @@ public class RolloutScopeCopyTests
         RolloutScopeCopy.Sentence("the UniFi Network application").Should().Be("The UniFi Network application");
         RolloutScopeCopy.Sentence("UniFi OS").Should().Be("UniFi OS");
         RolloutScopeCopy.Sentence("").Should().BeEmpty();
+    }
+
+    private static TimeZoneInfo Zone(string id) => TimeZoneInfo.FindSystemTimeZoneById(id);
+
+    [Fact]
+    public void ASiteAnHourAheadOfTheServer_ReadsTheStartInSiteHours()
+    {
+        var start = new DateTime(2026, 10, 11, 11, 0, 0, DateTimeKind.Utc);
+
+        RolloutScopeCopy.SiteAside("America/New_York", start, Zone("America/Chicago"))
+            .Should().Be(" (07:00 at-site)");
+        RolloutScopeCopy.SiteAside("America/New_York", start, Zone("America/Chicago"),
+                new DisplayFormat(ClockStyle.TwelveHour, DateOrder.MonthFirst))
+            .Should().Be(" (7:00 AM at-site)");
+    }
+
+    [Fact]
+    public void ASiteOnTheServersClock_SaysNothing()
+    {
+        var start = new DateTime(2026, 10, 11, 11, 0, 0, DateTimeKind.Utc);
+
+        RolloutScopeCopy.SiteAside("America/Chicago", start, Zone("America/Chicago")).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void ZonesSharingABaseOffset_DifferOnlyWhileOneIsOnDst()
+    {
+        // Phoenix keeps MST all year; Denver is on MDT in July, so the clocks differ by an hour.
+        var july = new DateTime(2026, 7, 15, 14, 0, 0, DateTimeKind.Utc);
+        var january = new DateTime(2026, 1, 15, 14, 0, 0, DateTimeKind.Utc);
+
+        RolloutScopeCopy.SiteAside("America/Phoenix", july, Zone("America/Denver"))
+            .Should().Be(" (07:00 at-site)");
+        RolloutScopeCopy.SiteAside("America/Phoenix", january, Zone("America/Denver")).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void AnAlertStart_IsLabeledWithItsZone_AndTheSiteAside()
+    {
+        var start = new DateTime(2026, 10, 11, 11, 0, 0, DateTimeKind.Utc);
+
+        RolloutScopeCopy.AlertStartLabel(start, "America/New_York", Zone("America/Chicago"), DisplayFormat.Fallback)
+            .Should().Be("Sun Oct 11, 06:00 CDT (07:00 at-site)");
+        RolloutScopeCopy.AlertStartLabel(start, "America/New_York", Zone("America/New_York"), DisplayFormat.Fallback)
+            .Should().Be("Sun Oct 11, 07:00 EDT");
+    }
+
+    [Fact]
+    public void AnAlertStart_FollowsTheNotificationFormat_AsideIncluded()
+    {
+        var start = new DateTime(2026, 10, 11, 11, 0, 0, DateTimeKind.Utc);
+        var twelveDayFirst = new DisplayFormat(ClockStyle.TwelveHour, DateOrder.DayFirst);
+
+        RolloutScopeCopy.AlertStartLabel(start, "America/New_York", Zone("America/Chicago"), twelveDayFirst)
+            .Should().Be("Sun 11 Oct, 6:00 AM CDT (7:00 AM at-site)");
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("Not/AZone")]
+    public void AMissingOrUnknownSiteZone_SaysNothing(string? zone)
+    {
+        RolloutScopeCopy.SiteAside(zone, DateTime.UtcNow, Zone("America/Chicago")).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Moved_StatesTheNewStartAndTheOneItReplaced_OnTheNotificationClock()
+    {
+        var now = new DateTime(2026, 10, 11, 11, 0, 0, DateTimeKind.Utc);
+        var previous = now.AddDays(2);
+        var start = now.AddDays(3);
+
+        var message = RolloutScopeCopy.Moved(Doc(), devices: 3, start, previous, now, Zone("America/Chicago"), DisplayFormat.Fallback);
+
+        message.Should().Be(
+            "3 devices will be upgraded starting Wed Oct 14, 06:00 CDT, in about 3 days. "
+            + "The start moved from Tue Oct 13, 06:00 CDT. Open Firmware Rollout to postpone or stop it.");
+    }
+
+    [Fact]
+    public void Moved_CarriesTheSiteAsideWhenTheSiteKeepsOtherHours()
+    {
+        var now = new DateTime(2026, 10, 11, 11, 0, 0, DateTimeKind.Utc);
+        var doc = Doc();
+        doc.TimeZoneId = "America/New_York";
+
+        RolloutScopeCopy.Moved(doc, devices: 1, now.AddDays(1), now, now, Zone("America/Chicago"), DisplayFormat.Fallback)
+            .Should().Contain("Mon Oct 12, 06:00 CDT (07:00 at-site)")
+            .And.Contain("moved from Sun Oct 11, 06:00 CDT (07:00 at-site)");
+    }
+
+    [Fact]
+    public void Moved_ForAConsoleOnlyRollout_NamesTheConsole()
+    {
+        var now = new DateTime(2026, 10, 11, 11, 0, 0, DateTimeKind.Utc);
+
+        RolloutScopeCopy.Moved(Doc(os: true), devices: 0, now.AddHours(5), now.AddHours(2), now, Zone("America/Chicago"), DisplayFormat.Fallback)
+            .Should().StartWith("UniFi OS will be upgraded starting ");
     }
 }

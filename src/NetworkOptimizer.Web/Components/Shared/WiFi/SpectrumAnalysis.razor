@@ -7,49 +7,13 @@
 @inject SiteContextService SiteContext
 @inject ILogger<SpectrumAnalysis> Logger
 @inject NavigationManager NavigationManager
+@inject IDisplayTimeZone DisplayTime
 
 <div class="spectrum-container wifi-sections">
     <!-- Header Row (matching Client Stats pattern) -->
     <div class="spectrum-header">
         <h3>RF Environment</h3>
-        <div class="spectrum-controls">
-            <div class="filter-group">
-                <label class="filter-label">Access Point:</label>
-                <select class="ap-filter-select" @bind="selectedApMac" @bind:after="OnApFilterChanged">
-                    <option value="">All APs</option>
-                    @foreach (var ap in accessPoints)
-                    {
-                        <option value="@ap.Mac">@ap.Name (@ap.Model)</option>
-                    }
-                </select>
-            </div>
-            <div class="filter-tabs band-tabs">
-                <button class="tab band-tab band-2ghz @(selectedBand == RadioBand.Band2_4GHz ? "active" : "")" @onclick='() => SetBandFilter(RadioBand.Band2_4GHz)'>2.4 GHz</button>
-                <button class="tab band-tab band-5ghz @(selectedBand == RadioBand.Band5GHz ? "active" : "")" @onclick='() => SetBandFilter(RadioBand.Band5GHz)'>5 GHz</button>
-                <button class="tab band-tab band-6ghz @(selectedBand == RadioBand.Band6GHz ? "active" : "")" @onclick='() => SetBandFilter(RadioBand.Band6GHz)'>6 GHz</button>
-            </div>
-            <div class="time-refresh-group">
-                <div class="time-range-selector">
-                    @foreach (var range in _timeRanges)
-                    {
-                        <button class="time-btn @(range.Key == selectedTimeRange ? "active" : "")"
-                                @onclick="() => SetTimeRange(range.Key)">
-                            @range.Key
-                        </button>
-                    }
-                </div>
-                <button class="btn btn-secondary btn-sm" @onclick="RefreshData" disabled="@isLoading">
-                    @if (isLoading)
-                    {
-                        <span class="spinner-sm"></span>
-                    }
-                    else
-                    {
-                        <span>Refresh</span>
-                    }
-                </button>
-            </div>
-        </div>
+        @FilterControls()
     </div>
 
     @if (isLoading)
@@ -75,7 +39,7 @@
             </div>
         </div>
     }
-    else if (allNeighbors.Count == 0)
+    else if (allNeighbors.Count == 0 && siteApNeighbors.Count == 0)
     {
         <div class="card">
             <div class="card-body">
@@ -210,6 +174,7 @@
         <div class="card">
             <div class="card-header">
                 <h2 class="card-title">Neighboring Networks (@filteredNeighbors.Count)</h2>
+                @ApFilterChip()
             </div>
             <div class="card-body">
                 <div class="table-responsive">
@@ -256,16 +221,7 @@
                                             @displaySignal dBm
                                         </span>
                                     </td>
-                                    <td>
-                                        @if (item.DetectedByAps.Count == 1)
-                                        {
-                                            @item.DetectedByAps[0]
-                                        }
-                                        else
-                                        {
-                                            <span data-tooltip="@string.Join(", ", item.DetectedByAps)">@item.DetectedByAps.Count APs</span>
-                                        }
-                                    </td>
+                                    <td>@HeardByCell(item)</td>
                                     <td>@FormatLastSeen(item.Network.LastSeen)</td>
                                 </tr>
                             }
@@ -282,23 +238,105 @@
                         </div>
                         <div class="pagination-buttons">
                             <button class="page-btn" @onclick="GoToFirstPage" disabled="@(_currentPage == 1)">
-                                <span>««</span>
+                                <AppIcon Name="chevron-first" />
                             </button>
                             <button class="page-btn" @onclick="GoToPreviousPage" disabled="@(_currentPage == 1)">
-                                <span>‹</span>
+                                <AppIcon Name="chevron-left" />
                             </button>
                             <span class="page-indicator">Page @_currentPage of @TotalPages</span>
                             <button class="page-btn" @onclick="GoToNextPage" disabled="@(_currentPage >= TotalPages)">
-                                <span>›</span>
+                                <AppIcon Name="chevron-right" />
                             </button>
                             <button class="page-btn" @onclick="GoToLastPage" disabled="@(_currentPage >= TotalPages)">
-                                <span>»»</span>
+                                <AppIcon Name="chevron-last" />
                             </button>
                         </div>
                     </div>
                 }
             </div>
         </div>
+
+        @if (filteredSiteAps.Count > 0)
+        {
+            <div class="card" data-tour="rf-site-aps">
+                <div class="card-header">
+                    <h2 class="card-title">Site Access Points</h2>
+                    @ApFilterChip()
+                </div>
+                <div class="card-body">
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>SSID</th>
+                                    <th>BSSID</th>
+                                    <th>Access Point</th>
+                                    <th>Channel</th>
+                                    <th>Width</th>
+                                    <th>Signal</th>
+                                    <th>Heard By</th>
+                                    <th>Last Seen</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var item in filteredSiteAps)
+                                {
+                                    <tr>
+                                        <td>
+                                            @if (item.IsMeshBackhaul)
+                                            {
+                                                <span class="hidden-ssid">(Mesh backhaul)</span>
+                                            }
+                                            else if (item.IsAutoLink)
+                                            {
+                                                <span class="hidden-ssid">(UniFi Auto-Link)</span>
+                                            }
+                                            else if (!string.IsNullOrEmpty(item.Network.Ssid))
+                                            {
+                                                @item.Network.Ssid
+                                            }
+                                            else if (!string.IsNullOrEmpty(item.SiteAp?.Ssid))
+                                            {
+                                                @item.SiteAp.Ssid
+                                            }
+                                            else
+                                            {
+                                                <span class="hidden-ssid">@BssidIdentifier.GetDisplayName(null, item.Network.Bssid)</span>
+                                            }
+                                        </td>
+                                        <td class="monospace">@item.Network.Bssid</td>
+                                        <td>
+                                            @if (!string.IsNullOrEmpty(item.SiteAp?.ApMac))
+                                            {
+                                                @ApFilterButton(item.SiteAp.ApMac, item.SiteAp.ApName ?? item.SiteAp.ApMac)
+                                            }
+                                        </td>
+                                        <td>
+                                            <span class="channel-badge @GetBandClass(item.Band) @(IsDfsChannel(item.Network.Channel, item.Band) ? "dfs" : "")">
+                                                @item.Network.Channel
+                                            </span>
+                                        </td>
+                                        <td>@(item.Network.Width ?? 20) MHz</td>
+                                        <td>
+                                            @{
+                                                var siteSignal = GetDisplaySignal(item);
+                                            }
+                                            <span class="signal-indicator @GetSignalClass(siteSignal)" style="color: @SignalClassification.GetSignalColor(siteSignal, selectedBand)">
+                                                @siteSignal dBm
+                                            </span>
+                                        </td>
+                                        <td>@HeardByCell(item)</td>
+                                        <td>@FormatLastSeen(item.Network.LastSeen)</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        }
+
+        @FilterControls("spectrum-controls-bottom")
 
         <!-- DFS Status -->
         @if (selectedBand == RadioBand.Band5GHz)
@@ -384,10 +422,19 @@
         margin-bottom: 0;
     }
 
+    .spectrum-controls-bottom {
+        justify-content: flex-end;
+    }
+
+    /* The container's gap already spaces the bar; the card's own margin would double it. */
+    .spectrum-container .card:has(+ .spectrum-controls-bottom) {
+        margin-bottom: 0;
+    }
+
     /* Your Channels Card */
     .your-channels-card {
-        background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-tertiary) 100%);
-        border: 1px solid var(--primary-color);
+        background: color-mix(in srgb, var(--primary-color) 9%, var(--bg-card));
+        border: 1px solid color-mix(in srgb, var(--primary-hover) 45%, transparent);
     }
 
     .your-channels-header {
@@ -420,31 +467,31 @@
         flex-direction: column;
         align-items: center;
         padding: 0.5rem 1rem;
-        border-radius: 8px;
-        background: var(--bg-primary);
+        border-radius: var(--border-radius-lg);
+        background: var(--bg-inset);
         border: 2px solid transparent;
         cursor: pointer;
         transition: all 0.15s ease;
     }
 
     .your-channel-chip:hover {
-        background: var(--bg-secondary);
+        background: var(--bg-hover);
     }
 
     .your-channel-chip.active {
-        box-shadow: 0 0 0 2px var(--primary-color);
+        box-shadow: 0 0 0 2px var(--primary-hover);
     }
 
     .your-channel-chip.band-2_4 {
-        border-color: #22c55e;
+        border-color: var(--band-24-color);
     }
 
     .your-channel-chip.band-5 {
-        border-color: #3b82f6;
+        border-color: var(--band-5-color);
     }
 
     .your-channel-chip.band-6 {
-        border-color: #a855f7;
+        border-color: var(--band-6-color);
     }
 
     .your-channel-chip .channel-number {
@@ -474,13 +521,24 @@
         flex: 1;
         min-width: 120px;
         padding: 1rem;
-        background: var(--bg-secondary);
-        border-radius: 8px;
+        background: var(--bg-inset);
+        box-shadow: inset 0 0 0 1px var(--border-color);
+        border-radius: var(--border-radius-lg);
         text-align: center;
     }
 
     .spectrum-stat-card.highlight {
-        background: linear-gradient(135deg, var(--accent-color) 0%, var(--primary-color) 100%);
+        background: none;
+        box-shadow: none;
+    }
+
+    .ap-filter-chip {
+        margin-left: auto;
+    }
+
+    .card-header:has(> .ap-filter-chip) {
+        flex-wrap: wrap;
+        gap: 0.5rem;
     }
 
     .spectrum-stat-card.clickable {
@@ -489,8 +547,11 @@
     }
 
     .spectrum-stat-card.clickable:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        background: var(--bg-hover);
+    }
+    .spectrum-stat-card.highlight.clickable:hover {
+        background: none;
+        filter: brightness(1.25);
     }
 
     .spectrum-stat-card .stat-value {
@@ -537,7 +598,6 @@
         display: inline-block;
         width: 16px;
         height: 10px;
-        border-radius: 2px;
     }
 
     .legend-bar.neighbors {
@@ -545,11 +605,11 @@
     }
 
     .legend-bar.your-ap {
-        background: #3b82f6;
+        background: var(--good-color);
     }
 
     .legend-bar.selected-ap {
-        background: #a855f7;
+        background: var(--purple-color);
     }
 
     .channel-bar-container {
@@ -567,12 +627,12 @@
     }
 
     .channel-label.your-channel {
-        color: #3b82f6;
+        color: var(--good-color);
         font-weight: 600;
     }
 
     .channel-label.selected-ap-channel {
-        color: #a855f7;
+        color: var(--purple-color);
         font-weight: 600;
     }
 
@@ -599,8 +659,8 @@
 
     .channel-bar-wrapper {
         height: 12px;
-        background: var(--bg-secondary);
-        border-radius: 0 3px 3px 0;
+        background: var(--bg-inset);
+        box-shadow: inset 0 0 0 1px var(--border-strong);
         overflow: hidden;
     }
 
@@ -610,7 +670,6 @@
 
     .channel-bar {
         height: 100%;
-        border-radius: 0 3px 3px 0;
         transition: width 0.3s ease;
     }
 
@@ -627,11 +686,11 @@
     }
 
     .channel-bar.your-ap-bar {
-        background: #3b82f6;
+        background: var(--good-color);
     }
 
     .channel-bar.your-ap-bar.selected-ap {
-        background: #a855f7;
+        background: var(--purple-color);
     }
 
     .channel-count-wrapper {
@@ -650,13 +709,13 @@
 
     .your-ap-count {
         font-size: 0.7rem;
-        color: #3b82f6;
+        color: var(--good-color);
         font-weight: 600;
         line-height: 1;
     }
 
     .your-ap-count.selected-ap {
-        color: #a855f7;
+        color: var(--purple-color);
     }
 
     /* Network Table */
@@ -670,7 +729,7 @@
         background: var(--accent-color);
         color: white;
         padding: 0.1rem 0.4rem;
-        border-radius: 3px;
+        border-radius: var(--border-radius);
         margin-left: 0.5rem;
     }
 
@@ -681,24 +740,32 @@
     .channel-badge {
         display: inline-block;
         padding: 0.2rem 0.5rem;
-        border-radius: 4px;
+        border-radius: var(--border-radius);
         font-size: 0.85rem;
         font-weight: 500;
     }
 
+    .channel-badge,
+    .channel-label,
+    .channel-count,
+    .your-ap-count {
+        font-family: var(--font-display);
+        font-variant-numeric: tabular-nums;
+    }
+
     .channel-badge.band-2g {
-        background: rgba(59, 130, 246, 0.2);
-        color: #60a5fa;
+        background: color-mix(in srgb, var(--band-24-color) 18%, transparent);
+        color: var(--band-24-color);
     }
 
     .channel-badge.band-5g {
-        background: rgba(34, 197, 94, 0.2);
-        color: #4ade80;
+        background: color-mix(in srgb, var(--band-5-color) 18%, transparent);
+        color: var(--band-5-color);
     }
 
     .channel-badge.band-6g {
-        background: rgba(168, 85, 247, 0.2);
-        color: #c084fc;
+        background: color-mix(in srgb, var(--band-6-color) 18%, transparent);
+        color: var(--band-6-color);
     }
 
     .channel-badge.dfs {
@@ -714,7 +781,7 @@
     }
 
     .signal-indicator.signal-good {
-        color: #4ade80;
+        color: var(--signal-good);
     }
 
     .signal-indicator.signal-fair {
@@ -735,10 +802,10 @@
 
     .dfs-channel-card {
         padding: 0.75rem;
-        border-radius: 8px;
+        border-radius: var(--border-radius-lg);
         text-align: center;
-        background: var(--bg-secondary);
-        border: 2px solid transparent;
+        background: var(--bg-inset);
+        border: 2px solid var(--border-color);
     }
 
     .dfs-channel-card.available {
@@ -767,7 +834,7 @@
     .status-badge {
         font-size: 0.7rem;
         padding: 0.15rem 0.4rem;
-        border-radius: 3px;
+        border-radius: var(--border-radius);
     }
 
     .status-badge.available {
@@ -803,7 +870,7 @@
         gap: 1rem;
         padding: 1rem;
         background: var(--bg-secondary);
-        border-radius: 8px;
+        border-radius: var(--border-radius-lg);
         border-left: 3px solid var(--info-color);
     }
 
@@ -850,27 +917,6 @@
         display: flex;
         align-items: center;
         gap: 0.5rem;
-    }
-
-    .page-btn {
-        padding: 0.4rem 0.6rem;
-        font-size: 0.85rem;
-        background: var(--bg-secondary);
-        border: 1px solid var(--border-color);
-        border-radius: 4px;
-        color: var(--text-primary);
-        cursor: pointer;
-        transition: all 0.15s ease;
-    }
-
-    .page-btn:hover:not(:disabled) {
-        background: var(--bg-tertiary);
-        border-color: var(--primary-color);
-    }
-
-    .page-btn:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
     }
 
     .page-indicator {
@@ -923,7 +969,8 @@
     private string selectedApMac = "";
     private RadioBand selectedBand = RadioBand.Band5GHz;
     private string selectedTimeRange = "1D";
-    private string sortColumn = "signal";
+    // Loads sorted by signal, strongest first, with that header marked. Null once a header is cleared.
+    private string? sortColumn = "signal";
     private bool sortDescending = true;
     private int _currentPage = 1;
     private const int _pageSize = 25;
@@ -938,8 +985,10 @@
         { "1M", TimeSpan.FromDays(30) }
     };
 
-    // Flattened view of all neighbors with their source AP info
-    private List<NeighborWithAp> allNeighbors = new();
+    // Flattened view of all external neighbors with their source AP info
+    private List<RfNeighborRow> allNeighbors = new();
+    // Site BSSIDs as sibling APs hear them (Site Access Points card); never counted as neighbors
+    private List<RfNeighborRow> siteApNeighbors = new();
     private List<ChannelDensity> _channelDensityData = new();
     private double _maxInterferenceScore;
 
@@ -985,35 +1034,9 @@
             Logger.LogInformation("Spectrum: Loaded {ApCount} APs, {ScanCount} scan results",
                 accessPoints.Count, scanResults.Count);
 
-            // Flatten neighbors from all scan results, deduplicate by BSSID keeping strongest signal
-            // but track all APs that detected each network (both names and MACs for filtering)
-            // Also store per-AP signal levels for accurate display when filtering by AP
-            // Filter out invalid channels (e.g., 65535 = 0xFFFF from controller)
-            allNeighbors = scanResults
-                .SelectMany(sr => sr.Neighbors
-                    .Where(n => n.Channel > 0 && n.Channel <= 233)
-                    .Select(n => new NeighborWithAp
-                    {
-                        Network = n,
-                        ApMac = sr.ApMac,
-                        ApName = sr.ApName ?? "Unknown AP",
-                        Band = sr.Band
-                    }))
-                .GroupBy(n => n.Network.Bssid.ToLowerInvariant())
-                .Select(g =>
-                {
-                    var strongest = g.OrderByDescending(n => n.Network.Signal ?? -100).First();
-                    strongest.DetectedByAps = g.Select(n => n.ApName).Distinct().ToList();
-                    strongest.DetectedByApMacs = g.Select(n => n.ApMac.ToLowerInvariant()).Distinct().ToList();
-                    // Store signal per AP for filtering - if same AP detected multiple times, keep strongest
-                    strongest.SignalByApMac = g
-                        .GroupBy(n => n.ApMac.ToLowerInvariant())
-                        .ToDictionary(
-                            apGroup => apGroup.Key,
-                            apGroup => apGroup.Max(n => n.Network.Signal ?? -100));
-                    return strongest;
-                })
-                .ToList();
+            // Site BSSIDs leave every external view; their siblings' sightings get their own card.
+            allNeighbors = RfEnvironmentNeighbors.ExternalNeighbors(scanResults);
+            siteApNeighbors = RfEnvironmentNeighbors.SiteAccessPoints(scanResults);
 
             Logger.LogInformation("Spectrum: Found {NeighborCount} unique neighboring networks (deduplicated by BSSID)", allNeighbors.Count);
             UpdateChannelDensity();
@@ -1047,35 +1070,9 @@
             scanResults = scanTask.Result;
             regulatoryChannels = regulatoryTask.Result;
 
-            // Flatten neighbors from all scan results, deduplicate by BSSID keeping strongest signal
-            // but track all APs that detected each network (both names and MACs for filtering)
-            // Also store per-AP signal levels for accurate display when filtering by AP
-            // Filter out invalid channels (e.g., 65535 = 0xFFFF from controller)
-            allNeighbors = scanResults
-                .SelectMany(sr => sr.Neighbors
-                    .Where(n => n.Channel > 0 && n.Channel <= 233)
-                    .Select(n => new NeighborWithAp
-                    {
-                        Network = n,
-                        ApMac = sr.ApMac,
-                        ApName = sr.ApName ?? "Unknown AP",
-                        Band = sr.Band
-                    }))
-                .GroupBy(n => n.Network.Bssid.ToLowerInvariant())
-                .Select(g =>
-                {
-                    var strongest = g.OrderByDescending(n => n.Network.Signal ?? -100).First();
-                    strongest.DetectedByAps = g.Select(n => n.ApName).Distinct().ToList();
-                    strongest.DetectedByApMacs = g.Select(n => n.ApMac.ToLowerInvariant()).Distinct().ToList();
-                    // Store signal per AP for filtering - if same AP detected multiple times, keep strongest
-                    strongest.SignalByApMac = g
-                        .GroupBy(n => n.ApMac.ToLowerInvariant())
-                        .ToDictionary(
-                            apGroup => apGroup.Key,
-                            apGroup => apGroup.Max(n => n.Network.Signal ?? -100));
-                    return strongest;
-                })
-                .ToList();
+            // Site BSSIDs leave every external view; their siblings' sightings get their own card.
+            allNeighbors = RfEnvironmentNeighbors.ExternalNeighbors(scanResults);
+            siteApNeighbors = RfEnvironmentNeighbors.SiteAccessPoints(scanResults);
             UpdateChannelDensity();
         }
         catch (Exception ex)
@@ -1089,10 +1086,19 @@
         }
     }
 
-    private List<NeighborWithAp> filteredNeighbors =>
+    private List<RfNeighborRow> filteredNeighbors =>
         allNeighbors
             .Where(n => string.IsNullOrEmpty(selectedApMac) || n.DetectedByApMacs.Contains(selectedApMac.ToLowerInvariant()))
             .Where(n => n.Band == selectedBand)
+            .ToList();
+
+    // Same AP and band filters as the neighbor table, grouped by the owning AP
+    private List<RfNeighborRow> filteredSiteAps =>
+        siteApNeighbors
+            .Where(n => string.IsNullOrEmpty(selectedApMac) || n.DetectedByApMacs.Contains(selectedApMac.ToLowerInvariant()))
+            .Where(n => n.Band == selectedBand)
+            .OrderBy(n => n.SiteAp?.ApName, StringComparer.OrdinalIgnoreCase)
+            .ThenByDescending(GetDisplaySignal)
             .ToList();
 
     private void SetBandFilter(RadioBand band)
@@ -1108,22 +1114,121 @@
         UpdateChannelDensity();
     }
 
-    private void OnChannelChipClick(YourChannelInfo channel)
-    {
-        if (string.IsNullOrEmpty(channel.ApMac)) return;
+    private void OnChannelChipClick(YourChannelInfo channel) => ToggleApFilter(channel.ApMac);
 
-        // Toggle: if already filtering to this AP, clear the filter
-        if (selectedApMac == channel.ApMac)
-        {
-            selectedApMac = "";
-        }
-        else
-        {
-            selectedApMac = channel.ApMac;
-        }
+    /// <summary>Filters the page to one AP's scans, or clears the filter when it is already that AP.</summary>
+    private void ToggleApFilter(string? apMac)
+    {
+        if (string.IsNullOrEmpty(apMac)) return;
+        // The select binds to the AP list's MAC spelling, so match it case-insensitively.
+        var mac = accessPoints.FirstOrDefault(a => string.Equals(a.Mac, apMac, StringComparison.OrdinalIgnoreCase))?.Mac ?? apMac;
+        selectedApMac = string.Equals(selectedApMac, mac, StringComparison.OrdinalIgnoreCase) ? "" : mac;
         _currentPage = 1;
         UpdateChannelDensity();
     }
+
+    /// <summary>Heard By names every AP up to this many; past it, the loudest two and "+N more".</summary>
+    private const int MaxHeardByNames = 3;
+
+    /// <summary>BSSIDs (lowercase) whose Heard By cell was expanded past the loudest two.</summary>
+    private readonly HashSet<string> _expandedHeardBy = new(StringComparer.OrdinalIgnoreCase);
+
+    private RenderFragment HeardByCell(RfNeighborRow item) => __builder =>
+    {
+        var macs = item.DetectedByApMacs
+            .OrderByDescending(m => item.SignalByApMac.GetValueOrDefault(m, -100))
+            .ToList();
+        var bssid = item.Network.Bssid;
+        var shown = macs.Count <= MaxHeardByNames || _expandedHeardBy.Contains(bssid) ? macs : macs.Take(2).ToList();
+        <div class="filter-pills">
+            @foreach (var mac in shown)
+            {
+                @ApFilterButton(mac, GetApName(mac))
+            }
+            @if (shown.Count < macs.Count)
+            {
+                <button type="button" class="filter-pill filter-pill-more"
+                        data-tooltip="@string.Join(", ", macs.Skip(2).Select(GetApName))"
+                        @onclick="() => _expandedHeardBy.Add(bssid)">+@(macs.Count - 2) more</button>
+            }
+        </div>
+    };
+
+    /// <summary>The AP, band, and time range filters with Refresh: in the header and again under the tables.</summary>
+    private RenderFragment FilterControls(string? extraClass = null) => __builder =>
+    {
+        <div class="spectrum-controls @extraClass">
+            <div class="filter-group">
+                <label class="filter-label">Access Point:</label>
+                <select class="ap-filter-select" @bind="selectedApMac" @bind:after="OnApFilterChanged">
+                    <option value="">All APs</option>
+                    @foreach (var ap in accessPoints)
+                    {
+                        <option value="@ap.Mac">@ap.Name (@ap.Model)</option>
+                    }
+                </select>
+            </div>
+            <div class="filter-tabs band-tabs">
+                <button class="tab band-tab band-2ghz @(selectedBand == RadioBand.Band2_4GHz ? "active" : "")" @onclick='() => SetBandFilter(RadioBand.Band2_4GHz)'>2.4 GHz</button>
+                <button class="tab band-tab band-5ghz @(selectedBand == RadioBand.Band5GHz ? "active" : "")" @onclick='() => SetBandFilter(RadioBand.Band5GHz)'>5 GHz</button>
+                <button class="tab band-tab band-6ghz @(selectedBand == RadioBand.Band6GHz ? "active" : "")" @onclick='() => SetBandFilter(RadioBand.Band6GHz)'>6 GHz</button>
+            </div>
+            <div class="time-refresh-group">
+                <div class="time-range-selector">
+                    @foreach (var range in _timeRanges)
+                    {
+                        <button class="time-btn @(range.Key == selectedTimeRange ? "active" : "")"
+                                @onclick="() => SetTimeRange(range.Key)">
+                            @range.Key
+                        </button>
+                    }
+                </div>
+                <button class="btn btn-secondary btn-sm" @onclick="RefreshData" disabled="@isLoading">
+                    @if (isLoading)
+                    {
+                        <span class="spinner-sm"></span>
+                    }
+                    else
+                    {
+                        <span>Refresh</span>
+                    }
+                </button>
+            </div>
+        </div>
+    };
+
+    private string GetApName(string apMac) =>
+        accessPoints.FirstOrDefault(a => string.Equals(a.Mac, apMac, StringComparison.OrdinalIgnoreCase))?.Name ?? apMac;
+
+    private RenderFragment ApFilterButton(string apMac, string name) => __builder =>
+    {
+        var active = string.Equals(selectedApMac, apMac, StringComparison.OrdinalIgnoreCase);
+        <button type="button" class="filter-pill @(active ? "active" : "")" aria-pressed="@(active ? "true" : "false")"
+                data-tooltip="@(active ? "Show all APs" : $"Show only what {name} hears")"
+                @onclick="() => ToggleApFilter(apMac)">
+            @name
+            @if (active)
+            {
+                <span class="filter-pill-x" aria-hidden="true">&times;</span>
+            }
+        </button>
+    };
+
+    private void ClearApFilter()
+    {
+        selectedApMac = "";
+        _currentPage = 1;
+        UpdateChannelDensity();
+    }
+
+    private RenderFragment ApFilterChip() => __builder =>
+    {
+        if (string.IsNullOrEmpty(selectedApMac)) return;
+        <button type="button" class="btn btn-sm btn-secondary ap-filter-chip" data-tooltip="Show all APs"
+                aria-label="@($"Clear the {GetApName(selectedApMac)} filter")" @onclick="ClearApFilter">
+            @GetApName(selectedApMac) <span aria-hidden="true">&times;</span>
+        </button>
+    };
 
     private string GetSelectedApLabel()
     {
@@ -1185,39 +1290,53 @@
 
     private List<int> _cleanestChannelList = new();
 
+    /// <summary>The Cleanest Channels stat for the page's band and AP filter.</summary>
     private string GetCleanestChannels()
     {
-        var availableChannels = GetAvailableChannels();
-        if (availableChannels.Length == 0) { _cleanestChannelList = new(); return "-"; }
+        _cleanestChannelList = CleanestChannelsFor(selectedBand, selectedApMac);
+        return _cleanestChannelList.Count == 0 ? "-" : string.Join(", ", _cleanestChannelList);
+    }
+
+    /// <summary>
+    /// Up to three of the band's least-loaded channels for one AP (or the whole site when
+    /// <paramref name="apMac"/> is empty), best first. Reads only; the stat card keeps its own list.
+    /// </summary>
+    private List<int> CleanestChannelsFor(RadioBand band, string apMac)
+    {
+        var availableChannels = GetAvailableChannels(band, apMac);
+        if (availableChannels.Length == 0) return new();
 
         // Get the AP's configured channel width for overlap-aware scoring
-        var apWidth = GetSelectedApChannelWidth();
+        var apWidth = GetApChannelWidth(band, apMac);
 
-        // Build interference sources from external neighbors
-        var interferenceSources = filteredNeighbors
+        // Build interference sources from the external neighbors that AP hears
+        var interferenceSources = allNeighbors
+            .Where(n => n.Band == band)
+            .Where(n => string.IsNullOrEmpty(apMac) || n.DetectedByApMacs.Contains(apMac.ToLowerInvariant()))
             .Select(n => (
-                Span: GetChannelSpan(n.Network.Channel, n.Network.Width ?? 20),
-                Weight: ChannelSpanHelper.SignalToInterferenceWeight(GetDisplaySignal(n))
+                Span: ChannelSpanHelper.GetChannelSpan(band, n.Network.Channel, n.Network.Width ?? 20),
+                Weight: ChannelSpanHelper.SignalToInterferenceWeight(
+                    !string.IsNullOrEmpty(apMac) && n.SignalByApMac.TryGetValue(apMac.ToLowerInvariant(), out var s) ? s : GetDisplaySignal(n))
             ))
             .ToList();
 
         // Add own APs as interference sources (co-located = strong interference)
-        // Exclude the selected AP since we're recommending a channel for it.
+        // Exclude the AP itself since we're recommending a channel for it.
         // Also exclude its mesh partner - mesh pairs share a channel by design,
-        // so the partner isn't "interference" for the selected AP.
-        var excludedMacs = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { selectedApMac };
-        if (!string.IsNullOrEmpty(selectedApMac))
+        // so the partner isn't "interference" for the AP.
+        var excludedMacs = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { apMac };
+        if (!string.IsNullOrEmpty(apMac))
         {
-            var selectedAp = accessPoints.FirstOrDefault(a => a.Mac == selectedApMac);
-            if (selectedAp != null)
+            var ap = accessPoints.FirstOrDefault(a => a.Mac == apMac);
+            if (ap != null)
             {
-                // If selected AP is a mesh child, exclude its parent
-                if (selectedAp.IsMeshChild && !string.IsNullOrEmpty(selectedAp.MeshParentMac))
-                    excludedMacs.Add(selectedAp.MeshParentMac);
+                // If the AP is a mesh child, exclude its parent
+                if (ap.IsMeshChild && !string.IsNullOrEmpty(ap.MeshParentMac))
+                    excludedMacs.Add(ap.MeshParentMac);
 
-                // If selected AP is a mesh parent, exclude its children
+                // If the AP is a mesh parent, exclude its children
                 foreach (var child in accessPoints.Where(a => a.IsMeshChild &&
-                    selectedApMac.Equals(a.MeshParentMac, StringComparison.OrdinalIgnoreCase)))
+                    apMac.Equals(a.MeshParentMac, StringComparison.OrdinalIgnoreCase)))
                 {
                     excludedMacs.Add(child.Mac);
                 }
@@ -1227,7 +1346,7 @@
         var ownApRadios = accessPoints
             .Where(ap => !excludedMacs.Contains(ap.Mac))
             .SelectMany(ap => ap.Radios)
-            .Where(r => r.Band == selectedBand && r.Channel.HasValue);
+            .Where(r => r.Band == band && r.Channel.HasValue);
 
         foreach (var radio in ownApRadios)
         {
@@ -1235,7 +1354,7 @@
             const int assumedSignal = -65;
             var weight = ChannelSpanHelper.SignalToInterferenceWeight(assumedSignal);
             interferenceSources.Add((
-                Span: GetChannelSpan(radio.Channel!.Value, radio.ChannelWidth ?? 20, radio.CenterChannel),
+                Span: ChannelSpanHelper.GetChannelSpan(band, radio.Channel!.Value, radio.ChannelWidth ?? 20, radio.CenterChannel),
                 Weight: weight
             ));
         }
@@ -1244,7 +1363,7 @@
         var candidateScores = availableChannels
             .Select(ch =>
             {
-                var candidateSpan = GetChannelSpan(ch, apWidth);
+                var candidateSpan = ChannelSpanHelper.GetChannelSpan(band, ch, apWidth);
                 var score = interferenceSources
                     .Where(s => SpansOverlap(candidateSpan, s.Span))
                     .Sum(s => s.Weight);
@@ -1253,7 +1372,7 @@
             .ToList();
 
         // Exclude high-density channels (score > 3.5 = high interference)
-        _cleanestChannelList = candidateScores
+        var cleanest = candidateScores
             .Where(c => c.Score <= 3.5)
             .OrderBy(c => c.Score)
             .Take(3)
@@ -1261,45 +1380,45 @@
             .ToList();
 
         // Always show at least the single best channel
-        if (_cleanestChannelList.Count == 0 && candidateScores.Count > 0)
+        if (cleanest.Count == 0 && candidateScores.Count > 0)
         {
-            _cleanestChannelList.Add(candidateScores
+            cleanest.Add(candidateScores
                 .OrderBy(c => c.Score)
                 .First().Channel);
         }
 
-        return string.Join(", ", _cleanestChannelList);
+        return cleanest;
     }
 
-    private int GetSelectedApChannelWidth()
+    private int GetApChannelWidth(RadioBand band, string apMac)
     {
-        if (!string.IsNullOrEmpty(selectedApMac))
+        if (!string.IsNullOrEmpty(apMac))
         {
-            var ap = accessPoints.FirstOrDefault(a => a.Mac == selectedApMac);
-            var radio = ap?.Radios.FirstOrDefault(r => r.Band == selectedBand);
+            var ap = accessPoints.FirstOrDefault(a => a.Mac == apMac);
+            var radio = ap?.Radios.FirstOrDefault(r => r.Band == band);
             return radio?.ChannelWidth ?? 20;
         }
         return 20;
     }
 
-    private int[] GetAvailableChannels()
+    private int[] GetAvailableChannels(RadioBand band, string apMac)
     {
         // 2.4 GHz: always use non-overlapping channels (regulatory returns 1-11 but only 1/6/11 are valid choices)
-        if (selectedBand == RadioBand.Band2_4GHz)
+        if (band == RadioBand.Band2_4GHz)
             return [1, 6, 11];
 
-        var width = GetSelectedApChannelWidth();
+        var width = GetApChannelWidth(band, apMac);
 
         // Use regulatory data if available (matches UniFi UI channel dropdown per width)
         if (regulatoryChannels != null)
         {
             bool includeDfs = true;
-            if (selectedBand == RadioBand.Band5GHz)
+            if (band == RadioBand.Band5GHz)
             {
-                if (!string.IsNullOrEmpty(selectedApMac))
+                if (!string.IsNullOrEmpty(apMac))
                 {
-                    var selectedAp = accessPoints.FirstOrDefault(ap => ap.Mac == selectedApMac);
-                    includeDfs = selectedAp?.Radios.Any(r => r.Band == RadioBand.Band5GHz && r.HasDfs) ?? false;
+                    var ap = accessPoints.FirstOrDefault(a => a.Mac == apMac);
+                    includeDfs = ap?.Radios.Any(r => r.Band == RadioBand.Band5GHz && r.HasDfs) ?? false;
                 }
                 else
                 {
@@ -1307,12 +1426,12 @@
                 }
             }
 
-            var channels = regulatoryChannels.GetChannels(selectedBand, width, includeDfs);
+            var channels = regulatoryChannels.GetChannels(band, width, includeDfs);
             if (channels.Length > 0) return channels;
         }
 
         // Fallback to hardcoded lists if regulatory data unavailable (US defaults, 20 MHz)
-        return selectedBand switch
+        return band switch
         {
             RadioBand.Band5GHz => [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165],
             RadioBand.Band6GHz => [1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61],
@@ -1452,11 +1571,13 @@
         return Math.Max(15, Math.Min(100, (int)(apCountOnChannel * 100.0 / totalAps)));
     }
 
-    private IEnumerable<NeighborWithAp> GetSortedNetworks()
+    private IEnumerable<RfNeighborRow> GetSortedNetworks()
     {
-        IEnumerable<NeighborWithAp> networks = filteredNeighbors;
+        IEnumerable<RfNeighborRow> networks = filteredNeighbors;
 
-        networks = sortColumn switch
+        // No column picked: the default order, strongest signal first.
+        var sortDescending = sortColumn == null || this.sortDescending;
+        networks = (sortColumn ?? "signal") switch
         {
             "ssid" => sortDescending ? networks.OrderByDescending(n => n.Network.Ssid) : networks.OrderBy(n => n.Network.Ssid),
             "bssid" => sortDescending ? networks.OrderByDescending(n => n.Network.Bssid) : networks.OrderBy(n => n.Network.Bssid),
@@ -1472,7 +1593,7 @@
         return networks;
     }
 
-    private IEnumerable<NeighborWithAp> GetPagedNetworks()
+    private IEnumerable<RfNeighborRow> GetPagedNetworks()
     {
         return GetSortedNetworks()
             .Skip((_currentPage - 1) * _pageSize)
@@ -1486,16 +1607,25 @@
     private void GoToNextPage() { if (_currentPage < TotalPages) _currentPage++; }
     private void GoToLastPage() => _currentPage = TotalPages;
 
+    // Three states per header, as on the other data tables: its first direction, the other
+    // direction, then cleared, which is the default order with no header marked.
     private void SetSort(string column)
     {
-        if (sortColumn == column)
+        var firstDescending = column == "signal" || column == "lastSeen";
+        if (sortColumn != column)
         {
-            sortDescending = !sortDescending;
+            // Cleared is already strongest signal first, so Signal's first click from there goes
+            // the other way: a click always changes the order.
+            sortDescending = sortColumn == null && column == "signal" ? !firstDescending : firstDescending;
+            sortColumn = column;
+        }
+        else if (sortDescending == firstDescending)
+        {
+            sortDescending = !firstDescending;
         }
         else
         {
-            sortColumn = column;
-            sortDescending = column == "signal" || column == "lastSeen"; // Default descending for these
+            sortColumn = null;
         }
         _currentPage = 1;
     }
@@ -1527,7 +1657,7 @@
         if (ago.TotalMinutes < 60) return $"{(int)ago.TotalMinutes}m ago";
         if (ago.TotalHours < 24) return $"{(int)ago.TotalHours}h ago";
 
-        return lastSeen.Value.ToLocalTime().ToString("MMM d HH:mm");
+        return lastSeen.Value.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DayTime, DisplayFormat.Culture);
     }
 
     private IEnumerable<DfsChannelStatus> GetDfsChannelStatus()
@@ -1561,39 +1691,76 @@
         });
     }
 
+    /// <summary>More external networks than this on or overlapping a radio's channel makes it congested.</summary>
+    private const int CongestedChannelNeighbors = 5;
+
     private List<HealthIssue> GetRecommendations()
     {
         var recommendations = new List<HealthIssue>();
 
-        // Check for congested channels
+        // Check for congested channels: this band's radios, one finding per channel, counting the
+        // external neighbors (filteredNeighbors excludes own BSSIDs) whose span overlaps the radio's
+        // and that an AP on the channel hears at the preamble-detect level or stronger. Another AP's
+        // sightings are not this radio's air: a 160 MHz span would otherwise collect them.
         var yourChannels = accessPoints
-            .SelectMany(ap => ap.Radios)
-            .Where(r => r.Channel.HasValue)
-            .Select(r => new { Channel = r.Channel!.Value, r.Band })
-            .Distinct()
+            .Where(ap => string.IsNullOrEmpty(selectedApMac) || ap.Mac == selectedApMac)
+            .SelectMany(ap => ap.Radios
+                .Where(r => r.Channel.HasValue && r.Band == selectedBand)
+                .Select(r => (Ap: ap, Radio: r)))
+            .GroupBy(x => x.Radio.Channel!.Value)
+            .OrderBy(g => g.Key)
+            .Select(g => (First: g.OrderBy(x => x.Ap.Name, StringComparer.OrdinalIgnoreCase).First(),
+                ApKeys: g.Select(x => x.Ap.Mac.ToLowerInvariant()).ToHashSet()))
             .ToList();
 
-        foreach (var ch in yourChannels)
+        foreach (var ((ap, radio), apKeys) in yourChannels)
         {
+            var channel = radio.Channel!.Value;
+            var width = radio.ChannelWidth ?? 20;
+            var span = GetChannelSpan(channel, width, radio.CenterChannel);
             var neighborCount = filteredNeighbors
-                .Count(n => n.Network.Channel == ch.Channel );
+                .Count(n => n.SignalByApMac.Any(s => apKeys.Contains(s.Key) && s.Value >= PreambleDetectDbm)
+                    && SpansOverlap(span, GetChannelSpan(n.Network.Channel, n.Network.Width ?? 20)));
 
-            if (neighborCount > 5)
+            if (neighborCount <= CongestedChannelNeighbors) continue;
+
+            // A candidate whose block is the radio's own block is the channel it already uses; only
+            // the candidates ranked ahead of it are quieter.
+            var cleanest = CleanestChannelsFor(selectedBand, ap.Mac);
+            var own = cleanest.FindIndex(c => SpansOverlap(span, GetChannelSpan(c, width)));
+            var better = (own >= 0 ? cleanest.Take(own) : cleanest).Take(2).ToList();
+            if (better.Count == 0 && own < 0) continue;
+            if (better.Count == 0)
             {
-                var cleanest = GetCleanestChannels();
+                // Moving cannot help; only 2.4 GHz is worth saying so, since its three channels are all there is.
+                if (selectedBand != RadioBand.Band2_4GHz) continue;
                 recommendations.Add(new HealthIssue
                 {
-                    Severity = HealthIssueSeverity.Warning,
-                    Title = $"Channel {ch.Channel} is congested",
-                    Description = $"There are {neighborCount} other networks on channel {ch.Channel}. Consider switching to channel {cleanest} for better performance.",
+                    Severity = HealthIssueSeverity.Info,
+                    Title = $"Channel {channel} is congested",
+                    Description = $"{neighborCount} other networks are on or overlap channel {channel}, but it is already the quietest of the three 2.4 GHz channels, so moving would not help.",
                     Dimensions = new HashSet<HealthDimension> { HealthDimension.ChannelHealth }
                 });
+                continue;
             }
+
+            var quieter = better.Count == 1
+                ? $"Channel {better[0]} is quieter."
+                : $"Channels {better[0]} and {better[1]} are quieter.";
+            recommendations.Add(new HealthIssue
+            {
+                Severity = HealthIssueSeverity.Warning,
+                Title = $"Channel {channel} is congested",
+                Description = $"{neighborCount} other networks are on or overlap channel {channel}. {quieter}",
+                Dimensions = new HashSet<HealthDimension> { HealthDimension.ChannelHealth }
+            });
         }
 
         // Check for DFS opportunity
         var availableDfs = GetAvailableDfsChannels();
-        if (availableDfs > 10 && !yourChannels.Any(c => c.Band == RadioBand.Band5GHz && IsDfsChannel(c.Channel, c.Band)))
+        var onDfs = accessPoints.SelectMany(ap => ap.Radios)
+            .Any(r => r.Channel.HasValue && IsDfsChannel(r.Channel.Value, r.Band));
+        if (availableDfs > 10 && !onDfs)
         {
             recommendations.Add(new HealthIssue
             {
@@ -1604,20 +1771,30 @@
             });
         }
 
-        // Check for wide channel interference
-        var wideChannelNetworks = filteredNeighbors
-            .Where(n => (n.Network.Width ?? 20) >= 80 )
-            .Count();
-
-        if (wideChannelNetworks > 3)
+        // Our wide radios that strong neighbors overlap, as that radio's AP hears them. Below the
+        // 802.11 preamble-detect level a neighbor does not make the radio defer, so it costs nothing.
+        var bandLabel = selectedBand.ToDisplayString();
+        foreach (var ap in accessPoints.Where(a => string.IsNullOrEmpty(selectedApMac) || a.Mac == selectedApMac))
         {
-            recommendations.Add(new HealthIssue
+            var apKey = ap.Mac.ToLowerInvariant();
+            foreach (var radio in ap.Radios.Where(r => r.Band == selectedBand && r.Channel.HasValue && (r.ChannelWidth ?? 20) >= 80))
             {
-                Severity = HealthIssueSeverity.Info,
-                Title = "Wide channel usage detected",
-                Description = $"{wideChannelNetworks} networks are using 80 MHz or wider channels. In dense environments, narrower channels (40 MHz) often perform better.",
-                Dimensions = new HashSet<HealthDimension> { HealthDimension.ChannelHealth }
-            });
+                var span = GetChannelSpan(radio.Channel!.Value, radio.ChannelWidth!.Value, radio.CenterChannel);
+                var strong = filteredNeighbors.Count(n =>
+                    n.SignalByApMac.TryGetValue(apKey, out var signal) && signal >= PreambleDetectDbm
+                    && SpansOverlap(span, GetChannelSpan(n.Network.Channel, n.Network.Width ?? 20)));
+                if (strong < WideChannelStrongNeighbors) continue;
+
+                recommendations.Add(new HealthIssue
+                {
+                    Severity = HealthIssueSeverity.Info,
+                    Title = "Wide channel usage detected",
+                    Description = $"{ap.Name} {bandLabel} uses {radio.ChannelWidth} MHz, and {strong} neighbors at {PreambleDetectDbm} dBm or stronger share part of it. A narrower channel avoids them. Run the Channel Recommendation to compare widths.",
+                    AffectedEntity = ap.Name,
+                    LinkUrl = ChannelRecommendationUrl(),
+                    Dimensions = new HashSet<HealthDimension> { HealthDimension.ChannelHealth }
+                });
+            }
         }
 
         return recommendations;
@@ -1632,7 +1809,7 @@
     /// When filtering by a specific AP, shows that AP's signal reading.
     /// Otherwise shows the strongest signal across all detecting APs.
     /// </summary>
-    private int GetDisplaySignal(NeighborWithAp neighbor)
+    private int GetDisplaySignal(RfNeighborRow neighbor)
     {
         if (!string.IsNullOrEmpty(selectedApMac) &&
             neighbor.SignalByApMac.TryGetValue(selectedApMac.ToLowerInvariant(), out var apSignal))
@@ -1643,18 +1820,6 @@
     }
 
     // Helper classes
-    private class NeighborWithAp
-    {
-        public NeighborNetwork Network { get; set; } = null!;
-        public string ApMac { get; set; } = "";
-        public string ApName { get; set; } = "";
-        public RadioBand Band { get; set; }
-        public List<string> DetectedByAps { get; set; } = new();
-        public List<string> DetectedByApMacs { get; set; } = new();
-        // Signal per detecting AP MAC (lowercase) - allows showing AP-specific signal when filtering
-        public Dictionary<string, int> SignalByApMac { get; set; } = new();
-    }
-
     private class ChannelDensity
     {
         public int Channel { get; set; }
@@ -1678,7 +1843,11 @@
         public bool IsYourChannel { get; set; }
     }
 
-    private void NavigateToChannelRecommendations()
+    private void NavigateToChannelRecommendations() =>
+        NavigationManager.NavigateTo(ChannelRecommendationUrl(), forceLoad: false, replace: false);
+
+    /// <summary>The Channel Recommendation for the selected band, run on arrival.</summary>
+    private string ChannelRecommendationUrl()
     {
         var bandParam = selectedBand switch
         {
@@ -1687,7 +1856,13 @@
             RadioBand.Band6GHz => "6",
             _ => "5"
         };
-        NavigationManager.NavigateTo($"/wifi-optimizer?tab=channels&band={bandParam}&recommend=true", forceLoad: false, replace: false);
+        return $"/wifi-optimizer?tab=channels&band={bandParam}&recommend=true";
     }
+
+    /// <summary>802.11's 20 MHz preamble-detect level: a weaker neighbor does not make a radio defer.</summary>
+    private const int PreambleDetectDbm = -82;
+
+    /// <summary>A wide radio is flagged when at least this many strong neighbors overlap its span.</summary>
+    private const int WideChannelStrongNeighbors = 3;
 
 }

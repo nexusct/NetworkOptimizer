@@ -7,26 +7,28 @@
 @inject LicensePhoneHomeService PhoneHome
 @inject ISiteManagementService SiteManagement
 @inject IJSRuntime JS
+@inject IDisplayTimeZone DisplayTime
 
 <div class="card settings-tab-application" id="licensing">
     <div class="card-header">
         <h2 class="card-title">Licensing</h2>
         @if (_multiSiteEnabled)
         {
-            <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+            <ScopeBadge />
         }
     </div>
     <div class="card-body">
         @if (LicenseState.AnyKeysActive)
         {
             <p class="section-description">
-                @UsedSlots of @LicenseState.TotalAllowance licensed site slots used &middot; @FreeSlots free@(SoonestTermExpiry is { } expiry ? $" · earliest term expires {expiry.ToLocalTime():MMM d, yyyy}" : "")
+                @UsedSlots of @LicenseState.TotalAllowance licensed site slots used &middot; @FreeSlots free@(SoonestTermExpiry is { } expiry ? $" · earliest term expires {expiry.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.Date, DisplayFormat.Culture)}" : "")
             </p>
         }
         else
         {
             <p class="section-description">
-                Free tier: up to @SiteManagementService.FreeSiteLimit sites for personal use. Enter a license key to unlock more.
+                Free tier: up to @SiteManagementService.FreeSiteLimit Sites for personal use. To unlock more,
+                <a href="@LicenseBilling.LicensingUrl" target="_blank" rel="noopener">buy a license</a>, then enter its key below.
             </p>
         }
 
@@ -90,7 +92,7 @@
                                 </td>
                                 <td>@AssignedCount(key.Id) / @key.SiteAllowance</td>
                                 <td><span class="status-badge @GetStatusBadgeClass(key)">@GetStatusLabel(key)</span></td>
-                                <td>@(key.Model == LicenseKeyModels.Perpetual || key.PaidThrough == null ? "-" : key.PaidThrough.Value.ToLocalTime().ToString("MMM d, yyyy"))</td>
+                                <td>@(key.Model == LicenseKeyModels.Perpetual || key.PaidThrough == null ? "-" : key.PaidThrough.Value.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.Date, DisplayFormat.Culture))</td>
                                 <td>
                                     <button class="btn btn-danger btn-sm" @onclick="() => RemoveKeyAsync(key)" disabled="@(_removingKeyId == key.Id)">
                                         @if (_removingKeyId == key.Id)
@@ -132,7 +134,7 @@
                     {
                         <span class="status-badge @GetSiteBadgeClass(status)">@GetSiteBadgeLabel(status)</span>
                     }
-                    <select class="form-control license-site-select" value="@(AssignedKeyId(site.Id)?.ToString() ?? "")"
+                    <select class="form-control license-site-select" data-autosave value="@(AssignedKeyId(site.Id)?.ToString() ?? "")"
                             @onchange="e => OnAssignmentChangedAsync(site.Slug, e)">
                         <option value="">Not covered</option>
                         @foreach (var key in _keys)
@@ -166,8 +168,16 @@
                 </button>
                 @if (NewestCheckAt is { } lastCheck)
                 {
-                    <span class="form-help">Last checked: @TimeFormatHelper.FormatRelativeTime(lastCheck)</span>
+                    <span class="form-help">Last checked: @TimeFormatHelper.FormatRelativeTime(lastCheck, DisplayTime.Zone, DisplayTime.Format)</span>
                 }
+            </div>
+        }
+
+        @if (LicenseBilling.HasSubscriptionKey(_keys))
+        {
+            <div class="action-buttons license-billing-actions">
+                <a href="@LicenseBilling.BillingUrl" target="_blank" rel="noopener" class="btn btn-secondary">Manage billing</a>
+                <span class="form-help">Update your card, see invoices, or cancel your subscription.</span>
             </div>
         }
 

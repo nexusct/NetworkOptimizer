@@ -14,12 +14,14 @@
 @inject NetworkOptimizerDbContext Db
 @inject IUpnpNoteService UpnpNotes
 @inject PullToRefreshState PtrState
+@inject IDisplayTimeZone DisplayTime
 @implements IDisposable
 @rendermode InteractiveServer
 
 <PageTitle>UPnP Inspector - Network Optimizer</PageTitle>
 
 <div class="page-header">
+    <PageBackButton />
     <h1>UPnP Inspector</h1>
     <p class="page-description">Monitor dynamic port forwarding rules opened via UPnP</p>
 </div>
@@ -28,7 +30,7 @@
 {
     <div class="connection-banner @(!string.IsNullOrEmpty(ConnectionService.LastError) ? "connection-error" : "")">
         <div class="banner-content">
-            <span class="banner-icon">!</span>
+            <span class="banner-icon"><GatewayIcon /></span>
             <div class="banner-text">
                 @if (!string.IsNullOrEmpty(ConnectionService.LastError))
                 {
@@ -143,7 +145,7 @@
                 <h2 class="card-title">UPnP Mappings by Device</h2>
                 @if (lastRefreshTime.HasValue)
                 {
-                    <span class="audit-timestamp"><span class="timestamp-label">Last refresh: </span>@lastRefreshTime.Value.ToString("HH:mm:ss")</span>
+                    <span class="audit-timestamp"><span class="timestamp-label">Last refresh: </span>@lastRefreshTime.Value.ToString(DisplayTime.Format.TimeSeconds, DisplayFormat.Culture)</span>
                 }
             </div>
             <div class="card-body">
@@ -520,7 +522,7 @@
             }
 
             hasData = true;
-            lastRefreshTime = DateTime.Now;
+            lastRefreshTime = DisplayTime.Now;
         }
         catch (Exception ex)
         {

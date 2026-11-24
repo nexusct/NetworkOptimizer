@@ -29,7 +29,8 @@ public class MonitoringAlertRegistry : ISiteScopedRegistry
         StarlinkAlertEvaluator Starlink,
         DeviceRebootAlertEvaluator DeviceReboot,
         DeviceStateAlertEvaluator DeviceState,
-        RadioHealthAlertEvaluator RadioHealth);
+        RadioHealthAlertEvaluator RadioHealth,
+        WanLinkSpeedAlertEvaluator WanLinkSpeed);
 
     private readonly IServiceProvider _serviceProvider;
     private readonly ConcurrentDictionary<string, SiteAlertEvaluators> _instances = new();
@@ -53,8 +54,11 @@ public class MonitoringAlertRegistry : ISiteScopedRegistry
             // Shared across both evaluators that can fire device offline/recovered so
             // whichever fires first wins and the other is suppressed.
             var dedup = new Monitoring.DeviceOfflineDeduplicator();
+            // The device state evaluator reads the target evaluator's fabric results to tell an
+            // outage from a device that only stopped reporting to UniFi Network.
+            var targets = ActivatorUtilities.CreateInstance<MonitoringAlertEvaluator>(_serviceProvider, s, bus, wanOutages, dedup);
             return new SiteAlertEvaluators(
-                ActivatorUtilities.CreateInstance<MonitoringAlertEvaluator>(_serviceProvider, s, bus, wanOutages, dedup),
+                targets,
                 ActivatorUtilities.CreateInstance<DeviceHealthAlertEvaluator>(_serviceProvider, s, bus),
                 ActivatorUtilities.CreateInstance<SfpAlertEvaluator>(_serviceProvider, s, bus),
                 ActivatorUtilities.CreateInstance<CableModemAlertEvaluator>(_serviceProvider, s, bus),
@@ -62,8 +66,9 @@ public class MonitoringAlertRegistry : ISiteScopedRegistry
                 ActivatorUtilities.CreateInstance<CellularAlertEvaluator>(_serviceProvider, s, bus),
                 ActivatorUtilities.CreateInstance<StarlinkAlertEvaluator>(_serviceProvider, s, bus),
                 ActivatorUtilities.CreateInstance<DeviceRebootAlertEvaluator>(_serviceProvider, s, bus),
-                ActivatorUtilities.CreateInstance<DeviceStateAlertEvaluator>(_serviceProvider, s, bus, dedup),
-                ActivatorUtilities.CreateInstance<RadioHealthAlertEvaluator>(_serviceProvider, s, bus));
+                ActivatorUtilities.CreateInstance<DeviceStateAlertEvaluator>(_serviceProvider, s, bus, dedup, targets),
+                ActivatorUtilities.CreateInstance<RadioHealthAlertEvaluator>(_serviceProvider, s, bus),
+                ActivatorUtilities.CreateInstance<WanLinkSpeedAlertEvaluator>(_serviceProvider, s, bus));
         });
 
     /// <summary>The default site's evaluators.</summary>

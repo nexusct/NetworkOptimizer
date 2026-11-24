@@ -178,11 +178,12 @@ width-provenance rules so an unprovable width is recorded as unknown rather than
 half-life, where measured data wins over inferred wherever both exist. One deliberate ordering rule
 inside that: a resident sibling's LIVE read outranks stale own-outcome memory.
 
-Known ceiling, following from applying being out of scope (see "Applying a channel plan to UniFi"):
-the collector sees the resulting live channel and width, but nothing ties an observed state back to a
-specific recommendation - so the loop cannot tell a followed recommendation from a change the user
-made for their own reasons. Outcomes are still attributed correctly; only the "did our advice help"
-question stays out of reach.
+Known ceiling: the collector sees the resulting live channel and width, but nothing ties an observed
+state back to a specific recommendation, so the loop cannot tell a followed recommendation from a
+change the user made for their own reasons. Apply Recommended Channels (see "Applying a channel plan
+to UniFi") now makes some moves ours and audits them as `wifi.channel_plan.applied`; joining those
+moves to their outcomes is not wired. Outcomes are still attributed correctly; only the "did our
+advice help" question stays out of reach.
 
 Remaining:
 
@@ -254,38 +255,39 @@ stale reading actually being material and uncorroborated. **Do not re-implement 
     `ScanReadingForScoring` loops siblings for current-channel reads - both negligible at small n but
     worth checking on large sites before they bite.
 
-## Applying a channel plan to UniFi (considered, deliberately out of scope for now)
+## Applying a channel plan to UniFi (shipped for radio channels; the rule still holds elsewhere)
 
-The recommendation ends at a plan the user applies by hand. That is a decision, not an oversight, and
-the reasoning generalises to any mutative config operation against UniFi Network - so it is recorded
-here rather than re-argued each time the question comes up.
+The recommendation used to end at a plan the user applied by hand, on purpose. The reasoning
+generalises to any mutative config operation against UniFi Network, so it stays recorded here:
 
-- **UniFi Network has no PATCH.** Every change is a full-config PUT/POST, so writing one field means
-  writing back the entire object - including the ~90% we have no intention of touching. Get any of
-  that wrong, or have the console change it concurrently, and the site's configuration is damaged.
-- **Their REST API has a history of bugs and loose form.** Parsing is not necessarily strict, and a
-  release can reinterpret or break a payload shape. On read-only calls that is harmless; on a
-  mutative call the same surprise can wipe an AP's configuration.
-- **The blast radius is the customer's network**, which is exactly the thing this tool exists to keep
-  healthy. Analysis that is wrong costs a bad recommendation; a write that is wrong costs an outage.
+- **Full-object writes.** A PUT that carries the whole object writes back the ~90% we never meant to
+  touch. Get any of that wrong, or have the console change it concurrently, and the site's
+  configuration is damaged.
+- **Their REST API has a history of bugs and loose form.** A release can reinterpret or break a
+  payload shape. On a read that is harmless; on a write it can wipe an AP's configuration.
+- **The blast radius is the customer's network.** A wrong analysis costs a bad recommendation; a
+  wrong write costs an outage.
 
-So today the only mutative controller operation reachable from the app is the RF quick scan
-(`POST .../cmd/devmgr`) - transient and self-contained rather than a config write, though note there
-is no cancel for a scan already running. No reachable feature rewrites a UniFi device or site
-configuration object.
+**Revisited 2026-10-06 for radio channels, which now ship as Apply Recommended Channels.** The first
+objection does not hold for `rest/device`: the console merges a PUT into the stored document, top-level
+keys by name and `radio_table` entries by radio `name`, and keeps every field not sent. Verified on a
+U7 Pro XGS with partial-body probes and a live channel move. So the write is
+`{"radio_table":[{"name","radio","channel","ht"}]}` for the radios being moved and nothing else:
+nothing read earlier is written back, which also means an edit made in UniFi Network between our read
+and our PUT survives. Each AP is re-read first and skipped if it is no longer on the plan's current
+channel. `GET rest/device` is a 404, so reads go through `stat/device`.
 
-Two full-object PUT helpers do exist on the client and are currently called by nothing:
-`UpdateNetworkConfigAsync` (`rest/networkconf`) and `UpdateTrafficRouteAsync` (`v2 trafficroutes`).
-Wiring either one up is exactly the step this section argues against, so it should be a deliberate
-decision rather than something that happens because a helper was already sitting there.
+Still open from that work: the PUT is verified on one model; API-key Console connections are untested
+for writes; a mesh child is not written (it follows its parent on the uplink band), which is untested
+on a real mesh pair.
 
-Everything else we change goes through our own SSH-deployed components, where we control the format
-and the rollback.
-
-Not a permanent no. Revisit when there is a safe path - e.g. read-modify-write with a verified
-round-trip, a diff against the fetched object before sending, and a way to detect concurrent
-modification. Until then, treat "we compute it, the user applies it" as the intended shape of any
-feature that would otherwise write to the controller.
+The rule still holds for every other object. The quick scan (`POST .../cmd/devmgr`) and the radio
+channel PUT are the only controller writes reachable from the app. Two full-object PUT helpers exist
+and are called by nothing: `UpdateNetworkConfigAsync` (`rest/networkconf`) and
+`UpdateTrafficRouteAsync` (`v2 trafficroutes`). Neither has been shown to merge a partial body, so
+wiring one up needs the same proof first: a partial-body probe that shows the console keeps what is
+not sent, then a body that carries only the fields being changed. Everything else we change goes
+through our own SSH-deployed components, where we control the format and the rollback.
 
 ## Wi-Fi Optimizer
 
@@ -301,6 +303,10 @@ feature that would otherwise write to the controller.
   MLO-enabled WLANs. The WiFi Optimizer health issue has not adopted it - `WiFiOptimizerService` still
   flags MLO from `hasWifi7Aps && hasMloEnabledWlan` (any AP + any WLAN), so an AP that broadcasts no
   MLO SSID is still counted. Reuse the path-analysis pattern.
+- **Propagation calibration from sibling sightings** - an AP's scan radio hears every sibling AP's BSSIDs
+  with a real signal level (`NeighborNetwork.IsSiteBssid`, shown on RF Environment's Site Access Points
+  card). That is measured AP-to-AP path loss. It could calibrate the propagation model, and stand in for
+  floor-plan placement on sites without one.
 - **MLO STR mesh backhaul (multi-band):** Channel recommendations pin a mesh child to its leader's channel only on the single band `AccessPointSnapshot.MeshUplinkBand` reports. AP-to-AP MLO STR backhaul can run over multiple bands at once (e.g. 5 + 6 GHz). When UniFi exposes per-link bands, make `MeshUplinkBand` a set and have `BuildMeshConstraints` emit one constraint per participating band. The reconciliation logic in `ChannelRecommendationService` keys off `MeshGroupLeader` and needs no change - only the constraint-building. See `TODO(MLO)` in `BuildMeshConstraints`. Dormant: no AP-to-AP MLO STR backhaul hardware exists yet (today's MLO STR is client/bridge only - UDB-Switch and AirWire, the MLO STR bridge - which are endpoints, not mesh-AP children, so they never hit this path).
 
 ### AP Catalog: Enforce 5 GHz EIRP Cap (US Regulatory)
@@ -384,6 +390,32 @@ site health score, power/coverage). One gap hides inside the "signal strength / 
 per-client *signal* classification is everywhere, but `WirelessClientSnapshot.Snr` has no UI consumer at
 all - it is collected and never shown. Either surface it or drop the field.
 
+### Floor Plan Heatmap - InnerSpace import follow-ups
+The InnerSpace import (floors, walls, materials, window and door heights, APs) skips two things
+InnerSpace models that the Signal Map does not yet. Each is its own change after the import ships.
+
+- **Attenuation objects (obstacles).** InnerSpace stores polygons with a preset or custom type and a
+  height band: car, cubicles, elevator, foliage (heavy / light), human crowd, machinery, server rack,
+  shelves (small / medium / warehouse), truck, appliance, cabinet, furniture, hanging sign, bulkhead,
+  HVAC duct. Its loss is dB per meter of path inside the polygon, not a flat dB per crossing like a
+  wall.
+  - Storage: an `ObstaclesJson` column on `FloorPlan` (additive), shaped like `WallsJson`:
+    polygon points, material key, optional bottom / top height.
+  - Materials: `obstacle_*` keys in `MaterialAttenuation`, per band, dB per meter; names match
+    InnerSpace's presets so the import maps them by name.
+  - Propagation: add dB/m x length inside each polygon along the ray. Store the height band; count
+    the full length until the model is 3D.
+  - Editor: a polygon tool beside Draw Layout with an obstacle material picker.
+  - Check heatmap time with ~150 walls plus 50 obstacles before shipping.
+- **AP tilt.** InnerSpace keeps a mount quaternion and an antenna (point-of-view) quaternion per AP;
+  the difference is the tilt. `ApLocation` and `PlannedAp` have azimuth and mount, no tilt.
+  - Storage: nullable `TiltDeg` on both (null = the mount's native direction, today's behavior).
+  - Propagation: offset the elevation angle by `TiltDeg` before the antenna pattern lookup.
+  - Editor: a tilt field beside orientation for wall-mounted and directional (narrow / wide / panel)
+    modes.
+  - Import: derive tilt from the two quaternions; under 2 degrees imports as null.
+  - Test: null tilt gives a bit-identical heatmap to today.
+
 ## LAN Speed Test
 
 ### Path Analysis Enhancements
@@ -401,6 +433,14 @@ all - it is collected and never shown. Either surface it or drop the field.
 - Actual execution time is correct (UTC-based) - only the displayed local time drifts
 - **Affected code:** `Alerts.razor: FormatStartTime()`, `UtcToLocalTimeOnly()`, `ParseTimeInput()`
 - **Options:** Store IANA timezone per schedule, use `TimeZoneInfo.ConvertTimeFromUtc`, or store local time + timezone
+
+### Default date and time format for alert text
+- Alert text is written once, for no viewer, so its times are 24-hour on every install
+- Settings has an install-wide **Default time zone**, which the notification clock already falls back to (`NotificationTimeZoneResolver`); the time format and date order have no install default, only each user's own choice (`ITimeZonePreferenceSource.GetOwnFormatAsync`)
+- Two places format alert times without a viewer:
+  - Rollout alert copy (`RolloutScopeCopy.AlertStartLabel`, `Moved`) uses `DisplayFormat.Fallback` (24-hour, month first)
+  - The Email, Slack, Teams, Discord, and ntfy channels stamp times with `TimestampFormatter`, which hard-codes `yyyy-MM-dd HH:mm:ss` and `HH:mm`
+- **Fix:** add a default time format and date order beside **Default time zone**, resolve it with the notification clock, and use it in both places
 
 ### Threat Alert Dedup Tuning (if users report noise)
 
@@ -424,6 +464,19 @@ Current state (as of v1.5.x): Dedup is working - event-level dedup via InnerAler
 - If too quiet: Reduce the 2x event multiplier to 1.5x
 - Note the 2x multiplier is the *early-stage* path only; full-chain re-alerting uses 50%+ event growth
 - These are Info severity - users who find them noisy can disable rule 13 in alert settings
+
+## Client Names: Two Paths `ClientNames.Choose` Cannot Fully Serve
+
+Every UI client label uses `ClientNames.Choose` (`src/NetworkOptimizer.UniFi/ClientNames.cs`): UniFi's display
+name, the device rule for UniFi devices, then alias and hostname. Two paths lack the data for all of it:
+
+- **Security Audit offline clients:** `GetClientHistoryAsync` requests v2 `clients/history` without
+  `includeUnifiDevices`, so `unifi_device` never comes back set and an offline UniFi device (a camera, an AI Key)
+  gets the ordinary order instead of the device rule. Check first whether history lists UniFi devices at all with
+  the flag; add it only if it does, since it widens what the offline tables show.
+- **Threat Intelligence:** `AlertSourceDescriber` and the dashboard name clients from `rest/user`, which carries no
+  `display_name`, so an unnamed client shows its DHCP hostname instead of UniFi's name ("iPhone 24:ae"). Pass the
+  site's `ClientDisplayNameCache` names into `ClientNames.For(client, displayName)`.
 
 ## Security Audit / PDF Report
 
@@ -510,6 +563,17 @@ New audit section focused on network performance issues (distinct from security 
   tunnel has been shaped end to end - that is the open part.
 
 ## Monitoring
+
+### Channel Spectrum: per-channel history (CM Stats)
+The Channel Spectrum shows the latest poll only: per-channel values live in the in-memory stats
+cache, and InfluxDB holds only the per-poll aggregates. Storing each channel per poll would let the
+spectrum follow the charts' time window, with each bar drawn as its range over the window and the
+latest value marked, and would give per-channel history for tracking a channel that degrades.
+
+Costs to weigh first: about 40 points per modem per poll instead of 1, in the longterm bucket where
+`cable_modem` lives. A `channel` tag on `cable_modem` would mix per-channel points into every
+existing query of that measurement, so each would need a filter; a new measurement is ruled out by
+the additive-only schema rule. History starts at the upgrade.
 
 ### Device reboot records: one boot writes several points
 One restart can leave up to nine stored records instead of the one the design intends. Measured on
@@ -671,11 +735,26 @@ Three possible closers, cheapest first, none investigated beyond reading the cod
 - [ ] **Widen ASN resolution to IPv6.** `ResolveAsync` gates on `PublicAddressClass.PublicIPv4` and
   the enum has no v6 member, so v6 classifies as `Unknown` and is dropped before either backend -
   both of which handle v6 fine. Better signal anyway: a CGNAT'd v4 site usually has native global v6
-  mapping straight to the carrier ASN. Belongs with `feature/ipv6-support`.
+  mapping straight to the carrier ASN.
 - [ ] **External IP echo (icanhazip) as a last resort.** Strict parse, short timeout, failure means
   no-signal. The landmine is binding, not availability: the tracer is source-bound via
   `_binding?.Source`, a plain fetch egresses via the OS routing table, so multi-WAN would stamp
   WAN2's targets with WAN1's ASN. Needs a source-bound `HttpClient`.
+
+### Upstream discovery: off-path transit hops with a similar RTT (only if seen)
+
+A ping to a transit hop's own address can route differently from the trace that found it, so its
+latency and loss describe some other path (typical of IX peering-LAN addresses reached through a
+different carrier). The reachability gate now excludes a transit hop whose direct-ping minimum RTT
+sits well above its trace RTT (`IsOffPath`, shown as "Different route").
+
+That catches only a divergent path that is slower. One with a similar RTT (two carriers into the
+same metro) still passes, and its ancestor set claims a routing relationship the ping never
+exercises. No case of it has been observed.
+
+- [ ] **Trace to the candidate and compare ancestry**, only for candidates the RTT check leaves
+  borderline. Needs tolerance for star segments (the hop itself may not answer at the end of its own
+  trace) and ECMP churn, and costs one traceroute per candidate on metered WANs.
 
 ### Monitored device versions: fill in SoftwareVersion / HostVersion for the rest
 
@@ -739,6 +818,113 @@ Written to InfluxDB as FIELDS on `cellular` (`software_version`, `host_version`)
 performance against firmware is the point of collecting them. Never as tags: a tag is part of the
 series key, so it would fork every modem's series the day it upgrades. Do the same for the cable
 modem and ONT measurements when their fields land.
+
+### CellMapper integration: Cellular Stats and remote clients
+
+Idea logged 2026-11-11. Tie two places to CellMapper's crowd-sourced tower data.
+
+**Cellular Stats (cellular modem monitoring).** It already knows the serving cell (cell ID, eNB / gNB,
+PCI, band, carrier):
+
+- Name the serving tower and show it on a map beside the modem, with distance and bearing, so aiming an
+  outdoor antenna or picking a window for a desktop modem is one glance.
+- Link the serving cell straight to its CellMapper page.
+- Over time: which towers and bands the modem has used, against its signal and speed history.
+
+**Client Performance while remote.** A phone reaching the site over Tailscale or a VPN on cellular:
+its public address names the carrier (ASN), and a speed test can carry its GPS location. Show the
+carrier's nearby towers and bands from CellMapper beside the result, so a slow remote test reads
+against the coverage where it ran.
+
+Check CellMapper's terms and whether it offers an API before building.
+
+### Live Traffic: flows that end on the Gateway itself (only if a user asks)
+
+Live's Flows leave out traffic to the Gateway: Client DNS to the Gateway's resolver, SSH or the console
+UI on its address, and Network Optimizer polling Adaptive SQM's TC monitor (TCP 8088). History shows
+them, since UniFi Network's records include the Gateway zone.
+
+Why: `LiveFlowTracker.Describe` (Monitoring, runs in the On-Gateway Agent) keeps a flow only when
+`ConntrackClassifier` reads it as WAN (`ClassifyWan`) or routed LAN between two Clients
+(`ClassifyRoutedLan`). A flow whose destination is one of the Gateway's own addresses is neither, so it
+returns null and never leaves the Agent.
+
+To do: a third class in `ConntrackClassifier` for a LAN Client to a Gateway address (and the reverse,
+the Gateway reaching a Client), carried as `Lan` with the Gateway as the remote, so the server's naming
+applies: the Gateway by name, "Adaptive SQM" on 8088 (`LiveTrafficStore.AdaptiveSqmMonitor`, which
+today only ever fires in History), DNS to the Gateway. It is an Agent change: bump `LatestAgentVersion`
+in the release that ships it, optional for the fleet. Check the volume first: every Client's DNS to the
+Gateway is a flow, so these may need their own cap or to sort below routed traffic in a busy site's top
+500 (`LeaseMaxFlows`).
+
+### Live Traffic: name flows by TLS / QUIC SNI (optional)
+
+Live Traffic names a remote from the DNS answers the Gateway sees (`DnsBpfFilter`, UDP 53 only) and
+from the UniFi Console's records. A Client on DoH, DoT, or DoQ (Chrome Secure DNS, iCloud Private
+Relay, an OS resolver set to DoH), or a connection that outlives the DNS answer, has no name in view.
+A read-only probe on a test site found no DNS name for 14% of new QUIC and 40% of new TLS connections.
+
+To do: the On-Gateway Agent reads the `server_name` from the Client's ClientHello and sends it with
+the flow, and the server uses it when no DNS answer names the address. TLS first; QUIC second.
+
+- Capture only while a Live Traffic lease is held, and only for flows that have no name yet: the same
+  privacy boundary as Live DNS.
+- TLS: a BPF on TCP 443 for the first data segments after the handshake, then parse the ClientHello.
+  It can span segments.
+- QUIC: a BPF on UDP 443 for long-header Initial packets. It needs the Initial keys (RFC 9001 for v1,
+  RFC 9369 for v2, different salts and labels), header protection removal, AES-128-GCM decrypt, and
+  CRYPTO reassembly across several Initials: current Chrome's ClientHello (post-quantum key shares)
+  does not fit in one packet.
+- ECH: the visible SNI is the outer public name (often a CDN's). Treat SNI as a hint; a DNS answer wins.
+- Cost: crypto per new QUIC flow on the Gateway CPU. Budget it per pass.
+
+It is an Agent change and a proto change: bump `LatestAgentVersion` in the release that ships it,
+optional for the fleet.
+
+### MLO mesh backhaul: record each link's signal for playback
+
+On an MLO mesh pairing (5 GHz and 6 GHz together), the LAN maps show each link's signal in the
+tooltip and average the two links for the signal meter, but only live. Playback has one reading:
+`MeshBackhaulPhyRecorder.Record` writes one `wifi_client` point per mesh child, tagged with the
+child's own `uplink.radio_band` and carrying `uplink.signal`, which is that one link (in practice the
+5 GHz one). The other link's signal, in the child's `uplink.mlo_links` (or the parent's
+`MeshParentClaim.Links` when the child reports none), is never stored. So during playback an MLO
+child's tooltip shows one Signal row, and its meter grades one link instead of the average.
+
+PHY is not part of this gap: the point's tx/rx rates are the uplink's own, which sum the MLO links,
+raised to the parent's summed claim when that is higher. Playback's Link speed already covers both
+links. Only a per-link split of PHY is missing, and nothing shows one.
+
+To do:
+
+- Record every MLO link's signal, using `LanFlowMapService.MloLinkSignals`'s source order: the
+  child's own reading per link, else the parent's claim, with the child's own reading for its STA link.
+- Keep the schema additive (CLAUDE.md, InfluxDB). Either one more `wifi_client` point per extra
+  link, under that link's `band` tag (it lands in the existing per-band series, and the historic
+  resolver must then stop picking one point per MAC), or per-link fields on the existing point
+  (`signal_dbm_5`, `signal_dbm_6`). Settle which before writing either; a mixed approach splits the series.
+- Playback: return the per-link readings in the historic update's `NodeClientStats`. It needs a
+  per-link list like `LanNode.MloLinks`, so its `SignalBars` and `SignalColor` take the same 5/6 GHz
+  average. Then the 2D tooltip's MLO rows follow the playhead instead of falling back to one row.
+- The agent-relayed path records through the same recorder, so it needs no separate change.
+
+## VPN Clients Dashboard
+
+A dashboard for clients reaching the site over a VPN: connections through an external Tailscale
+server, and every UniFi VPN variant - Teleport, one-click VPN, the VPN servers, and site-to-site
+tunnels. Speed test path analysis already tells Tailscale, Teleport, and VPN hops apart; nothing
+yet shows who is connected through which tunnel, or how much they move.
+
+Tailscale is done (the Tailscale connection, v2.11.1): tailnet devices are named in Client
+Performance, Live Traffic, and speed tests, with each device's path and, through an On-Site Agent on
+the tailnet's router, the device behind routed traffic. What is left is the UniFi VPN variants, and
+Live View nodes for all of them.
+
+The same data feeds three existing surfaces, so collect it once and share it:
+
+- **Monitoring - Live View**: VPN clients and tunnels as nodes on the topology maps.
+- **Bandwidth Hogs**: VPN clients and site-to-site traffic as attributable consumers.
+- **Client Performance**: a VPN client gets a page like any other client.
 
 ## Multi-Tenant / Multi-Site Support
 
@@ -1246,24 +1432,25 @@ priority and unlikely to grow.
 - [ ] Add test coverage for the path and login detection, so the legacy branch cannot rot silently
   between releases that nobody exercises it in.
 
-## Retention: alerts and audit events are never pruned
+## Retention: alerts and Security Audit results are never pruned
 
 The Application Settings card carried an "Alert Retention (days)" field wired to a `SaveAppSettings`
 stub that did nothing, so the value never persisted. The field and its dead Save button were removed
 rather than made to persist a number nothing reads - storing it would have turned a visibly broken
 control into an invisibly broken one.
 
-Nothing in the solution consumes a retention value today:
+The identity audit log (`AuditEvents`) is pruned to design doc 05 by `AuditWriterService`: age plus
+a row cap, with the prune itself audited. What still grows without bound:
 - `IAlertRepository` has no delete/prune method at all - alert history grows without bound.
 - `AlertEngine.ClearOldAlerts(TimeSpan)` exists in Monitoring with **zero callers**.
-- `IAuditRepository.DeleteOldAuditsAsync` exists with **zero callers**, so the audit retention
-  design doc 05 specifies (365 days + a row cap, with `audit.pruned` itself audited) is unimplemented.
+- `IAuditRepository.DeleteOldAuditsAsync` (Security Audit runs, the `AuditResults` table) exists
+  with **zero callers**.
 
 The real fix, as one piece of work:
 - [ ] Add pruning to `IAlertRepository` and run it from a background service, mirroring how the
   monitoring collectors are hosted. Per-site DBs mean the job has to walk every site, not just main.
-- [ ] Implement audit pruning to doc 05: time-based default 365d plus a row-count cap, emitting an
-  `audit.pruned` event with count and range.
+- [ ] Decide whether Security Audit results need pruning at all (one row per run), and call
+  `DeleteOldAuditsAsync` from the same job if so.
 - [ ] Reinstate the settings UI once something consumes the values, saving through the gated
   `ISystemSettingsAdmin` so the change is Admin-only and audited like every other settings write.
 
@@ -1366,3 +1553,76 @@ the reference doc's "no internet" path for APs/switches.
   `TriggerUpgradeAsync` both fail, or after a device cycles back on the old version.
 - [ ] Investigate per-device-type command selection for the syswrapper path: APs/switches use
   `syswrapper.sh upgrade2 &`, gateways may differ. The reference doc covers both cases.
+
+## Gateway-class AP classification when its uplink is offline
+
+`SnmpDeviceRules.IsSiteGateway` treats a gateway-class console (an Express: UX, UX7) as an AP only while
+its uplink device is in the monitorable (online) list. If that uplink drops while the console stays
+up, it reads as the gateway and its poll address and fabric target flip to the gateway LAN IP until
+the uplink returns (#1244). Accepted for now: the UniFi Console is usually down in that case too,
+except on UniFi OS Server. The fix is to check uplinks against the full device list, not the
+monitorable subset.
+
+## UniFi Network 11 role names
+
+Network 11 replaces the UniFi Network roles with Full, Hotspot, View, and None. Once Network 11 is
+GA, update every place we name a UniFi Network role, and re-test which roles get the `x_` secrets in
+`get/setting` (on Network 10.x only View Only loses them, which withholds the SNMPv3 password).
+
+- `Monitoring.razor`: the SNMPv3 password warning ("View Only", "Site Admin / Full Management")
+- `MonitoringSettings.SnmpV3PasswordMissing` XML doc ("View Only")
+- `Settings.razor`: Local Account role guidance (Network Full / View, Protect View, "Why Full?")
+- `README.md`: Restricted account roles
+- `docker/DEPLOYMENT.md`: Restricted account roles and the View vs Full note
+- `wwwroot/data/tours/2.9.2.json`: Apply Recommended Channels step ("Network: Full", "Site Admin")
+
+## Self-Hosting: publish an app with DNS, Traefik, and the WAF
+
+For homelab and SMB operators who self-host. One place in Network Optimizer to publish an app:
+
+- **UniFi DNS** - create and keep the local DNS record (UniFi Network's DNS records / policy table) for the app's hostname.
+- **Traefik** - write the router and service (hostname, backend URL, certificate resolver) through NetworkOptimizer-Proxy, the way the WAF's ban and allow lists are pushed today, rather than by hand-editing `dynamic/config.yml`.
+- **Access** - pick per app: public, LAN only, or Trusted Sources only (the WAF's `waf-trusted`), plus whether the WAF inspects it and with which body limit.
+- **Per site** - the app lives on whichever site runs its proxy, reached through the On-Site Agent like the WAF.
+
+Open questions: how Traefik takes NO-managed routers (a file NO writes vs. the HTTP provider, which needs no shared host), and how this coexists with routers the operator writes by hand.
+
+## WAF event filters
+
+The Threat Intelligence noise filters no longer apply to WAF events (`ThreatRepository.WafQuery`):
+they describe IPS flows, and a WAF event's port 443 is a placeholder, so "my phone, port 443" hid
+every WAF event from that phone. If the WAF page needs a hide-this-source control, give it filters of
+its own (source, host, rule) rather than reusing the IPS ones. False positives belong in exclusions.
+
+## Change Control: auto-revert for changes made in UniFi Network
+
+The auto-revert covers plans applied through Change Control: if a plan cuts the site or a device off
+from Network Optimizer, it rolls itself back (the On-Site Agent does it on an agent site). A change
+made directly in UniFi Network (the console UI, the mobile app, another integration) has no such
+safety net, though Change Control records it within a poll.
+
+Offer the same trigger for those: when a recorded change is followed by the site or its devices
+dropping off, roll that change back automatically, or offer the Roll Back in the alert. Open
+questions: opt-in per site, since the operator made the change on purpose and may be mid-work; how
+long to wait after the change before treating a drop as caused by it; and telling a change-caused
+drop from an unrelated outage (ISP Health already separates ISP from local).
+
+## User setting: 12-hour or 24-hour clock, everywhere
+
+Times are formatted inline today and the two styles are mixed: about 30 server-side format strings
+use a 12-hour clock (`h:mm tt`) and about 120 use 24-hour (`HH:mm`), and roughly 18 JS files format
+times on their own (ApexCharts axes and tooltips, `toLocaleTimeString`, hand-built labels). Add a
+per-user preference (`IUserPreferences`, falling back to the install-wide value) for 12- or 24-hour,
+and route every displayed time through it.
+
+- **Server:** `TimeFormatHelper` holds the one time format (`FormatLocalDateTime` and friends, added
+  2026-10-31 for Change Control) and reads the preference; the inline `h:mm tt` / `HH:mm` strings in
+  C# and Razor move onto it. `CcFormat` already delegates there.
+- **JS:** one shared formatter module that chart and page scripts import (axis labels, tooltips,
+  table cells), fed the preference from Razor on page load, so a chart and the card beside it agree.
+- **Out of scope:** outbound notifications (alerts to email, Slack, and other channels) go to people
+  who are not signed-in users, so they keep the install default; logs, CSV/PDF exports, and API
+  responses keep fixed formats a machine can read.
+
+Open question: whether the same setting should choose the date order too (Oct 31 vs 31 Oct), since
+the formats are being centralized anyway.

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using FluentAssertions;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -24,6 +25,36 @@ public class VlanAnalyzerTests
             Mock.Of<ILogger<FirewallRuleAnalyzer>>(),
             new FirewallRuleParser(Mock.Of<ILogger<FirewallRuleParser>>()));
     }
+
+    #region ExtractNetworks WAN Tests
+
+    [Theory]
+    [InlineData("\"purpose\": \"wan\"")]
+    [InlineData("\"wan_networkgroup\": \"WAN3\"")]
+    [InlineData("\"wan_type\": \"wireless_5g\"")]
+    public void ExtractNetworks_CellularWanInNetworkTable_IsNotANetwork(string wanMarker)
+    {
+        var json = $$"""
+        {
+            "data": [
+                {
+                    "type": "udm",
+                    "name": "Gateway",
+                    "network_table": [
+                        { "_id": "lan-id", "name": "Main", "vlan": 2, "purpose": "corporate", "ip_subnet": "192.0.2.1/24", "networkgroup": "LAN" },
+                        { "_id": "wan-id", "name": "Cellular", {{wanMarker}} }
+                    ]
+                }
+            ]
+        }
+        """;
+
+        var networks = _analyzer.ExtractNetworks(JsonDocument.Parse(json).RootElement);
+
+        networks.Select(n => n.Name).Should().Equal("Main");
+    }
+
+    #endregion
 
     #region AnalyzeNetworkIsolation Tests
 
@@ -1894,6 +1925,37 @@ public class VlanAnalyzerTests
     }
 
     [Fact]
+    public void AnalyzeDnsConfiguration_SharedIpv6Dns_ReturnsIssueOverIpv6()
+    {
+        var networks = new List<NetworkInfo>
+        {
+            new() { Id = "1", Name = "Corporate", VlanId = 10, Purpose = NetworkPurpose.Corporate, HasIpv6 = true, Ipv6DnsServers = ["fd00:10::53"] },
+            new() { Id = "2", Name = "IoT", VlanId = 20, Purpose = NetworkPurpose.IoT, HasIpv6 = true, Ipv6DnsServers = ["fd00:10:0:0::53"] }
+        };
+
+        var issue = _analyzer.AnalyzeDnsConfiguration(networks).Should().ContainSingle().Subject;
+
+        issue.Type.Should().Be("DNS_SHARED_SERVERS");
+        issue.Message.Should().Be("Network 'IoT' shares DNS servers with corporate network over IPv6");
+        IpFamilyText.IsIpv6Only(issue.Metadata).Should().BeTrue();
+    }
+
+    [Fact]
+    public void AnalyzeDnsConfiguration_SharedIpv4DnsOnly_ReturnsOnlyTheIpv4Issue()
+    {
+        var networks = new List<NetworkInfo>
+        {
+            new() { Id = "1", Name = "Corporate", VlanId = 10, Purpose = NetworkPurpose.Corporate, DnsServers = ["192.168.1.1"], HasIpv6 = true, Ipv6DnsServers = ["fd00:10::53"] },
+            new() { Id = "2", Name = "IoT", VlanId = 20, Purpose = NetworkPurpose.IoT, DnsServers = ["192.168.1.1"], HasIpv6 = true, Ipv6DnsServers = ["fd00:20::53"] }
+        };
+
+        var issue = _analyzer.AnalyzeDnsConfiguration(networks).Should().ContainSingle().Subject;
+
+        issue.Message.Should().Be("Network 'IoT' shares DNS servers with corporate network");
+        IpFamilyText.IsIpv6Only(issue.Metadata).Should().BeFalse();
+    }
+
+    [Fact]
     public void AnalyzeDnsConfiguration_DifferentDns_ReturnsNoIssues()
     {
         var networks = new List<NetworkInfo>
@@ -3071,6 +3133,39 @@ public class VlanAnalyzerTests
     }
 
     [Fact]
+    public void ApplyPurposeOverrides_ManagementAccess_SetsPurpose()
+    {
+        var networks = new List<NetworkInfo>
+        {
+            CreateNetwork("Workstations", NetworkPurpose.Corporate, vlanId: 5, id: "net-1")
+        };
+
+        _analyzer.ApplyPurposeOverrides(networks, new Dictionary<string, string>
+        {
+            { "net-1", "ManagementAccess" }
+        });
+
+        networks[0].Purpose.Should().Be(NetworkPurpose.ManagementAccess);
+        networks[0].HasPurposeOverride.Should().BeTrue();
+    }
+
+    [Theory]
+    [InlineData("Admin")]
+    [InlineData("Admin Network")]
+    [InlineData("Management Access")]
+    public void ClassifyNetwork_Name_NeverClassifiesAsManagementAccess(string name)
+    {
+        // Management Access is override-only: names alone cannot tell it from the device fabric
+        _analyzer.ClassifyNetwork(name).Should().NotBe(NetworkPurpose.ManagementAccess);
+    }
+
+    [Fact]
+    public void ManagementAccess_DisplayString()
+    {
+        NetworkPurpose.ManagementAccess.ToDisplayString().Should().Be("Management Access");
+    }
+
+    [Fact]
     public void ApplyPurposeOverrides_SamePurpose_StillSetsOverrideFlag()
     {
         var networks = new List<NetworkInfo>
@@ -3436,6 +3531,29 @@ public class VlanAnalyzerTests
 
         // Assert
         issues.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void AnalyzeInfrastructureVlanPlacement_ExpressInApModeOnHomeVlan_Flagged()
+    {
+        // An Express adopted as an AP is infrastructure like any AP, not an exempt gateway.
+        var networks = new List<NetworkInfo>
+        {
+            CreateNetwork("Management", NetworkPurpose.Management, vlanId: 1),
+            CreateNetwork("Home", NetworkPurpose.Home, vlanId: 2)
+        };
+        var deviceJson = System.Text.Json.JsonDocument.Parse("""
+        {
+            "data": [
+                { "type": "udm", "model": "UX", "name": "Express", "ip": "192.168.2.20",
+                  "mac": "aa:bb:cc:dd:ee:01", "device_mode_override": "mesh" }
+            ]
+        }
+        """).RootElement;
+
+        var issues = _analyzer.AnalyzeInfrastructureVlanPlacement(deviceJson, networks);
+
+        issues.Should().NotBeEmpty();
     }
 
     [Fact]

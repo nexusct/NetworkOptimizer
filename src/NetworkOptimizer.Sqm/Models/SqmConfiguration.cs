@@ -33,14 +33,23 @@ public class SqmConfiguration
     public bool ShapeUpload { get; set; } = false;
 
     /// <summary>
-    /// Opt-in: size the download (IFB) HTB burst proportionally to the shaped rate
-    /// (~1 ms of line time) instead of the conservative 5 KB clamp. Off by default.
+    /// Size the download (IFB) HTB burst proportionally to the shaped rate (~1 ms of line
+    /// time) instead of the conservative 5 KB clamp. False here; the Adaptive SQM page turns
+    /// it on for a new WAN, and a saved WAN keeps its stored value.
     /// Helps on paths where the conservative bucket is only a few packets and throughput
     /// tracks scheduling latency rather than the configured rate; can worsen the loaded
-    /// latency tail and interact with an upstream policer, so it is not a default.
+    /// latency tail and interact with an upstream policer.
     /// Egress is unaffected either way.
     /// </summary>
     public bool RateProportionalDownloadBurst { get; set; } = false;
+
+    /// <summary>
+    /// Opt-in, experimental: replace UniFi's download HTB tree on the IFB with a CAKE root that
+    /// Adaptive SQM installs and keeps re-installing after UniFi rebuilds the tree. Per-device
+    /// fairness behind NAT and per-packet overhead accounting; UniFi download QoS classes and the
+    /// download burst setting do not apply while it is on. Upload stays HTB and fq_codel.
+    /// </summary>
+    public bool CakeDownload { get; set; } = false;
 
     /// <summary>
     /// Upload shaping strength (0-1). 0 keeps the upload rate static at nominal, which is what
@@ -166,7 +175,7 @@ public class SqmConfiguration
     public List<string> SpeedtestSchedule { get; set; } = new() { "0 6 * * *", "30 18 * * *" };
 
     /// <summary>
-    /// Ping adjustment interval in minutes (default: 5)
+    /// Ping adjustment interval in minutes (default: 1)
     /// </summary>
     public int PingAdjustmentInterval { get; set; } = 1;
 

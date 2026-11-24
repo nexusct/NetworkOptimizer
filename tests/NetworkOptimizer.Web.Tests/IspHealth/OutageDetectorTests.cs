@@ -68,6 +68,54 @@ public class OutageDetectorTests
         return s;
     }
 
+    /// <summary>A 15 s gateway series over [from, to), dark where the predicate holds and clean otherwise.</summary>
+    private static List<LatencySample> GatewayAt(DateTime from, DateTime to, Func<DateTime, bool> isDark)
+    {
+        var s = new List<LatencySample>();
+        for (var t = from; t < to; t += TimeSpan.FromSeconds(15))
+            s.Add(new LatencySample(t, 1, 1.5, 0.2, isDark(t) ? 100 : 0));
+        return s;
+    }
+
+    [Fact]
+    public void IsGatewayDarkAtOnset_TrueForAGatewayRestartWhoseWanTailOutlastsIt()
+    {
+        // A gateway restart as recorded: dark ~1.5 min from just before onset, two samples missing,
+        // then answering while the WAN takes another 1.5 min to come back. A whole-span test reads
+        // 75 s dark of a 171 s outage and calls it the ISP's.
+        var onset = OutStart.AddSeconds(12);
+        var end = onset.AddSeconds(171);
+        var gateway = GatewayAt(OutStart.AddMinutes(-1), end.AddMinutes(1), t => t >= OutStart && t <= OutStart.AddSeconds(90))
+            .Where(s => s.Time != OutStart.AddSeconds(15) && s.Time != OutStart.AddSeconds(75)).ToList();
+
+        OutageDetector.IsGatewayDarkAtOnset(gateway, onset, end, 15, Options).Should().BeTrue();
+    }
+
+    [Fact]
+    public void IsGatewayDarkAtOnset_FalseWhenTheGatewayAnsweredThroughTheOutage()
+    {
+        // A real WAN outage: the gateway keeps answering while the internet targets are dark.
+        var gateway = GatewayAt(OutStart.AddMinutes(-1), OutEnd, _ => false);
+
+        OutageDetector.IsGatewayDarkAtOnset(gateway, OutStart, OutEnd, 15, Options).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsGatewayDarkAtOnset_FalseWhenTheGatewayWentDarkOnlyLaterInTheOutage()
+    {
+        // The WAN failed first; the gateway dropping minutes later does not make the outage local.
+        var gateway = GatewayAt(OutStart.AddMinutes(-1), OutEnd, t => t >= OutStart.AddMinutes(4));
+
+        OutageDetector.IsGatewayDarkAtOnset(gateway, OutStart, OutEnd, 15, Options).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsGatewayDarkAtOnset_FalseWithNoGatewaySamplesOrAnEmptySpan()
+    {
+        OutageDetector.IsGatewayDarkAtOnset([], OutStart, OutEnd, 15, Options).Should().BeFalse();
+        OutageDetector.IsGatewayDarkAtOnset(GatewayAt(OutStart, OutEnd, _ => true), OutEnd, OutEnd, 15, Options).Should().BeFalse();
+    }
+
     [Fact]
     public void Detects_upstream_outage_and_attributes_break_beyond_olt()
     {
@@ -751,7 +799,7 @@ public class OutageDetectorTests
         var hops = new[]
         {
             new OutageDetector.Hop("AT&T nokia-olt", 0, LossSeries(ds, de, 80), AsnLabel: "AT&T"),
-            new OutageDetector.Hop("AT&T mtnview-border", 1, LossSeries(ds, de, 80), AsnLabel: "AT&T"),
+            new OutageDetector.Hop("AT&T border-a", 1, LossSeries(ds, de, 80), AsnLabel: "AT&T"),
             new OutageDetector.Hop("Cloudflare", 2, LossSeries(ds, de, 80), AsnLabel: "Cloudflare"),
             new OutageDetector.Hop("Fastly", 3, LossSeries(ds, de, 80), AsnLabel: "Fastly"),
         };
@@ -761,7 +809,7 @@ public class OutageDetectorTests
         events.Should().ContainSingle();
         var names = events[0].Tiers.Select(t => t.Name).ToList();
         names.Should().Contain("AT&T nokia-olt");
-        names.Should().Contain("AT&T mtnview-border");
+        names.Should().Contain("AT&T border-a");
         names.Should().NotContain("AT&T");                 // the bare duplicate label is replaced
         names.Should().Contain("Cloudflare");              // unique labels stay clean
         names.Should().Contain("Fastly");

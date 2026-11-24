@@ -223,6 +223,53 @@ public class StarlinkAlertEvaluatorTests
         Of("starlink.dish_alert").Should().HaveCount(2, "the condition cleared, so it can raise again");
     }
 
+    /// <summary>The flag stays raised for hours after weather passes while every other reading is healthy.</summary>
+    [Fact]
+    public async Task LowerSignalThanPredicted_OnAnOtherwiseHealthyDish_DoesNotAlert()
+    {
+        var stats = Healthy();
+        stats.ActiveAlerts = ["install_pending", "lower_signal_than_predicted"];
+        stats.IsSnrAboveNoiseFloor = false; // proto3 default when the dish omits it
+
+        await Feed(stats);
+
+        Of("starlink.dish_alert").Should().BeEmpty();
+    }
+
+    [Theory]
+    [InlineData(0.001, false)]
+    [InlineData(0.0006, true)]
+    public async Task LowerSignalThanPredicted_BackedByObstructionOrSnr_Alerts(
+        double fraction, bool snrPersistentlyLow)
+    {
+        var stats = Healthy();
+        stats.ActiveAlerts = ["lower_signal_than_predicted"];
+        stats.FractionObstructed = fraction;
+        stats.IsSnrPersistentlyLow = snrPersistentlyLow;
+        stats.IsSnrAboveNoiseFloor = false;
+
+        await Feed(stats);
+
+        Of("starlink.dish_alert").Should().ContainSingle()
+            .Which.Context["dish_alerts"].Should().Be("lower_signal_than_predicted");
+    }
+
+    [Fact]
+    public async Task LowerSignalThanPredicted_LosingItsBacking_Recovers()
+    {
+        var backed = Healthy();
+        backed.ActiveAlerts = ["lower_signal_than_predicted"];
+        backed.IsSnrPersistentlyLow = true;
+        await Feed(backed);
+
+        _time.Advance(TimeSpan.FromMinutes(1));
+        var bare = Healthy();
+        bare.ActiveAlerts = ["lower_signal_than_predicted"];
+        await Feed(bare);
+
+        RecoveriesOf("starlink.dish_alert").Should().ContainSingle();
+    }
+
     // --- starlink.obstructed -------------------------------------------------------------
 
     [Fact]
@@ -649,6 +696,116 @@ public class StarlinkAlertEvaluatorTests
         await Feed(limited);
 
         Of("starlink.service_restricted").Should().ContainSingle();
+    }
+
+    // --- Restart: alerts open before it ---------------------------------------------------
+
+    private async Task AfterRestartAsync(int polls, TimeSpan every, Func<StarlinkStats> stats,
+        params NetworkOptimizer.Alerts.Models.AlertHistoryEntry[] stored)
+    {
+        var evaluator = new StarlinkAlertEvaluator(_bus, NullLogger<StarlinkAlertEvaluator>.Instance,
+            timeProvider: _time, scopeFactory: OpenAlertTestScope.With(stored));
+        for (var i = 0; i < polls; i++)
+        {
+            await evaluator.EvaluateAsync(DishId, DishName, stats(), ethCapableMbps: 1000);
+            _time.Advance(every);
+        }
+    }
+
+    private static NetworkOptimizer.Alerts.Models.AlertHistoryEntry Stored(string type, params (string, string)[] context) =>
+        OpenAlertTestScope.Alert(type, $"starlink:{DishId}", TimeSpan.FromHours(1), context: context);
+
+    [Fact]
+    public async Task ObstructedBeforeRestart_ClearSky_PublishesItsRecovery()
+    {
+        await AfterRestartAsync(20, TimeSpan.FromMinutes(1), Healthy, Stored("starlink.obstructed"));
+
+        RecoveriesOf("starlink.obstructed").Should().ContainSingle();
+        Of("starlink.obstructed").Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task DishFaultBeforeRestart_SameCodeStanding_IsNotRepublished()
+    {
+        await AfterRestartAsync(5, TimeSpan.FromMinutes(1), () =>
+        {
+            var stats = Healthy();
+            stats.ActiveAlerts = ["install_pending", "thermal_throttle"];
+            return stats;
+        }, Stored("starlink.dish_alert", ("dish_alerts", "thermal_throttle")));
+
+        _bus.Published.Should().BeEmpty();
+    }
+
+    /// <summary>Resolving a standing fault by hand acknowledges it; a restart must not raise it again.</summary>
+    [Fact]
+    public async Task DishFaultResolvedByHand_SameCodeStanding_IsNotRepublishedAfterRestart()
+    {
+        await AfterRestartAsync(5, TimeSpan.FromMinutes(1), () =>
+        {
+            var stats = Healthy();
+            stats.ActiveAlerts = ["thermal_throttle"];
+            return stats;
+        }, Stored("starlink.dish_alert", ("dish_alerts", "thermal_throttle")).Resolved());
+
+        _bus.Published.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task DishFaultResolvedByItsRecovery_SameCodeBack_IsRaisedAfterRestart()
+    {
+        await AfterRestartAsync(1, TimeSpan.FromMinutes(1), () =>
+        {
+            var stats = Healthy();
+            stats.ActiveAlerts = ["thermal_throttle"];
+            return stats;
+        },
+            Stored("starlink.dish_alert", ("dish_alerts", "thermal_throttle")).Resolved(),
+            OpenAlertTestScope.Alert("starlink.recovered", $"starlink:{DishId}", TimeSpan.FromMinutes(30),
+                context: ("recovered_type", "starlink.dish_alert")).Resolved());
+
+        Of("starlink.dish_alert").Should().ContainSingle();
+    }
+
+    /// <summary>The reference dish fails its self-test permanently, so only the stored regression keeps this open.</summary>
+    [Fact]
+    public async Task SelfTestRegressionBeforeRestart_StillFailing_IsNotCleared()
+    {
+        await AfterRestartAsync(5, TimeSpan.FromMinutes(1), Healthy,
+            Stored("starlink.dish_alert", ("dish_alerts", ""), ("self_test_regressed", "true")));
+
+        _bus.Published.Should().BeEmpty();
+    }
+
+    /// <summary>The restart emptied the outage window; an empty window is not a recovery.</summary>
+    [Fact]
+    public async Task OutageBurstBeforeRestart_IsHeldUntilTheWindowRefills()
+    {
+        await AfterRestartAsync(23, TimeSpan.FromHours(1), Healthy, Stored("starlink.outage_burst"));
+
+        _bus.Published.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task OutageBurstBeforeRestart_ClosesAfterAFullQuietWindow()
+    {
+        await AfterRestartAsync(26, TimeSpan.FromHours(1), Healthy, Stored("starlink.outage_burst"));
+
+        RecoveriesOf("starlink.outage_burst").Should().ContainSingle();
+    }
+
+    [Fact]
+    public async Task RestrictedBeforeRestart_Lifted_PublishesItsRecovery()
+    {
+        await AfterRestartAsync(2, TimeSpan.FromMinutes(1), () =>
+        {
+            var free = Healthy();
+            free.DownlinkRestrictedReason = "NoLimit";
+            free.UplinkRestrictedReason = "NoLimit";
+            return free;
+        }, Stored("starlink.service_restricted"));
+
+        RecoveriesOf("starlink.service_restricted").Should().ContainSingle();
     }
 
     // --- Labelling ------------------------------------------------------------------------

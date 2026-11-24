@@ -2,14 +2,16 @@
 // filter badges, poll interval scaling) into a shared module so latency-charts,
 // device-health-charts, and future chart sets share one implementation.
 import ApexCharts from '/_content/Blazor-ApexCharts/js/apexcharts.esm.js';
-import { computeStats, renderStatsTable as renderTable } from './chart-stats.js?v=9';
-import { valueSortedTooltip, tooltipHeld, alignedPoints } from './chart-tooltip.js?v=17';
+import { computeStats, renderStatsTable as renderTable } from './chart-stats.js?v=10';
+import { valueSortedTooltip, tooltipHeld, alignedPoints } from './chart-tooltip.js?v=22';
 import { renderFilterReset, isFiltered } from './chart-filter.js?v=6';
-import { createMarkLayer } from './chart-event-marks.js?v=5';
-import { createAxisDateCaption } from './chart-axis-date.js?v=3';
-import { syncIdentity, extentsOf, spanTo } from './chart-sync.js?v=7';
+import { createMarkLayer } from './chart-event-marks.js?v=14';
+import { createAxisDateCaption } from './chart-axis-date.js?v=5';
+import { syncIdentity, extentsOf, spanTo } from './chart-sync.js?v=9';
 import { awaitContainer } from './chart-mount.js?v=1';
-import { loadWindowHours, saveWindowHours, markActiveRange } from './chart-window.js?v=2';
+import { loadWindowHours, saveWindowHours, markActiveRange } from './chart-window.js?v=3';
+import { downloadColor, uploadColor } from './chart-colors.js?v=2';
+import { formatBps, formatBpsAxis } from './chart-format.js?v=2';
 
 // Storage scope for this tab's remembered time window.
 const WINDOW_TAB = 'device-health';
@@ -47,8 +49,18 @@ let tempChart = null;
 let cpuChart = null;
 let memChart = null;
 let fanChart = null;
+// The site's summed WAN download and upload, shown only while the gateway is the one device
+// selected. Built when it appears and destroyed when it goes: ApexCharts sizes itself to its
+// container, and a hidden card has no width to size to.
+let wanChart = null;
+let wanChartRendering = null;
 let customCharts = {};
 let customFieldDefs = [];
+// Health check charts, keyed by the check's Influx field. Below the custom OID ones; each carries
+// a dashed threshold line as its own series so the mark layer's annotation updates never touch it.
+let checkCharts = {};
+let checkDefs = [];
+const THRESHOLD_COLOR = '#9ca3af';
 let pollTimer = null;
 let currentRangeHours = 1;
 let windowOffset = 0;
@@ -93,21 +105,17 @@ function baseOpts(height, yTitle, yFormatter, extra, group = SYNC_GROUP) {
         dataLabels: { enabled: false },
         xaxis: {
             type: 'datetime',
-            labels: {
-                style: { colors: '#9ca3af' },
-                datetimeUTC: false,
-                datetimeFormatter: { hour: 'HH:mm', day: 'MMM dd' },
-            },
+            labels: noTime.timeAxisLabels({ style: { colors: '#9ca3af' } }),
             title: axisDate.option(),
         },
         yaxis: {
             min: 0,
             title: { text: yTitle, style: { color: '#9ca3af' } },
-            labels: { style: { colors: '#9ca3af' }, formatter: yFormatter },
+            labels: { minWidth: 20, style: { colors: '#9ca3af' }, formatter: yFormatter },
         },
         grid: { borderColor: '#374151', strokeDashArray: 3 },
         legend: { show: false },
-        tooltip: { theme: 'dark', shared: true, x: { format: 'MMM dd, HH:mm:ss' }, custom: valueSortedTooltip },
+        tooltip: { theme: 'dark', shared: true, x: { formatter: noTime.chartTooltipFormatter() }, custom: valueSortedTooltip },
         noData: { text: 'No data in this time range', style: { color: '#64748b' } },
         ...extra,
     };
@@ -127,17 +135,76 @@ function buildQueryParams() {
     } else {
         params = `rangeHours=${currentRangeHours}`;
     }
+    // Asked for only when it will be drawn, so the other selections cost no WAN query.
+    if (gatewaySolo()) params += '&wanThroughput=true';
     return params;
+}
+
+// True when the gateway is the only device on screen, which is when its WAN traffic belongs here.
+function gatewaySolo() {
+    const shown = deviceMeta.filter(d => visibility[d.mac] !== false);
+    return shown.length === 1 && shown[0].isGateway;
+}
+
+function wanSeries() {
+    const wan = lastData?.wanThroughput;
+    const pts = arr => (arr || []).map(p => ({ x: noTime.toChart(new Date(p.time).getTime()), y: p.value }));
+    return padFirst([
+        { name: 'Download', color: downloadColor(), data: pts(wan?.download) },
+        { name: 'Upload', color: uploadColor(), data: pts(wan?.upload) },
+    ]);
+}
+
+async function syncWanChart() {
+    const container = document.getElementById(containerId);
+    const card = container?.querySelector('.health-wan-card');
+    const el = container?.querySelector('.health-wan-chart');
+    if (!card || !el) {
+        // Unmounted while the chart rendered: nothing else will destroy it.
+        if (wanChart) { wanChart.destroy(); wanChart = null; }
+        return;
+    }
+
+    if (!(gatewaySolo() && lastData?.wanThroughput)) {
+        card.style.display = 'none';
+        if (wanChart) { wanChart.destroy(); wanChart = null; delete chartEls.wan; }
+        return;
+    }
+    card.style.display = '';
+    if (wanChart) { wanChart.updateSeries(wanSeries(), false); return; }
+    if (wanChartRendering) return;
+
+    wanChartRendering = (async () => {
+        const chart = new ApexCharts(el, {
+            ...baseOpts(200, 'Throughput', v => v != null ? formatBpsAxis(v) : '', {
+                tooltip: {
+                    theme: 'dark', shared: true, x: { formatter: noTime.chartTooltipFormatter() },
+                    custom: ctx => valueSortedTooltip(ctx, { format: formatBps }),
+                },
+            }),
+            series: wanSeries(), colors: [downloadColor(), uploadColor()],
+        });
+        await chart.render();
+        wanChart = chart;
+        chartEls.wan = el;
+    })();
+    try { await wanChartRendering; } finally { wanChartRendering = null; }
+    // The selection or the tab may have moved on while it rendered; this settles it either way.
+    await syncWanChart();
+    applyAnnotations();
 }
 
 async function fetchData() {
     if (fetchController) fetchController.abort();
     fetchController = new AbortController();
     try {
-        const resp = await fetch(`/api/monitoring/device-health-chart?${buildQueryParams()}`,
+        const params = buildQueryParams();
+        const resp = await fetch(`/api/monitoring/device-health-chart?${params}`,
             { signal: fetchController.signal });
         if (!resp.ok) return null;
-        return await resp.json();
+        const data = await resp.json();
+        data.wanAsked = params.includes('wanThroughput=true');
+        return data;
     } catch (e) {
         if (e.name === 'AbortError') return null;
         return null;
@@ -198,6 +265,7 @@ function drawSeries() {
     if (cpuChart) cpuChart.updateSeries(padFirst(makeSeries('cpu')), false);
     if (memChart) memChart.updateSeries(padFirst(makeSeries('mem')), false);
     if (fanChart) fanChart.updateSeries(padFirst(makeSeries('fan')), false);
+    syncWanChart();
     for (const [field, chart] of Object.entries(customCharts)) {
         if (!chart) continue;
         chart.updateSeries(padFirst(devices.map(d => ({
@@ -206,15 +274,51 @@ function drawSeries() {
             data: customPoints(d, field),
         }))), false);
     }
+    for (const def of checkDefs) {
+        const chart = checkCharts[def.fieldName];
+        if (!chart) continue;
+        chart.updateSeries(checkSeries(def, devices), false);
+    }
 }
 
 function customPoints(d, field) {
-    return (d.custom?.[field] || []).map(p => ({ x: new Date(p.time).getTime(), y: p.value }));
+    return (d.custom?.[field] || []).map(p => ({ x: noTime.toChart(new Date(p.time).getTime()), y: p.value }));
+}
+
+function checkPoints(d, field) {
+    return (d.checks?.[field] || []).map(p => ({ x: noTime.toChart(new Date(p.time).getTime()), y: p.value }));
+}
+
+// The device lines first, then the threshold spanning the group's window - drawn last so the
+// device colours keep their positions in the palette and the tooltip lists it at the bottom.
+function checkSeries(def, devices) {
+    const series = padFirst(devices.map(d => ({
+        name: d.name,
+        color: hashColor(d.name),
+        data: checkPoints(d, def.fieldName),
+    })));
+    const ext = groupExtents;
+    if (ext && Number.isFinite(ext.minX) && Number.isFinite(ext.maxX) && ext.maxX > ext.minX) {
+        series.push({
+            name: `Threshold (${def.op} ${def.threshold}${def.unit || ''})`,
+            color: THRESHOLD_COLOR,
+            data: [{ x: ext.minX, y: def.threshold }, { x: ext.maxX, y: def.threshold }],
+        });
+    }
+    return series;
+}
+
+// Every series is solid except the threshold, which is the last one when it is present.
+function checkDashes(series) {
+    return series.map((s, i) => (i === series.length - 1 && s.color === THRESHOLD_COLOR ? 5 : 0));
 }
 
 function updateVisibility() {
     drawSeries();
     applyAnnotations();
+    // Narrowed to the gateway on a response that did not carry its WAN rates: fetch them now
+    // rather than leave the card waiting for the next poll.
+    if (gatewaySolo() && lastData && !lastData.wanAsked) loadAndUpdate();
 }
 
 // Every chart on the tab paired with the element it rendered into, which is what the mark
@@ -224,8 +328,10 @@ function chartEntries() {
         [tempChart, chartEls.temp],
         [cpuChart, chartEls.cpu],
         [memChart, chartEls.mem],
+        [wanChart, chartEls.wan],
         [fanChart, chartEls.fan],
         ...Object.keys(customCharts).map(k => [customCharts[k], chartEls[`custom:${k}`]]),
+        ...Object.keys(checkCharts).map(k => [checkCharts[k], chartEls[`check:${k}`]]),
     ].filter(([c]) => c);
 }
 
@@ -250,7 +356,7 @@ async function loadAndUpdate() {
     const data = await fetchData();
     if (!data?.devices) return;
     deviceMeta = data.devices.map(d => ({
-        name: d.name, mac: d.mac, color: hashColor(d.name),
+        name: d.name, mac: d.mac, color: hashColor(d.name), isGateway: !!d.isGateway,
     }));
     groupExtents = extentsOf((data.devices || []).map(d => d.data || []));
     // Set before updateVisibility below, which is what draws the marks.
@@ -263,6 +369,7 @@ async function loadAndUpdate() {
     const fanCard = container?.querySelector('.health-fan-card');
     if (fanCard) fanCard.style.display = hasFan ? '' : 'none';
     if (container) await syncCustomCharts(container, data.devices, newDefs);
+    if (container) await syncCheckCharts(container, data.devices, data.healthChecks || []);
 
     // Ahead of the redraw below - see apply().
     axisDate.apply();
@@ -320,6 +427,50 @@ async function syncCustomCharts(container, devices, defs) {
     customFieldDefs = defs;
 }
 
+async function syncCheckCharts(container, devices, defs) {
+    const checkContainer = container.querySelector('.health-check-charts');
+    if (!checkContainer) return;
+
+    const newKeys = new Set(defs.map(d => d.fieldName));
+    for (const key of Object.keys(checkCharts)) {
+        if (newKeys.has(key)) continue;
+        checkCharts[key].destroy();
+        delete checkCharts[key];
+        delete chartEls[`check:${key}`];
+        checkContainer.querySelector(`[data-check-field="${key}"]`)?.closest('.chart-card')?.remove();
+    }
+
+    for (const def of defs) {
+        const series = checkSeries(def, devices.filter(d => visibility[d.mac] !== false));
+        const fmt = v => v != null ? `${fmtCustom(v)}${def.unit || ''}` : '-';
+
+        if (checkCharts[def.fieldName]) {
+            checkCharts[def.fieldName].updateOptions({ stroke: { curve: 'smooth', width: 2, dashArray: checkDashes(series) } }, false, false, false);
+            checkCharts[def.fieldName].updateSeries(series, false);
+            continue;
+        }
+
+        let chartDiv = checkContainer.querySelector(`[data-check-field="${def.fieldName}"]`);
+        if (!chartDiv) {
+            const card = document.createElement('div');
+            card.className = 'chart-card';
+            card.innerHTML = `<div class="chart-header"><h3 class="chart-title">${escapeHtml(def.name)}</h3></div><div data-check-field="${escapeHtml(def.fieldName)}"></div>`;
+            checkContainer.appendChild(card);
+            chartDiv = card.querySelector('[data-check-field]');
+        }
+        const chart = new ApexCharts(chartDiv, {
+            ...baseOpts(200, def.unit || '', fmt),
+            stroke: { curve: 'smooth', width: 2, dashArray: checkDashes(series) },
+            series, colors: PALETTE,
+        });
+        await chart.render();
+        checkCharts[def.fieldName] = chart;
+        chartEls[`check:${def.fieldName}`] = chartDiv;
+    }
+
+    checkDefs = defs;
+}
+
 const fmtTemp = v => v != null ? v.toFixed(1) : '-';
 const fmtPct = v => v != null ? v.toFixed(1) + '%' : '-';
 const fmtRpm = v => v != null ? Math.round(v).toLocaleString() : '-';
@@ -336,6 +487,15 @@ function renderStatsTable(container, showAll) {
             { header: `${def.description} Mean`, format: fmtCustom },
             { header: `${def.description} Min`, format: fmtCustom },
             { header: `${def.description} Max`, format: fmtCustom },
+        );
+    }
+
+    const checkCols = [];
+    for (const def of checkDefs) {
+        const fmt = v => v != null ? `${fmtCustom(v)}${def.unit || ''}` : '-';
+        checkCols.push(
+            { header: `${def.name} Latest`, format: fmt, cls: 'stats-lead' },
+            { header: `${def.name} Max`, format: fmt },
         );
     }
 
@@ -365,6 +525,12 @@ function renderStatsTable(container, showAll) {
             baseValues.push(stats?.latest, stats?.mean, stats?.min, stats?.max);
         }
 
+        for (const def of checkDefs) {
+            const vals = (d.checks?.[def.fieldName] || []).map(p => p.value).filter(v => v != null);
+            const stats = computeStats(vals);
+            baseValues.push(stats?.latest, stats?.max);
+        }
+
         return { id: d.mac, label: d.name, color: hashColor(d.name),
             visible: deviceMeta.some(dm => dm.mac === d.mac) && visibility[d.mac] !== false,
             values: baseValues };
@@ -378,6 +544,7 @@ function renderStatsTable(container, showAll) {
             { header: 'Mem Latest', format: fmtPct, cls: 'stats-lead' }, { header: 'Mem Mean', format: fmtPct }, { header: 'Mem Min', format: fmtPct }, { header: 'Mem Max', format: fmtPct },
             ...fanCols,
             ...customCols,
+            ...checkCols,
         ],
         filter: { meta: () => deviceMeta, key: 'mac', visibility: () => visibility,
             resetVisibility: () => { visibility = {}; },
@@ -396,8 +563,7 @@ function startPoll() {
 function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 
 function toLocalDatetimeString(d) {
-    const pad = n => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    return noTime.inputValue(d);
 }
 
 // A plain preset keeps no explicit bounds - getEffectiveFrom/To answer null for it - so its window
@@ -432,7 +598,7 @@ function updateCustomLabel(container) {
         btn.classList.add('active');
         const from = getEffectiveFrom(), to = getEffectiveTo();
         if (from && to) {
-            const fmt = d => d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+            const fmt = d => noTime.date(d, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
             btn.setAttribute('data-tooltip', `${fmt(from)} - ${fmt(to)}`);
         }
         if (!clearBtn) {
@@ -457,8 +623,9 @@ function updateCustomLabel(container) {
 function applyDragZoom(xaxis) {
     const container = document.getElementById(containerId);
     if (container && xaxis && Number.isFinite(xaxis.min) && Number.isFinite(xaxis.max) && xaxis.min < xaxis.max) {
-        customFrom = new Date(xaxis.min);
-        customTo = new Date(xaxis.max);
+        // The selection is in chart x (noTime.toChart); the window is real instants.
+        customFrom = new Date(noTime.fromChart(xaxis.min));
+        customTo = new Date(noTime.fromChart(xaxis.max));
         isCustomRange = true;
         windowOffset = 0;
         container.querySelectorAll('[data-range]').forEach(b => b.classList.remove('active'));
@@ -520,8 +687,17 @@ function shiftWindow(container, direction) {
     startPoll();
 }
 
-export async function mount(elId) {
+// The page, told when the reader picks a window themselves, so it can drop the link's ?at= from the URL: a link's
+// framing must not outlive the reader's own choice (a site switch carries the URL along).
+let pageRef = null;
+function readerChoseWindow() {
+    pageRef?.invokeMethodAsync('DeviceWindowChosen').catch(() => { });
+}
+
+export async function mount(elId, dotNetRef) {
     containerId = elId;
+    pageRef = dotNetRef || null;
+    window.__healthCharts = { unmount };
     // Read before the await, so the decision is made against the URL this mount was called
     // for. Null leaves this tab's own default standing.
     const restoredHours = loadWindowHours(WINDOW_TAB);
@@ -545,18 +721,19 @@ export async function mount(elId) {
     if (cpuChart) { cpuChart.destroy(); cpuChart = null; }
     if (memChart) { memChart.destroy(); memChart = null; }
     if (fanChart) { fanChart.destroy(); fanChart = null; }
+    if (wanChart) { wanChart.destroy(); wanChart = null; }
 
     chartEls = { temp: tempEl, cpu: cpuEl, mem: memEl };
 
     tempChart = new ApexCharts(tempEl, { ...baseOpts(200, '°C', v => v != null ? v.toFixed(0) + ' °C' : ''), series: [], colors: PALETTE });
     cpuChart = new ApexCharts(cpuEl, {
         ...baseOpts(200, 'CPU %', v => v != null ? v.toFixed(0) + '%' : ''),
-        yaxis: { min: 0, max: v => Math.max(v * 1.1, 30), title: { text: 'CPU %', style: { color: '#9ca3af' } }, labels: { style: { colors: '#9ca3af' }, formatter: v => v != null ? v.toFixed(0) + '%' : '' } },
+        yaxis: { min: 0, max: v => Math.max(v * 1.1, 30), title: { text: 'CPU %', style: { color: '#9ca3af' } }, labels: { minWidth: 20, style: { colors: '#9ca3af' }, formatter: v => v != null ? v.toFixed(0) + '%' : '' } },
         series: [], colors: PALETTE,
     });
     memChart = new ApexCharts(memEl, {
         ...baseOpts(200, 'Memory %', v => v != null ? v.toFixed(0) + '%' : ''),
-        yaxis: { min: 0, max: v => Math.max(v * 1.1, 50), title: { text: 'Memory %', style: { color: '#9ca3af' } }, labels: { style: { colors: '#9ca3af' }, formatter: v => v != null ? v.toFixed(0) + '%' : '' } },
+        yaxis: { min: 0, max: v => Math.max(v * 1.1, 50), title: { text: 'Memory %', style: { color: '#9ca3af' } }, labels: { minWidth: 20, style: { colors: '#9ca3af' }, formatter: v => v != null ? v.toFixed(0) + '%' : '' } },
         series: [], colors: PALETTE,
     });
 
@@ -564,7 +741,7 @@ export async function mount(elId) {
         chartEls.fan = fanEl;
         fanChart = new ApexCharts(fanEl, {
             ...baseOpts(200, 'RPM', v => v != null ? Math.round(v).toLocaleString() + ' RPM' : ''),
-            yaxis: { min: 0, title: { text: 'RPM', style: { color: '#9ca3af' } }, labels: { style: { colors: '#9ca3af' }, formatter: v => v != null ? Math.round(v).toLocaleString() : '' } },
+            yaxis: { min: 0, title: { text: 'RPM', style: { color: '#9ca3af' } }, labels: { minWidth: 20, style: { colors: '#9ca3af' }, formatter: v => v != null ? Math.round(v).toLocaleString() : '' } },
             series: [], colors: PALETTE,
         });
         await fanChart.render();
@@ -582,12 +759,13 @@ export async function mount(elId) {
             // too, and a window the link chose must not become a remembered preference.
             saveWindowHours(WINDOW_TAB, hours);
             selectPresetRange(container, hours);
+            readerChoseWindow();
         });
     });
 
     // Shift arrows
     container.querySelectorAll('[data-shift]').forEach(btn => {
-        btn.addEventListener('click', () => shiftWindow(container, btn.dataset.shift));
+        btn.addEventListener('click', () => { shiftWindow(container, btn.dataset.shift); readerChoseWindow(); });
     });
 
     // Custom range popover
@@ -608,13 +786,14 @@ export async function mount(elId) {
     });
 
     container.querySelector('[data-action="apply-custom"]')?.addEventListener('click', () => {
-        const from = fromInput?.value ? new Date(fromInput.value) : null;
-        const to = toInput?.value ? new Date(toInput.value) : null;
+        const from = fromInput?.value ? noTime.fromInputValue(fromInput.value) : null;
+        const to = toInput?.value ? noTime.fromInputValue(toInput.value) : null;
         if (!from || !to || isNaN(from) || isNaN(to) || from >= to) return;
         customFrom = from;
         customTo = to;
         isCustomRange = true;
         windowOffset = 0;
+        readerChoseWindow();
         container.querySelectorAll('[data-range]').forEach(b => b.classList.remove('active'));
         popover?.classList.remove('open');
         updateCustomLabel(container);
@@ -698,6 +877,7 @@ export function soloDevice(mac) {
 }
 
 export function unmount() {
+    pageRef = null;
     stopPoll();
     window.removeEventListener('resize', onMarkResize);
     clearTimeout(markResizeTimer);
@@ -708,9 +888,13 @@ export function unmount() {
     if (cpuChart) { cpuChart.destroy(); cpuChart = null; }
     if (memChart) { memChart.destroy(); memChart = null; }
     if (fanChart) { fanChart.destroy(); fanChart = null; }
+    if (wanChart) { wanChart.destroy(); wanChart = null; }
     for (const chart of Object.values(customCharts)) chart.destroy();
     customCharts = {};
     customFieldDefs = [];
+    for (const chart of Object.values(checkCharts)) chart.destroy();
+    checkCharts = {};
+    checkDefs = [];
     chartEls = {};
     containerId = null;
     deviceMeta = [];

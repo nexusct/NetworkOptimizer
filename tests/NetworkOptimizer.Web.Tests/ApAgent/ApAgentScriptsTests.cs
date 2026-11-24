@@ -20,7 +20,7 @@ public class ApAgentScriptsTests
         ---PROCD---
         present
         ---BINARY---
-        exists
+        /tmp/netopt-apagent/apagent-linux-arm
         ---WRAPPER---
         exists
         ---PROCESS---
@@ -30,7 +30,7 @@ public class ApAgentScriptsTests
         ---BINARY_VERSION---
         1
         ---MD5---
-        3366043c8f699cf4aabbccddeeff0011
+        3366043c8f699cf4aabbccddeeff0011  /tmp/netopt-apagent/apagent-linux-arm
         ---SFTP---
         present
         ---SCP---
@@ -41,20 +41,177 @@ public class ApAgentScriptsTests
     [InlineData("armv7l", true)]
     [InlineData("armv6l", true)]
     [InlineData("armv8l", true)]
-    [InlineData("aarch64", false)]
-    [InlineData("mips", false)]
+    [InlineData("aarch64", true)]
+    [InlineData("arm64", true)]
+    [InlineData("aarch64_be", false)]
+    [InlineData("mips", true)]
+    [InlineData("mipsel", true)]
+    [InlineData("mips64", false)]
     [InlineData("x86_64", false)]
     [InlineData("", false)]
     [InlineData(null, false)]
-    public void OnlyThirtyTwoBitArm_has_a_build(string? machine, bool supported)
+    public void ArmAndThirtyTwoBitMips_have_a_build(string? machine, bool supported)
     {
         ApAgentScripts.SupportsArchitecture(machine).Should().Be(supported);
+    }
+
+    [Theory]
+    [InlineData("armv7l", null, "apagent-linux-arm")]
+    [InlineData("armv7l", "little", "apagent-linux-arm")]
+    // The kernel says "mips" for both byte orders; a little-endian U6-Lite reports exactly this.
+    [InlineData("mips", "little", "apagent-linux-mipsle")]
+    [InlineData("mips", "big", "apagent-linux-mips")]
+    [InlineData("mips", null, null)]
+    [InlineData("aarch64", null, "apagent-linux-arm64")]
+    [InlineData("aarch64_be", null, null)]
+    public void TheBuild_follows_the_byte_order_not_the_machine_string(string machine, string? byteOrder, string? expected)
+    {
+        ApAgentPaths.BinaryNameFor(machine, byteOrder).Should().Be(expected);
     }
 
     [Fact]
     public void AnUnsupportedArchitecture_says_what_it_is_rather_than_failing_cryptically()
     {
-        ApAgentScripts.UnsupportedReason("aarch64").Should().Contain("aarch64").And.Contain("armv7l");
+        ApAgentScripts.UnsupportedReason("x86_64").Should().Contain("x86_64").And.Contain("armv7l").And.Contain("aarch64");
+        ApAgentScripts.UnsupportedReason("mips").Should().Contain("byte order");
+    }
+
+    [Fact]
+    public void TheStagedFile_is_outside_the_build_glob_and_the_process_pattern()
+    {
+        var fileName = ApAgentPaths.StagedBinaryPath[(ApAgentPaths.StagedBinaryPath.LastIndexOf('/') + 1)..];
+        var glob = new System.Text.RegularExpressions.Regex(
+            "^" + ApAgentPaths.BinaryGlob.Replace("*", ".*") + "$");
+        var process = new System.Text.RegularExpressions.Regex(ApAgentPaths.ProcessPattern);
+
+        ApAgentPaths.StagedBinaryPath.Should().StartWith(ApAgentPaths.RemoteDir + "/", "a rename is atomic only within one tmpfs");
+        glob.IsMatch(fileName).Should().BeFalse("the status probe must never read a half-written file as a build");
+        process.IsMatch(ApAgentPaths.StagedBinaryPath).Should().BeFalse("pgrep and pkill must never see the staged file");
+        glob.IsMatch(ApAgentPaths.BinaryPrefix + "arm").Should().BeTrue("the check above is only meaningful if the glob matches a real build");
+    }
+
+    [Fact]
+    public void Promoting_renames_the_staged_file_over_the_live_build()
+    {
+        ApAgentScripts.PromoteStagedCommand("apagent-linux-arm")
+            .Should().Be("mv -f /tmp/netopt-apagent/upload.tmp /tmp/netopt-apagent/apagent-linux-arm");
+    }
+
+    [Fact]
+    public void Preparing_clears_only_the_staged_file_and_never_the_live_build()
+    {
+        var prepare = ApAgentScripts.PrepareStagingCommand();
+
+        prepare.Should().Be("mkdir -p /tmp/netopt-apagent && rm -f /tmp/netopt-apagent/upload.tmp");
+        prepare.Should().NotContain(ApAgentPaths.BinaryPrefix);
+    }
+
+    [Fact]
+    public void ALeftover_staged_file_does_not_change_which_md5_the_probe_reads()
+    {
+        var output = """
+            ---ARCH---
+            armv7l
+            ---BINARY---
+            /tmp/netopt-apagent/apagent-linux-arm
+            ---MD5---
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  /tmp/netopt-apagent/apagent-linux-arm
+            bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  /tmp/netopt-apagent/upload.tmp
+            """;
+
+        ApAgentScripts.ParseStatus(output, success: true).BinaryMd5.Should().Be("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    }
+
+    [Fact]
+    public void AMipsProbe_picks_the_little_endian_build_and_its_md5()
+    {
+        var output = """
+            ---ARCH---
+            mips
+            ---BYTE_ORDER---
+            little
+            ---BINARY---
+            /tmp/netopt-apagent/apagent-linux-mips
+            /tmp/netopt-apagent/apagent-linux-mipsle
+            ---MD5---
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  /tmp/netopt-apagent/apagent-linux-mips
+            bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  /tmp/netopt-apagent/apagent-linux-mipsle
+            """;
+
+        var status = ApAgentScripts.ParseStatus(output, success: true);
+
+        status.SupportedArchitecture.Should().BeTrue();
+        status.BinaryName.Should().Be("apagent-linux-mipsle");
+        status.BinaryDeployed.Should().BeTrue();
+        status.BinaryMd5.Should().Be("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    }
+
+    [Fact]
+    public void AnAarch64Probe_picks_the_arm64_build_not_the_arm_build_its_name_starts_with()
+    {
+        var output = """
+            ---ARCH---
+            aarch64
+            ---BYTE_ORDER---
+            ---BINARY---
+            /tmp/netopt-apagent/apagent-linux-arm
+            /tmp/netopt-apagent/apagent-linux-arm64
+            ---MD5---
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  /tmp/netopt-apagent/apagent-linux-arm
+            bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  /tmp/netopt-apagent/apagent-linux-arm64
+            """;
+
+        var status = ApAgentScripts.ParseStatus(output, success: true);
+
+        status.SupportedArchitecture.Should().BeTrue();
+        status.BinaryName.Should().Be("apagent-linux-arm64");
+        status.BinaryDeployed.Should().BeTrue();
+        status.BinaryMd5.Should().Be("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    }
+
+    [Fact]
+    public void AMipsProbe_without_a_byte_order_is_unsupported_rather_than_guessed()
+    {
+        var status = ApAgentScripts.ParseStatus("---ARCH---\nmips\n---BYTE_ORDER---\n", success: true);
+
+        status.SupportedArchitecture.Should().BeFalse();
+        status.BinaryName.Should().BeNull();
+    }
+
+    [Fact]
+    public void AnotherArchitecturesBuild_on_the_AP_is_not_mistaken_for_this_one()
+    {
+        var status = ApAgentScripts.ParseStatus(
+            "---ARCH---\narmv7l\n---BINARY---\n/tmp/netopt-apagent/apagent-linux-mips\n---MD5---\naaaa  /tmp/netopt-apagent/apagent-linux-mips",
+            success: true);
+
+        status.BinaryDeployed.Should().BeFalse();
+        status.BinaryMd5.Should().BeNull();
+    }
+
+    [Fact]
+    public void TheProbeCommand_never_names_a_build_literally_so_pgrep_cannot_match_its_own_shell()
+    {
+        // pgrep -f matches the probe's own "sh -c" command line (measured on a U7), so any literal
+        // "apagent-linux-" in the command reads as a running agent when none is.
+        ApAgentScripts.StatusProbeCommand().Should().NotContain(ApAgentPaths.BinaryPrefix);
+    }
+
+    [Fact]
+    public void TheProbeCommand_requires_the_ubus_service_object_before_using_procd()
+    {
+        ApAgentScripts.StatusProbeCommand()
+            .Should().Contain("test -f /lib/functions/procd.sh && ubus -t 2 list service >/dev/null 2>&1 && echo present || echo absent");
+    }
+
+    [Fact]
+    public void StartVerification_keeps_the_two_second_first_check_and_waits_longer_for_slow_aps()
+    {
+        var command = ApAgentScripts.VerifyRunningCommand();
+
+        command.Should().StartWith("sleep 2; ");
+        command.Should().Contain("for i in 1 2 3 4 5 6 7 8 9");
+        command.Should().Contain("echo started");
     }
 
     [Fact]
@@ -89,7 +246,6 @@ public class ApAgentScriptsTests
             ---PROCD---
             absent
             ---BINARY---
-            missing
             ---WRAPPER---
             missing
             ---PROCESS---
@@ -140,7 +296,7 @@ public class ApAgentScriptsTests
     {
         var command = ApAgentScripts.StatusProbeCommand();
 
-        foreach (var section in new[] { "ARCH", "MODEL", "FIRMWARE", "PROCD", "BINARY", "WRAPPER", "PROCESS", "VERSION", "BINARY_VERSION", "MD5", "SFTP", "SCP" })
+        foreach (var section in new[] { "ARCH", "BYTE_ORDER", "MODEL", "FIRMWARE", "PROCD", "BINARY", "WRAPPER", "PROCESS", "VERSION", "BINARY_VERSION", "MD5", "SFTP", "SCP" })
             command.Should().Contain($"---{section}---");
     }
 
@@ -196,7 +352,7 @@ public class ApAgentScriptsTests
         // The config partition behind /etc/persistent is 1 MB, so a Go binary provably cannot live
         // there. Nothing may be written to it.
         ApAgentPaths.RemoteDir.Should().StartWith("/tmp/");
-        ApAgentPaths.RemoteBinaryPath.Should().NotContain("/etc/persistent");
+        ApAgentPaths.RemoteBinaryPath("apagent-linux-arm").Should().StartWith(ApAgentPaths.RemoteDir + "/");
         ApAgentPaths.RemoteInitScriptPath.Should().NotContain("/etc/persistent");
     }
 

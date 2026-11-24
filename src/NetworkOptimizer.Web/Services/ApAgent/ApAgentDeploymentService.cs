@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using NetworkOptimizer.Core.Enums;
 using NetworkOptimizer.Core.Helpers;
 using NetworkOptimizer.Storage.Models;
+using NetworkOptimizer.Storage.Models.Identity;
 using NetworkOptimizer.Storage.Services;
 using NetworkOptimizer.UniFi;
 using NetworkOptimizer.Web.Services.Monitoring.RebootReason;
@@ -37,28 +38,35 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
     private static readonly TimeSpan SshTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan HealthTimeout = TimeSpan.FromSeconds(5);
 
-    /// <summary>Deploys open an SSH session and move ~10 MB, so a site runs a couple at a time, not a fleet.</summary>
-    private readonly SemaphoreSlim _deployGate = new(2);
+    /// <summary>Deploys open an SSH session and move ~10 MB, so a site runs a few at a time, not a fleet.</summary>
+    internal const int DeployConcurrency = 4;
+
+    /// <summary>
+    /// APs a supervision pass works on at once. Most of a pass is one small health probe per AP, so
+    /// this runs ahead of <see cref="DeployConcurrency"/>; the deploys it finds queue on the gate.
+    /// </summary>
+    internal const int SupervisionParallelism = 8;
+
+    private readonly SemaphoreSlim _deployGate = new(DeployConcurrency);
 
     private readonly ILogger<ApAgentDeploymentService> _logger;
     private readonly IServiceProvider _serviceProvider;
-    private readonly IUniFiSshService _siteSsh;
-    private readonly SshClientService _sshClient;
     private readonly ApAgentTransferSelector _transferSelector;
     private readonly ApAgentHealthClient _healthClient;
     private readonly ApAgentTargetDirectory _directory;
-    private readonly SiteTunnelRouting _tunnelRouting;
     private readonly ICredentialProtectionService _credentialProtection;
     private readonly NetworkOptimizer.Core.ISiteWorkGate _siteWorkGate;
     private readonly Firmware.RolloutSuppressionRegistry _rolloutSuppression;
     private readonly string _siteSlug;
-    private readonly DateTime _startedAtUtc = DateTime.UtcNow;
 
     private readonly ApAgentRetryPolicy _retry = new();
     private readonly Dictionary<string, ApAgentAssessment> _lastAssessment = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>How the binary last crossed the wire per AP, when not over SFTP. In-memory like the assessments.</summary>
     private readonly Dictionary<string, string> _transferNotes = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>APs whose in-flight work is a removal rather than a deploy.</summary>
+    private readonly HashSet<string> _removing = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Firmware last probed per AP, rendered into the transfer-failure detail at display time.</summary>
     private readonly Dictionary<string, string> _lastFirmware = new(StringComparer.OrdinalIgnoreCase);
@@ -69,12 +77,9 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
     public ApAgentDeploymentService(
         ILogger<ApAgentDeploymentService> logger,
         IServiceProvider serviceProvider,
-        IUniFiSshService siteSsh,
-        SshClientService sshClient,
         ApAgentTransferSelector transferSelector,
         ApAgentHealthClient healthClient,
         ApAgentTargetDirectory directory,
-        SiteTunnelRouting tunnelRouting,
         ICredentialProtectionService credentialProtection,
         NetworkOptimizer.Core.ISiteWorkGate siteWorkGate,
         Firmware.RolloutSuppressionRegistry rolloutSuppression,
@@ -82,12 +87,9 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
     {
         _logger = logger;
         _serviceProvider = serviceProvider;
-        _siteSsh = siteSsh;
-        _sshClient = sshClient;
         _transferSelector = transferSelector;
         _healthClient = healthClient;
         _directory = directory;
-        _tunnelRouting = tunnelRouting;
         _credentialProtection = credentialProtection;
         _siteWorkGate = siteWorkGate;
         _rolloutSuppression = rolloutSuppression;
@@ -217,6 +219,8 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
             lock (_transferNotes) _transferNotes.TryGetValue(mac, out transferNote);
             string? firmware;
             lock (_lastFirmware) _lastFirmware.TryGetValue(mac, out firmware);
+            bool removing;
+            lock (_removing) removing = _removing.Contains(mac);
 
             fleet.Add(new ApAgentFleetEntry
             {
@@ -226,7 +230,8 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
                 Host = ap.DisplayIpAddress,
                 DeviceOnline = IsOnline(ap),
                 Enabled = record?.Enabled ?? true,
-                DeployInProgress = _retry.IsWorkInFlight(mac),
+                DeployInProgress = _retry.IsWorkInFlight(mac) && !removing,
+                RemoveInProgress = removing,
                 State = assessment?.State ?? ApAgentState.Unknown,
                 RecommendedAction = assessment?.Action ?? ApAgentAction.None,
                 Detail = assessment?.Detail,
@@ -253,7 +258,7 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
         if (ap == null)
             return new ApAgentSshStatus { Reachable = false, Error = "No access point with that MAC on this site." };
 
-        return await ProbeStatusAsync(ap.DisplayIpAddress, ct);
+        return await ProbeStatusAsync(TargetFor(ap), ct);
     }
 
     /// <inheritdoc />
@@ -305,7 +310,15 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
     }
 
     /// <inheritdoc />
-    public async Task<ApAgentOperationResult> RestartAsync(string deviceMac, CancellationToken ct = default)
+    public Task<ApAgentOperationResult> RestartAsync(string deviceMac, CancellationToken ct = default)
+        => RestartCoreAsync(deviceMac, repushToken: false, ct);
+
+    /// <summary>
+    /// Restarts the agent already on the AP. With <paramref name="repushToken"/>, first mints a new
+    /// token and rewrites the support files: the agent reads its token only from the init script
+    /// (procd) or the token file, both written at deploy, so a plain restart keeps the rejected one.
+    /// </summary>
+    private async Task<ApAgentOperationResult> RestartCoreAsync(string deviceMac, bool repushToken, CancellationToken ct)
     {
         var ap = await FindAccessPointAsync(deviceMac, ct);
         if (ap == null) return ApAgentOperationResult.Fail("No access point with that MAC on this site.");
@@ -315,23 +328,54 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
         if (claim == null)
             return ApAgentOperationResult.InProgress();
 
-        var status = await ProbeStatusAsync(ap.DisplayIpAddress, ct);
+        var target = TargetFor(ap);
+        var status = await ProbeStatusAsync(target, ct);
         if (!status.Reachable)
             return ApAgentOperationResult.Fail(status.Error ?? "Could not reach the access point over SSH.");
 
         if (!status.BinaryDeployed)
             return ApAgentOperationResult.Fail("The agent is not on this access point; deploy it instead.");
 
-        var record = await GetOrCreateRecordAsync(mac, ap.Name, ct);
-        var token = ResolveToken(record);
+        // The token changes under callers on a repush, as in a deploy; keep them off it meanwhile.
+        using var hold = repushToken ? _directory.HoldDuringDeploy(_siteSlug, mac) : null;
 
-        await _siteSsh.RunCommandAsync(ap.DisplayIpAddress, ApAgentScripts.StopCommand(status.ProcdAvailable), null, SshTimeout, ct);
-        var started = await StartAgentAsync(ap.DisplayIpAddress, token, status.ProcdAvailable, ct);
+        await RunAsync(target, ApAgentScripts.StopCommand(status.ProcdAvailable), ct);
+
+        string token;
+        if (repushToken)
+        {
+            token = await RotateTokenAsync(mac, ct);
+            var wrote = await WriteSupportFilesAsync(target, token, status.ProcdAvailable, ct);
+            if (!wrote.Success)
+            {
+                await RecordFailureAsync(mac, wrote.Error, ct);
+                return wrote;
+            }
+        }
+        else
+        {
+            token = ResolveToken(await GetOrCreateRecordAsync(mac, ap.Name, ct));
+        }
+
+        var started = await StartAgentAsync(target, token, status.ProcdAvailable, ct);
 
         if (!started.Success)
+        {
             await RecordFailureAsync(mac, started.Error ?? "The agent did not start.", ct);
+            return started;
+        }
 
-        return started;
+        // Same reason as after a deploy: the row otherwise keeps the verdict that caused the
+        // restart until the next supervision pass, even once the agent is healthy.
+        var verified = await VerifyStartedAsync(ap, mac, ct);
+        if (!await RecordVerificationAsync(mac, verified, ct))
+        {
+            _logger.LogWarning("AP Agent restarted on {Host} on site {Site} but failed verification: {State} - {Detail}",
+                ap.DisplayIpAddress, _siteSlug, verified.State, verified.Detail);
+            return ApAgentOperationResult.Fail(verified.Detail, verified.State);
+        }
+
+        return ApAgentOperationResult.Ok(verified.State);
     }
 
     /// <inheritdoc />
@@ -345,9 +389,24 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
         if (claim == null)
             return ApAgentOperationResult.InProgress();
 
-        var status = await ProbeStatusAsync(ap.DisplayIpAddress, ct);
-        var result = await _siteSsh.RunCommandAsync(
-            ap.DisplayIpAddress, ApAgentScripts.RemoveCommand(status.ProcdAvailable), null, SshTimeout, ct);
+        // The claim is shared with deploys, so this is what tells the table which one is running.
+        // Held to the end: cleared any earlier, the row reads as Deploying while the claim lasts.
+        lock (_removing) _removing.Add(mac);
+        try
+        {
+            return await RemoveCoreAsync(ap, mac, ct);
+        }
+        finally
+        {
+            lock (_removing) _removing.Remove(mac);
+        }
+    }
+
+    private async Task<ApAgentOperationResult> RemoveCoreAsync(DiscoveredDevice ap, string mac, CancellationToken ct)
+    {
+        var target = TargetFor(ap);
+        var status = await ProbeStatusAsync(target, ct);
+        var result = await RunAsync(target, ApAgentScripts.RemoveCommand(status.ProcdAvailable), ct);
 
         if (!result.success)
             return ApAgentOperationResult.Fail($"Failed to remove the agent: {result.output}");
@@ -392,38 +451,41 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
         var records = await LoadRecordsAsync(ct);
         var now = DateTime.UtcNow;
 
-        foreach (var ap in accessPoints)
+        // APs run side by side so a version bump reaches a large site in one pass. _deployGate caps
+        // the transfers inside it, which is what keeps a restart from hitting every AP at once.
+        var options = new ParallelOptions { MaxDegreeOfParallelism = SupervisionParallelism, CancellationToken = ct };
+        try
         {
-            if (ct.IsCancellationRequested) return;
-
-            var mac = NormalizeMac(ap.Mac);
-            records.TryGetValue(mac, out var record);
-            if (record is { Enabled: false }) continue;
-
-            // A firmware rollout holds the agent off an AP that is mid-upgrade. The hold lapses on
-            // its own if the rollout stops refreshing it, and the next pass redeploys as normal.
-            if (_rolloutSuppression.IsAgentHeld(_siteSlug, mac, now)) continue;
-
-            // The stagger: a server restart must not fire a simultaneous transfer at every AP on
-            // the site, so each one waits out its own offset before its first pass.
-            if (now - _startedAtUtc < ApAgentRetryPolicy.StaggerOffset(mac)) continue;
-
-            if (_retry.IsWorkInFlight(mac) || !_retry.IsReady(mac, now)) continue;
-
-            try
+            await Parallel.ForEachAsync(accessPoints, options, async (ap, token) =>
             {
-                record ??= await GetOrCreateRecordAsync(mac, ap.Name, ct);
-                var assessment = await AssessAsync(ap, record, ct);
-                await ActOnAsync(ap, assessment, ct);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "AP Agent supervision failed for {Host} on site {Site}", ap.DisplayIpAddress, _siteSlug);
-            }
+                var mac = NormalizeMac(ap.Mac);
+                records.TryGetValue(mac, out var record);
+                if (record is { Enabled: false }) return;
+
+                // A firmware rollout holds the agent off an AP that is mid-upgrade. The hold lapses on
+                // its own if the rollout stops refreshing it, and the next pass redeploys as normal.
+                if (_rolloutSuppression.IsAgentHeld(_siteSlug, mac, now)) return;
+
+                if (_retry.IsWorkInFlight(mac) || !_retry.IsReady(mac, now)) return;
+
+                try
+                {
+                    record ??= await GetOrCreateRecordAsync(mac, ap.Name, token);
+                    var assessment = await AssessAsync(ap, record, token);
+                    await ActOnAsync(ap, assessment, token);
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "AP Agent supervision failed for {Host} on site {Site}", ap.DisplayIpAddress, _siteSlug);
+                }
+            });
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
         }
     }
 
@@ -489,6 +551,9 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
 
         lock (_lastAssessment) _lastAssessment[record.DeviceMac] = assessment;
 
+        // Native voluntary steering is a distinct operation; do not pretend ubus became available.
+        _directory.RecordSteering(_siteSlug, record.DeviceMac, CanSteer(assessment, observation.Health));
+
         if (assessment.State == ApAgentState.Healthy || assessment.State == ApAgentState.OutOfDate)
         {
             _retry.RecordSuccess(record.DeviceMac);
@@ -507,6 +572,49 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
         return assessment;
     }
 
+    internal static bool CanSteer(ApAgentAssessment assessment, ApAgentHealthPayload? health)
+        => assessment.State is ApAgentState.Healthy or ApAgentState.OutOfDate && health is { } reported
+            && (!reported.Unavailable.Contains(ApAgentRoamService.SteeringProbe, StringComparer.OrdinalIgnoreCase)
+                || ApAgentNativeSteering.SupportedVaps(reported).Count > 0);
+
+    /// <summary>How long a fresh agent gets to bind its port: it runs its capability probes first.</summary>
+    private static readonly TimeSpan VerifyBindWindow = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    /// One signed health probe against a freshly started agent, so the deploy reports what a real
+    /// caller will get. A refusal inside the bind window is the agent still probing, not a failure.
+    /// </summary>
+    private async Task<ApAgentAssessment> VerifyStartedAsync(DiscoveredDevice ap, string mac, CancellationToken ct)
+    {
+        // Read fresh: after a deploy, the record holds the token it just rotated.
+        var record = await GetOrCreateRecordAsync(mac, ap.Name, ct);
+        var deadline = DateTime.UtcNow + VerifyBindWindow;
+        while (true)
+        {
+            var assessment = await AssessAsync(ap, record, ct);
+            if (assessment.State != ApAgentState.NotListening || DateTime.UtcNow >= deadline)
+                return assessment;
+            await Task.Delay(TimeSpan.FromSeconds(2), ct);
+        }
+    }
+
+    /// <summary>
+    /// Records a post-start verification against the retry policy. True when the agent answers, or
+    /// when no probe was sent (ApOffline: the console's device list says offline), so there is no
+    /// verdict to fail on. A clock problem is not backed off: nothing on our side fixes it.
+    /// </summary>
+    private async Task<bool> RecordVerificationAsync(string mac, ApAgentAssessment verified, CancellationToken ct)
+    {
+        if (verified.State is ApAgentState.Healthy or ApAgentState.OutOfDate or ApAgentState.ApOffline or ApAgentState.Unknown)
+        {
+            _retry.RecordSuccess(mac);
+            return true;
+        }
+
+        await RecordFailureAsync(mac, verified.Detail, ct, backOff: verified.State != ApAgentState.ClockSkewed);
+        return false;
+    }
+
     /// <summary>Carries out the one action an assessment warrants, and nothing else.</summary>
     private async Task ActOnAsync(DiscoveredDevice ap, ApAgentAssessment assessment, CancellationToken ct)
     {
@@ -516,12 +624,15 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
         {
             case ApAgentAction.Redeploy:
             case ApAgentAction.Upgrade:
-                await DeployAsync(mac, null, ct);
+                AuditSupervisorAction(ap, AuditActions.ApAgentDeployed, assessment, await DeployAsync(mac, null, ct));
                 break;
 
             case ApAgentAction.RepushConfig:
+                AuditSupervisorAction(ap, AuditActions.ApAgentRestarted, assessment, await RestartCoreAsync(mac, repushToken: true, ct));
+                break;
+
             case ApAgentAction.RestartInPlace:
-                await RestartAsync(mac, ct);
+                AuditSupervisorAction(ap, AuditActions.ApAgentRestarted, assessment, await RestartAsync(mac, ct));
                 break;
 
             case ApAgentAction.SurfacePathProblem:
@@ -530,10 +641,30 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
                 await RecordFailureAsync(mac, assessment.Detail, ct);
                 break;
 
+            case ApAgentAction.SurfaceClockProblem:
+                await RecordFailureAsync(mac, assessment.Detail, ct, backOff: false);
+                break;
+
             case ApAgentAction.Wait:
             case ApAgentAction.None:
                 break;
         }
+    }
+
+    /// <summary>
+    /// Audits a deploy or restart the supervisor started on its own. It calls this instance directly,
+    /// not through the gated interface, so the user-action audit never sees it.
+    /// </summary>
+    private void AuditSupervisorAction(
+        DiscoveredDevice ap, string action, ApAgentAssessment assessment, ApAgentOperationResult result)
+    {
+        if (result.AlreadyInProgress) return;
+        _serviceProvider.GetService<Auditing.IAuditLogger>()?.Log(Auditing.AuditEventBuilder.FromSystem(
+            AuditCategories.Action, action,
+            outcome: result.Success ? AuditOutcomes.Success : AuditOutcomes.Failure,
+            targetType: "ap", targetId: NormalizeMac(ap.Mac), targetName: ap.Name,
+            siteSlug: _siteSlug,
+            details: new { reason = assessment.Action.ToString(), error = result.Error }));
     }
 
     private async Task<ApAgentOperationResult> DeployCoreAsync(string mac, IProgress<string>? progress, CancellationToken ct)
@@ -541,15 +672,9 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
         var ap = await FindAccessPointAsync(mac, ct);
         if (ap == null) return ApAgentOperationResult.Fail("No access point with that MAC on this site.");
 
-        var localPath = Path.Combine(AppContext.BaseDirectory, "tools", ApAgentPaths.LocalBinaryName);
-        if (!File.Exists(localPath))
-        {
-            _logger.LogWarning("AP Agent binary not found at {Path}", localPath);
-            return ApAgentOperationResult.Fail("The AP Agent binary is not included in this build.");
-        }
-
         progress?.Report("Checking the access point...");
-        var status = await ProbeStatusAsync(ap.DisplayIpAddress, ct);
+        var target = TargetFor(ap);
+        var status = await ProbeStatusAsync(target, ct);
         if (!status.Reachable)
         {
             var error = status.Error ?? "Could not reach the access point over SSH.";
@@ -564,10 +689,22 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
 
         if (!status.SupportedArchitecture)
         {
-            var reason = ApAgentScripts.UnsupportedReason(status.Machine);
+            var reason = ApAgentScripts.UnsupportedReason(status.Machine, status.ByteOrder);
             lock (_lastAssessment) _lastAssessment[mac] = new ApAgentAssessment(ApAgentState.Unsupported, ApAgentAction.None, reason);
             await RecordFailureAsync(mac, reason, ct, backOff: false);
             return ApAgentOperationResult.Fail(reason, ApAgentState.Unsupported);
+        }
+
+        // Past the architecture gate, so BinaryName is set: it is what made the AP supported.
+        var localPath = Path.Combine(AppContext.BaseDirectory, "tools", status.BinaryName!);
+        if (!File.Exists(localPath))
+        {
+            _logger.LogWarning("AP Agent binary not found at {Path}", localPath);
+            // Backed off like every other failure here: the supervisor would otherwise SSH into the AP
+            // and write an audit row every tick until someone builds the binary.
+            var missing = $"The AP Agent binary for {status.Machine} is not included in this build.";
+            await RecordFailureAsync(mac, missing, ct);
+            return ApAgentOperationResult.Fail(missing);
         }
 
         await GetOrCreateRecordAsync(mac, ap.Name, ct);
@@ -576,23 +713,23 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
         // re-pushing 10 MB to prove it would be the expensive way to learn nothing.
         var localMd5 = ComputeMd5(localPath);
         var binaryIsCurrent = string.Equals(localMd5, status.BinaryMd5, StringComparison.OrdinalIgnoreCase);
-        if (binaryIsCurrent && status.IsRunning && status.DeployedBinaryVersion >= ExpectedBinaryVersion)
+        // Never skip for a process that refused its last probe: it binds br0's address once at start,
+        // so after the AP is re-addressed it runs on but listens on an address the AP no longer has.
+        bool refusing;
+        lock (_lastAssessment)
+            refusing = _lastAssessment.TryGetValue(mac, out var last) && last.State == ApAgentState.NotListening;
+        if (binaryIsCurrent && status.IsRunning && !refusing && status.DeployedBinaryVersion >= ExpectedBinaryVersion)
         {
             _retry.RecordSuccess(mac);
             return ApAgentOperationResult.Ok();
         }
 
-        // Past the idempotent return, so this covers real deploys only. The agent is down and its
-        // token is about to change; holding it out of the directory keeps callers off it throughout.
-        using var hold = _directory.HoldDuringDeploy(_siteSlug, mac);
-
-        progress?.Report("Stopping any running agent...");
-        await _siteSsh.RunCommandAsync(ap.DisplayIpAddress, ApAgentScripts.StopCommand(status.ProcdAvailable), null, SshTimeout, ct);
-
+        // Stage before stopping: the old agent serves through the copy, and a copy cut off by a
+        // server restart leaves it running rather than an AP with a truncated binary and no agent.
         if (!binaryIsCurrent)
         {
             progress?.Report("Transferring the agent...");
-            var transferred = await TransferBinaryAsync(mac, ap.DisplayIpAddress, localPath, localMd5, status, ct);
+            var transferred = await TransferBinaryAsync(mac, target, localPath, localMd5, status, ct);
             if (!transferred.Success)
             {
                 if (transferred.State == ApAgentState.TransferFailed)
@@ -602,10 +739,28 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
             }
         }
 
+        // The agent is down from here and its token is about to change; holding it out of the
+        // directory keeps callers off it throughout.
+        using var hold = _directory.HoldDuringDeploy(_siteSlug, mac);
+
+        progress?.Report("Stopping any running agent...");
+        await RunAsync(target, ApAgentScripts.StopCommand(status.ProcdAvailable), ct);
+
+        if (!binaryIsCurrent)
+        {
+            var promoted = await RunAsync(target, ApAgentScripts.PromoteStagedCommand(status.BinaryName!), ct);
+            if (!promoted.success)
+            {
+                var error = $"Could not move the new agent into place: {promoted.output}";
+                await RecordFailureAsync(mac, error, ct);
+                return ApAgentOperationResult.Fail(error);
+            }
+        }
+
         var token = await RotateTokenAsync(mac, ct);
 
         progress?.Report("Writing the service definition...");
-        var wrote = await WriteSupportFilesAsync(ap.DisplayIpAddress, token, status.ProcdAvailable, ct);
+        var wrote = await WriteSupportFilesAsync(target, token, status.ProcdAvailable, ct);
         if (!wrote.Success)
         {
             await RecordFailureAsync(mac, wrote.Error, ct);
@@ -613,14 +768,14 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
         }
 
         progress?.Report("Starting the agent...");
-        var started = await StartAgentAsync(ap.DisplayIpAddress, token, status.ProcdAvailable, ct);
+        var started = await StartAgentAsync(target, token, status.ProcdAvailable, ct);
         if (!started.Success)
         {
             await RecordFailureAsync(mac, started.Error, ct);
             return started;
         }
 
-        var after = await ProbeStatusAsync(ap.DisplayIpAddress, ct);
+        var after = await ProbeStatusAsync(target, ct);
         await UpdateRecordAsync(mac, r =>
         {
             r.DeviceName = ap.Name;
@@ -630,9 +785,18 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
             r.LastError = null;
         }, ct);
 
-        _retry.RecordSuccess(mac);
-        lock (_lastAssessment) _lastAssessment[mac] = new ApAgentAssessment(ApAgentState.Healthy, ApAgentAction.None, "Deployed and running.");
+        // A running process proves nothing about auth: only a signed request does. Without this, a
+        // deploy onto an AP that rejects every signature showed green until the first real call.
+        progress?.Report("Verifying the agent...");
+        var verified = await VerifyStartedAsync(ap, mac, ct);
         _directory.Invalidate(_siteSlug);
+
+        if (!await RecordVerificationAsync(mac, verified, ct))
+        {
+            _logger.LogWarning("AP Agent deployed to {Host} on site {Site} but failed verification: {State} - {Detail}",
+                ap.DisplayIpAddress, _siteSlug, verified.State, verified.Detail);
+            return ApAgentOperationResult.Fail(verified.Detail, verified.State);
+        }
 
         _logger.LogInformation("AP Agent deployed to {Host} on site {Site} (version {Version})",
             ap.DisplayIpAddress, _siteSlug, after.Version ?? "unknown");
@@ -641,61 +805,33 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
     }
 
     /// <summary>
-    /// Pushes the binary over the probed transfer chain, attempting each method in order until one
-    /// both uploads and verifies. The md5 comparison is the only integrity check in the path:
-    /// without it a truncated binary surfaces as "The agent did not start" and burns a retry cycle
-    /// before the next pass's md5 catches it.
+    /// Stages the binary over the probed transfer chain (<see cref="ApAgentBinaryStager"/>). The md5
+    /// comparison is the only integrity check in the path: without it a truncated binary surfaces as
+    /// "The agent did not start" and burns a retry cycle before the next pass's md5 catches it.
     /// </summary>
     private async Task<ApAgentOperationResult> TransferBinaryAsync(
-        string mac, string host, string localPath, string localMd5, ApAgentSshStatus status, CancellationToken ct)
+        string mac, DeviceSshTarget target, string localPath, string localMd5, ApAgentSshStatus status, CancellationToken ct)
     {
-        var connection = await BuildConnectionAsync(host);
+        var host = target.Host;
+        var connection = await BuildConnectionAsync(target, ct);
         if (connection == null)
-            return ApAgentOperationResult.Fail("Device SSH credentials are not configured for this site.");
+            return ApAgentOperationResult.Fail(await Router.DescribeMissingConnectionAsync(target, ct));
 
-        var mkdir = await _siteSsh.RunCommandAsync(host, $"mkdir -p {ApAgentPaths.RemoteDir}", null, SshTimeout, ct);
-        if (!mkdir.success)
-            return ApAgentOperationResult.Fail($"Could not create the install directory: {mkdir.output}");
+        var staged = await ApAgentBinaryStager.StageAsync(
+            (command, token) => RunAsync(target, command, token),
+            _transferSelector.Resolve(status), connection, localPath, localMd5, _logger, ct);
 
-        var failures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var transfer in _transferSelector.Resolve(status))
+        if (staged.SetupError != null)
+            return ApAgentOperationResult.Fail(staged.SetupError);
+
+        if (staged.Method is { } method)
         {
-            string? error = null;
-            try
-            {
-                await transfer.UploadAsync(connection, localPath, ApAgentPaths.RemoteBinaryPath, ct);
-
-                var check = await _siteSsh.RunCommandAsync(host,
-                    $"md5sum {ApAgentPaths.RemoteBinaryPath} 2>/dev/null | cut -d' ' -f1", null, SshTimeout, ct);
-                if (!check.success || !string.Equals(check.output.Trim(), localMd5, StringComparison.OrdinalIgnoreCase))
-                    error = "The copied file did not match the original (md5 mismatch).";
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                error = ex.Message;
-            }
-
-            if (error != null)
-            {
-                failures[transfer.Name] = error;
-                _logger.LogDebug("AP Agent transfer to {Host} over {Method} failed: {Error}", host, transfer.Name, error);
-                continue;
-            }
-
-            var chmod = await _siteSsh.RunCommandAsync(host, $"chmod +x {ApAgentPaths.RemoteBinaryPath}", null, SshTimeout, ct);
-            if (!chmod.success)
-                return ApAgentOperationResult.Fail($"Could not make the agent executable: {chmod.output}");
-
             // Information rather than Debug on a non-default method, so an AP sitting on a slower
             // path is visible in the log rather than silently slow.
-            if (transfer.Name != ApAgentTransferSelector.SftpMethod)
-                _logger.LogInformation("AP Agent transferred to {Host} over {Method} on site {Site}", host, transfer.Name, _siteSlug);
+            if (method != ApAgentTransferSelector.SftpMethod)
+                _logger.LogInformation("AP Agent transferred to {Host} over {Method} on site {Site}", host, method, _siteSlug);
 
-            var note = TransferNoteFor(transfer.Name, status);
+            var note = TransferNoteFor(method, status);
             lock (_transferNotes)
             {
                 if (note == null) _transferNotes.Remove(mac);
@@ -705,6 +841,7 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
             return ApAgentOperationResult.Ok();
         }
 
+        var failures = staged.Failures;
         var detail = string.Join("\n",
             "Could not copy the AP Agent to this access point.",
             "- SFTP: " + (failures.TryGetValue(ApAgentTransferSelector.SftpMethod, out var sftpError) ? sftpError : "not available on this firmware"),
@@ -740,9 +877,9 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
                 : "Copied directly: SFTP and SCP were refused.";
         }
 
-        // Arch-gated ARM plus pre-8 firmware is a U6-class AP without needing a model list; the
-        // model is never a decision input here.
-        if (unsupported && FirmwareMajorBelow8(status.Firmware))
+        // ARM plus pre-8 firmware is a U6-class AP without needing a model list; the model is never
+        // a decision input here. The hint describes ARM U6 hardware; on a MIPS AP it would mislead.
+        if (unsupported && status.BinaryName == ApAgentPaths.BinaryPrefix + "arm" && FirmwareMajorBelow8(status.Firmware))
             note += " U6 gets SFTP on the 8.8.5+ shared U7 stack firmware.";
         return note;
     }
@@ -754,7 +891,7 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
         return int.TryParse(shortForm.Split('.')[0], out var major) && major < 8;
     }
 
-    private async Task<ApAgentOperationResult> WriteSupportFilesAsync(string host, string token, bool procdAvailable, CancellationToken ct)
+    private async Task<ApAgentOperationResult> WriteSupportFilesAsync(DeviceSshTarget target, string token, bool procdAvailable, CancellationToken ct)
     {
         var commands = new List<string>
         {
@@ -765,15 +902,15 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
         if (procdAvailable)
             commands.Add(ApAgentScripts.WriteFileCommand(ApAgentScripts.InitScript(token), ApAgentPaths.RemoteInitScriptPath, "755"));
 
-        var result = await _siteSsh.RunCommandAsync(host, string.Join(" && ", commands), null, SshTimeout, ct);
+        var result = await RunAsync(target, string.Join(" && ", commands), ct);
         return result.success
             ? ApAgentOperationResult.Ok()
             : ApAgentOperationResult.Fail($"Could not write the agent's support files: {result.output}");
     }
 
-    private async Task<ApAgentOperationResult> StartAgentAsync(string host, string token, bool procdAvailable, CancellationToken ct)
+    private async Task<ApAgentOperationResult> StartAgentAsync(DeviceSshTarget target, string token, bool procdAvailable, CancellationToken ct)
     {
-        var result = await _siteSsh.RunCommandAsync(host, ApAgentScripts.StartCommand(procdAvailable), null, SshTimeout, ct);
+        var result = await RunAsync(target, ApAgentScripts.StartCommand(procdAvailable), ct);
         if (result.success && result.output.Contains("started", StringComparison.Ordinal))
             return ApAgentOperationResult.Ok();
 
@@ -783,38 +920,23 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
             : $"The agent did not start: {detail}");
     }
 
-    private async Task<ApAgentSshStatus> ProbeStatusAsync(string host, CancellationToken ct)
+    private async Task<ApAgentSshStatus> ProbeStatusAsync(DeviceSshTarget target, CancellationToken ct)
     {
-        var result = await _siteSsh.RunCommandAsync(host, ApAgentScripts.StatusProbeCommand(), null, SshTimeout, ct);
+        var result = await RunAsync(target, ApAgentScripts.StatusProbeCommand(), ct);
         return ApAgentScripts.ParseStatus(result.output, result.success);
     }
 
-    /// <summary>
-    /// The SSH connection the file transfer dials, routed through the site's agent tunnel the same
-    /// way <see cref="IUniFiSshService"/> routes its commands. Built by hand because the transfer
-    /// is not a command and so never passes through that service.
-    /// </summary>
-    private async Task<SshConnectionInfo?> BuildConnectionAsync(string host)
-    {
-        var settings = await _siteSsh.GetSettingsAsync();
-        if (string.IsNullOrEmpty(settings.Username)) return null;
+    /// <summary>The device's SSH identity for the shared router, which picks its credentials and host.</summary>
+    private static DeviceSshTarget TargetFor(DiscoveredDevice device) => DeviceSshTarget.From(device);
 
-        string? password = null;
-        if (!string.IsNullOrEmpty(settings.Password))
-            password = _credentialProtection.Decrypt(settings.Password);
+    private DeviceSshRouter Router => _serviceProvider.GetRequiredService<DeviceSshRouterRegistry>().GetFor(_siteSlug);
 
-        var connection = SshConnectionInfo.FromUniFiSettings(settings, host, password);
+    private Task<(bool success, string output)> RunAsync(DeviceSshTarget target, string command, CancellationToken ct)
+        => Router.RunAsync(target, command, SshTimeout, ct);
 
-        using (var scope = CreateSiteScope())
-        {
-            await StoredSshKeyReader.AttachAsync(scope.ServiceProvider, connection);
-        }
-
-        if (!connection.HasCredentials) return null;
-
-        (connection.Host, connection.Port) = await _tunnelRouting.RouteAsync(_siteSlug, connection.Host, connection.Port);
-        return connection;
-    }
+    /// <summary>The connection the file transfer dials, on the same route the commands take.</summary>
+    private Task<SshConnectionInfo?> BuildConnectionAsync(DeviceSshTarget target, CancellationToken ct)
+        => Router.GetConnectionAsync(target, ct);
 
     /// <summary>
     /// Subscribes to the existing reboot tracker rather than watching uptime again. This is the
@@ -837,7 +959,7 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
 
     private void OnDeviceRebooted(DeviceRebootTracker.DeviceBootEvent boot)
     {
-        if (boot.DeviceType != DeviceType.AccessPoint) return;
+        if (boot.DeviceType is not (DeviceType.AccessPoint or DeviceType.Gateway)) return;
 
         var mac = NormalizeMac(boot.DeviceMac);
         _retry.RecordSuccess(mac);
@@ -849,7 +971,7 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
         var connection = _serviceProvider.GetRequiredService<SiteConnectionRegistry>().GetFor(_siteSlug);
         var devices = await connection.GetDiscoveredDevicesAsync(ct);
         return devices
-            .Where(d => d.Type == DeviceType.AccessPoint && !string.IsNullOrEmpty(d.DisplayIpAddress))
+            .Where(d => UniFiDiscovery.BroadcastsWifi(d) && !string.IsNullOrEmpty(d.DisplayIpAddress))
             .ToList();
     }
 
@@ -880,7 +1002,7 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
         {
             DeviceMac = deviceMac,
             DeviceName = deviceName,
-            Token = _credentialProtection.Encrypt(GenerateToken()),
+            Token = _credentialProtection.EncryptForSite(GenerateToken(), _siteSlug),
         };
         db.ApAgentDeployments.Add(record);
         await db.SaveChangesAsync(ct);
@@ -898,7 +1020,7 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
             record = new ApAgentDeployment
             {
                 DeviceMac = deviceMac,
-                Token = _credentialProtection.Encrypt(GenerateToken()),
+                Token = _credentialProtection.EncryptForSite(GenerateToken(), _siteSlug),
             };
             db.ApAgentDeployments.Add(record);
         }
@@ -922,7 +1044,7 @@ public sealed class ApAgentDeploymentService : IApAgentDeploymentService, IDispo
     private async Task<string> RotateTokenAsync(string deviceMac, CancellationToken ct)
     {
         var token = GenerateToken();
-        await UpdateRecordAsync(deviceMac, r => r.Token = _credentialProtection.Encrypt(token), ct);
+        await UpdateRecordAsync(deviceMac, r => r.Token = _credentialProtection.EncryptForSite(token, _siteSlug), ct);
         _directory.Invalidate(_siteSlug);
         return token;
     }

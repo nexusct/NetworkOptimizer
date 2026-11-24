@@ -50,6 +50,78 @@ public class AgentTunnelRegistryTests
     }
 
     [Fact]
+    public async Task WaitForReconnectAsync_TunnelReregistersInsideWindow_ReturnsTrue()
+    {
+        var registry = Registry(tunnelEnabled: true);
+        registry.Unregister(registry.Register(1, "branch-office", "Agent"));
+
+        var wait = registry.WaitForReconnectAsync("branch-office", TimeSpan.FromSeconds(5), CancellationToken.None);
+        await Task.Delay(300);
+        registry.Register(1, "branch-office", "Agent");
+
+        (await wait).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task WaitForReconnectAsync_NoReconnect_ReturnsFalseWhenWindowEnds()
+    {
+        var registry = Registry(tunnelEnabled: true);
+        registry.Unregister(registry.Register(1, "branch-office", "Agent"));
+
+        (await registry.WaitForReconnectAsync("branch-office", TimeSpan.FromMilliseconds(300), CancellationToken.None))
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task WaitForReconnectAsync_SiteNeverHadTunnel_ReturnsAtOnce()
+    {
+        var registry = Registry(tunnelEnabled: true);
+        var started = DateTime.UtcNow;
+
+        (await registry.WaitForReconnectAsync("branch-office", TimeSpan.FromSeconds(30), CancellationToken.None))
+            .Should().BeFalse();
+        (DateTime.UtcNow - started).Should().BeLessThan(TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public async Task WaitForReconnectAsync_DropOlderThanWindow_ReturnsAtOnce()
+    {
+        var registry = Registry(tunnelEnabled: true);
+        registry.Unregister(registry.Register(1, "branch-office", "Agent"));
+        await Task.Delay(250);
+        var started = DateTime.UtcNow;
+
+        (await registry.WaitForReconnectAsync("branch-office", TimeSpan.FromMilliseconds(100), CancellationToken.None))
+            .Should().BeFalse();
+        (DateTime.UtcNow - started).Should().BeLessThan(TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public async Task WaitForReconnectAsync_StaleTunnelReaped_ReturnsAtOnce()
+    {
+        var registry = Registry(tunnelEnabled: true);
+        var connection = registry.Register(1, "branch-office", "Agent");
+        connection.LastMessageAt = DateTime.UtcNow - AgentTunnelConnection.StaleThreshold - TimeSpan.FromSeconds(1);
+        registry.Unregister(connection);
+        var started = DateTime.UtcNow;
+
+        (await registry.WaitForReconnectAsync("branch-office", TimeSpan.FromSeconds(30), CancellationToken.None))
+            .Should().BeFalse();
+        (DateTime.UtcNow - started).Should().BeLessThan(TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public async Task WaitForReconnectAsync_SiteStillHasATunnel_ReturnsTrue()
+    {
+        var registry = Registry(tunnelEnabled: true);
+        registry.Register(1, "branch-office", "Agent 1");
+        registry.Unregister(registry.Register(2, "branch-office", "Agent 2"));
+
+        (await registry.WaitForReconnectAsync("branch-office", TimeSpan.FromSeconds(5), CancellationToken.None))
+            .Should().BeTrue();
+    }
+
+    [Fact]
     public void IsAgentLive_TunnelDisabled_HeartbeatFresh_IsLive()
     {
         // No tunnel listener at all (single-box / legacy deployment): REST
@@ -80,5 +152,203 @@ public class AgentTunnelRegistryTests
 
         registry.IsAgentLive(agent).Should().BeFalse();
         registry.IsReachable(agent).Should().BeTrue();
+    }
+
+    [Fact]
+    public void ReconnectsWithin_FirstConnect_IsNotAReconnect()
+    {
+        var registry = Registry(tunnelEnabled: true);
+        registry.Register(1, "branch-office", "Agent");
+
+        registry.ReconnectsWithin(1, AgentTunnelRegistry.UnstableWindow).Should().Be(0);
+        registry.IsUnstable(1).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsUnstable_BelowThreshold_IsFalse()
+    {
+        var registry = Registry(tunnelEnabled: true);
+        for (var i = 0; i < AgentTunnelRegistry.UnstableReconnects; i++)
+            registry.Register(1, "branch-office", "Agent");
+
+        registry.ReconnectsWithin(1, AgentTunnelRegistry.UnstableWindow).Should().Be(AgentTunnelRegistry.UnstableReconnects - 1);
+        registry.IsUnstable(1).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsUnstable_AtThreshold_IsTrue()
+    {
+        var registry = Registry(tunnelEnabled: true);
+        for (var i = 0; i <= AgentTunnelRegistry.UnstableReconnects; i++)
+            registry.Unregister(registry.Register(1, "branch-office", "Agent"));
+
+        registry.IsUnstable(1).Should().BeTrue();
+        registry.DescribeUnstable(1).Should().StartWith($"Reconnected {AgentTunnelRegistry.UnstableReconnects} times in the last 15 minutes.");
+    }
+
+    [Fact]
+    public void Register_SameAgent_DropsTheDisplacedConnection()
+    {
+        // A proxy may never tell us the agent abandoned the old stream; left running, its
+        // watchdog would flag it stale and take the console off the new tunnel.
+        var registry = Registry(tunnelEnabled: true);
+        var old = registry.Register(1, "branch-office", "Agent");
+        var fresh = registry.Register(1, "branch-office", "Agent");
+
+        old.DropToken.IsCancellationRequested.Should().BeTrue();
+        fresh.DropToken.IsCancellationRequested.Should().BeFalse();
+        registry.IsCurrent(old).Should().BeFalse();
+        registry.IsCurrent(fresh).Should().BeTrue();
+    }
+
+    [Fact]
+    public void Unregister_SupersededConnection_KeepsTheNewOne()
+    {
+        var registry = Registry(tunnelEnabled: true);
+        var old = registry.Register(1, "branch-office", "Agent");
+        var fresh = registry.Register(1, "branch-office", "Agent");
+
+        registry.Unregister(old).Should().BeFalse();
+
+        registry.GetForSite("branch-office").Should().ContainSingle().Which.Should().BeSameAs(fresh);
+        registry.Unregister(fresh).Should().BeTrue();
+        registry.IsConnected(1).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Register_DifferentAgents_DropsNeither()
+    {
+        var registry = Registry(tunnelEnabled: true);
+        var first = registry.Register(1, "branch-office", "Agent");
+        var second = registry.Register(2, "branch-office", "Agent 2");
+
+        first.DropToken.IsCancellationRequested.Should().BeFalse();
+        registry.IsCurrent(first).Should().BeTrue();
+        registry.IsCurrent(second).Should().BeTrue();
+    }
+
+    [Fact]
+    public void PickForSite_SkipsASilentAgent_AndReturnsToItOnceFresh()
+    {
+        var registry = Registry(tunnelEnabled: true);
+        registry.Register(1, "branch-office", "Agent");
+        registry.Register(2, "branch-office", "Agent 2");
+        var usual = registry.PickForSite("branch-office")!;
+        var other = registry.GetForSite("branch-office").Single(c => !ReferenceEquals(c, usual));
+
+        usual.LastMessageAt = DateTime.UtcNow - AgentTunnelConnection.StaleThreshold - TimeSpan.FromSeconds(1);
+        registry.PickForSite("branch-office").Should().BeSameAs(other);
+        registry.HasOtherLiveForSite(usual).Should().BeTrue();
+
+        usual.LastMessageAt = DateTime.UtcNow;
+        registry.PickForSite("branch-office").Should().BeSameAs(usual);
+    }
+
+    [Fact]
+    public void PickForSite_SkipsAnAgentTheCallerRejects_UntilNoneIsLeft()
+    {
+        // The proxy rejects an agent whose open just timed out; a live alternative takes the dial.
+        var registry = Registry(tunnelEnabled: true);
+        registry.Register(1, "branch-office", "Agent");
+        registry.Register(2, "branch-office", "Agent 2");
+        var usual = registry.PickForSite("branch-office")!;
+        var other = registry.GetForSite("branch-office").Single(c => !ReferenceEquals(c, usual));
+
+        registry.PickForSite("branch-office", c => !ReferenceEquals(c, usual)).Should().BeSameAs(other);
+        // Nothing qualifies: the first live agent, so the caller still sees why it cannot dial.
+        registry.PickForSite("branch-office", _ => false).Should().BeSameAs(usual);
+    }
+
+    [Fact]
+    public void PickForSite_AllSilent_StillReturnsOne()
+    {
+        // The proxy's stale gate then refuses the dial and flips the console, as for a single agent.
+        var registry = Registry(tunnelEnabled: true);
+        var only = registry.Register(1, "branch-office", "Agent");
+        only.LastMessageAt = DateTime.UtcNow - AgentTunnelConnection.StaleThreshold - TimeSpan.FromSeconds(1);
+
+        registry.PickForSite("branch-office").Should().BeSameAs(only);
+        registry.HasOtherLiveForSite(only).Should().BeFalse();
+        registry.PickForSite("elsewhere").Should().BeNull();
+    }
+
+    [Fact]
+    public void IsUnstable_CountsPerAgent()
+    {
+        var registry = Registry(tunnelEnabled: true);
+        for (var i = 0; i <= AgentTunnelRegistry.UnstableReconnects; i++)
+            registry.Register(1, "branch-office", "Agent");
+        registry.Register(2, "branch-office", "Agent 2");
+
+        registry.IsUnstable(1).Should().BeTrue();
+        registry.IsUnstable(2).Should().BeFalse();
+    }
+
+    [Fact]
+    public void ConfigPush_StartedEarlierCannotLandAfterALaterOne()
+    {
+        var connection = Registry(tunnelEnabled: true).Register(1, "branch-office", "Agent");
+        var earlier = connection.BeginProbePush();
+        var later = connection.BeginProbePush();
+
+        connection.CommitProbePush(later).Should().BeTrue();
+        connection.CommitProbePush(earlier).Should().BeFalse();
+    }
+
+    [Fact]
+    public void ConfigPush_EarlierOneStillLandsWhenTheLaterNeverSent()
+    {
+        var connection = Registry(tunnelEnabled: true).Register(1, "branch-office", "Agent");
+        var earlier = connection.BeginSnmpPush();
+        _ = connection.BeginSnmpPush(); // held or failed: never committed
+
+        connection.CommitSnmpPush(earlier).Should().BeTrue();
+    }
+
+    [Fact]
+    public void ConfigPush_ProbeAndSnmpAreNumberedSeparately()
+    {
+        var connection = Registry(tunnelEnabled: true).Register(1, "branch-office", "Agent");
+        var snmp = connection.BeginSnmpPush();
+        connection.CommitProbePush(connection.BeginProbePush()).Should().BeTrue();
+        _ = connection.BeginProbePush();
+
+        connection.CommitSnmpPush(snmp).Should().BeTrue();
+    }
+
+    [Theory]
+    [InlineData(null, false)]
+    [InlineData(0, false)]
+    [InlineData(14, false)]
+    [InlineData(15, true)]
+    [InlineData(120, true)]
+    public void CollectorSettled_OnlyOnceTheCollectorHasHadItsConfigForTheGrace(int? secondsAgo, bool settled)
+    {
+        var now = new DateTime(2026, 10, 31, 12, 0, 0, DateTimeKind.Utc);
+        DateTime? since = secondsAgo is { } s ? now.AddSeconds(-s) : null;
+
+        AgentProbeResultSink.CollectorSettled(since, now).Should().Be(settled);
+    }
+
+    [Fact]
+    public void CollectorSince_IsUnsetOnANewConnection()
+    {
+        var connection = Registry(tunnelEnabled: true).Register(1, "branch-office", "Agent");
+
+        connection.CollectorSnmpSince.Should().BeNull();
+        connection.CollectorProbesSince.Should().BeNull();
+        connection.HoldsSiteTargets.Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData(1, false)]
+    [InlineData(29, false)]
+    [InlineData(30, true)]
+    [InlineData(65, true)]
+    public void EmptySnmpEnumeration_ConfirmsOnlyAfterTheGap(int secondsLater, bool confirmed)
+    {
+        var first = new DateTime(2026, 10, 31, 12, 0, 0, DateTimeKind.Utc);
+
+        AgentProbeResultSink.EmptyEnumerationConfirmed(first, first.AddSeconds(secondsLater)).Should().Be(confirmed);
     }
 }

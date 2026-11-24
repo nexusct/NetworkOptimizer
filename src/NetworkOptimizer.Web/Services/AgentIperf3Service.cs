@@ -48,7 +48,7 @@ public class AgentIperf3Service
             return (false, $"No agent is online for site '{siteSlug}' to run the LAN iperf3 test");
 
         var id = Interlocked.Increment(ref _nextRequestId);
-        var pending = new PendingRun(agent.AgentId);
+        var pending = new PendingRun(agent);
         _pending[id] = pending;
         try
         {
@@ -62,8 +62,8 @@ public class AgentIperf3Service
                 Reverse = reverse,
             };
 
-            _logger.LogDebug("Requesting agent iperf3 client run {Id} for site {Slug} -> {Host}:{Port} (reverse={Reverse})",
-                id, siteSlug, host, port, reverse);
+            _logger.LogDebug("Requesting iperf3 client run {Id} from agent {AgentId} ({AgentName}) for site {Slug} -> {Host}:{Port} (reverse={Reverse})",
+                id, agent.AgentId, agent.AgentName, siteSlug, host, port, reverse);
 
             var sent = await agent.SendAsync(new ServerMessage { Iperf3Request = request }, ct);
             if (!sent)
@@ -87,17 +87,27 @@ public class AgentIperf3Service
         }
     }
 
-    /// <summary>Completes the matching pending run when an agent returns a result.</summary>
-    public void OnResult(Iperf3ClientResult result)
+    /// <summary>
+    /// Completes the matching pending run when an agent returns a result. Request ids are global, so
+    /// only the agent the run was sent to may complete it.
+    /// </summary>
+    public void OnResult(AgentTunnelConnection sender, Iperf3ClientResult result)
     {
-        if (_pending.TryGetValue(result.RequestId, out var pending))
-            pending.Completion.TrySetResult(result);
+        if (!_pending.TryGetValue(result.RequestId, out var pending)) return;
+        if (!ReferenceEquals(pending.Connection, sender))
+        {
+            _logger.LogWarning(
+                "Agent {AgentId} (site {Slug}) returned iperf3 result {RequestId}, which was sent to agent {OwnerAgentId}; ignoring",
+                sender.AgentId, sender.SiteSlug, result.RequestId, pending.Connection.AgentId);
+            return;
+        }
+        pending.Completion.TrySetResult(result);
     }
 
     /// <summary>Fails any runs waiting on an agent whose tunnel just dropped.</summary>
     public void OnAgentDisconnected(AgentTunnelConnection agent)
     {
-        foreach (var (_, pending) in _pending.Where(p => p.Value.AgentId == agent.AgentId))
+        foreach (var (_, pending) in _pending.Where(p => ReferenceEquals(p.Value.Connection, agent)))
         {
             pending.Completion.TrySetResult(new Iperf3ClientResult
             {
@@ -109,9 +119,9 @@ public class AgentIperf3Service
 
     private sealed class PendingRun
     {
-        public PendingRun(int agentId) => AgentId = agentId;
+        public PendingRun(AgentTunnelConnection connection) => Connection = connection;
 
-        public int AgentId { get; }
+        public AgentTunnelConnection Connection { get; }
 
         public TaskCompletionSource<Iperf3ClientResult> Completion { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);

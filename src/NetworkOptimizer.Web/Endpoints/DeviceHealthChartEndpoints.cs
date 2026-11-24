@@ -7,6 +7,7 @@ using NetworkOptimizer.Storage.Services;
 using NetworkOptimizer.Web.Services;
 using NetworkOptimizer.Web.Services.Authorization;
 using NetworkOptimizer.Web.Services.Monitoring;
+using NetworkOptimizer.Web.Services.Monitoring.HealthChecks;
 using NetworkOptimizer.Web.Services.Monitoring.RebootReason;
 
 namespace NetworkOptimizer.Web.Endpoints;
@@ -24,9 +25,13 @@ public static class DeviceHealthChartEndpoints
             MonitoringInfluxClient influx,
             SiteDbContextFactory siteDbFactory,
             SiteContextService siteContext,
+            HealthCheckTemplateService templateService,
+            WanCounterInterfaces wanCounters,
+            UniFiConnectionService connectionService,
             int? rangeHours,
             DateTime? from,
             DateTime? to,
+            bool? wanThroughput,
             CancellationToken ct) =>
         {
             DateTime queryFrom, queryTo;
@@ -69,6 +74,60 @@ public static class DeviceHealthChartEndpoints
 
             var customFieldNames = customFieldDefs.Select(f => f.fieldName).ToList();
 
+            // Health checks chart below the custom OIDs: one chart per field name, so two devices
+            // running the same template share a chart the way custom OIDs do. The threshold and
+            // operator come from the first definition of each field; a user who gives two devices
+            // different thresholds under one field name sees the first one drawn.
+            var healthChecks = await db.HealthCheckDefinitions.AsNoTracking()
+                .Where(c => c.Enabled && deviceMacs.Contains(c.DeviceMac))
+                .ToListAsync(ct);
+            var templates = healthChecks.Count > 0 ? templateService.GetTemplates() : Array.Empty<HealthCheckTemplate>();
+            var healthCheckDefs = healthChecks
+                .GroupBy(c => c.FieldName)
+                .Select(g =>
+                {
+                    var first = g.First();
+                    var template = templates.FirstOrDefault(t => string.Equals(t.Id, first.TemplateId, StringComparison.OrdinalIgnoreCase));
+                    return new
+                    {
+                        fieldName = HealthCheckEvaluation.ValueField(g.Key),
+                        name = first.Name,
+                        threshold = first.Threshold,
+                        op = HealthCheckEvaluation.OperatorSymbol(first.Operator),
+                        unit = template?.Unit ?? "",
+                    };
+                })
+                .ToList();
+
+            // The gateway is flagged on every response (from the cached device list), so the chart
+            // knows when it is the only device selected. Its summed WAN rates are read only when the
+            // chart asks: it shows them only then.
+            string? gatewayKey = null;
+            try
+            {
+                var gw = NetworkOptimizer.UniFi.UniFiDiscovery.SiteGateway(await connectionService.GetDiscoveredDevicesAsync(ct));
+                if (!string.IsNullOrEmpty(gw?.Mac)) gatewayKey = NormalizeMac(gw.Mac);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException) { }
+
+            object? wanRates = null;
+            if (wanThroughput == true)
+            {
+                // The interfaces the WAN live chart stacks for All WANs, one per WAN. Left null when no
+                // WAN resolves, so a site without WAN counters shows no empty card.
+                var (gatewayMac, wanIfNames) = await wanCounters.AllAsync(ct);
+                if (gatewayMac != null && wanIfNames.Count > 0)
+                {
+                    var rates = await influx.QueryGatewayWanRatesAsync(gatewayMac, wanIfNames, queryFrom, queryTo,
+                        sumAcrossInterfaces: true, ct: ct);
+                    wanRates = new
+                    {
+                        download = rates.Select(p => new { time = p.Time.ToString("o"), value = p.DownloadBps }),
+                        upload = rates.Select(p => new { time = p.Time.ToString("o"), value = p.UploadBps }),
+                    };
+                }
+            }
+
             var result = new List<object>();
             foreach (var t in targets)
             {
@@ -85,10 +144,21 @@ public static class DeviceHealthChartEndpoints
                     customData = await influx.QueryCustomOidFieldsAsync(
                         t.DeviceMac, deviceCustomFields, queryFrom, queryTo, ct: ct);
 
+                Dictionary<string, List<(DateTime Time, double Value)>>? checkData = null;
+                var deviceCheckFields = healthChecks
+                    .Where(c => c.DeviceMac == t.DeviceMac)
+                    .Select(c => HealthCheckEvaluation.ValueField(c.FieldName))
+                    .Distinct()
+                    .ToList();
+                if (deviceCheckFields.Count > 0)
+                    checkData = await influx.QueryCustomOidFieldsAsync(
+                        t.DeviceMac, deviceCheckFields, queryFrom, queryTo, ct: ct);
+
                 result.Add(new
                 {
                     name = t.Name,
                     mac = t.DeviceMac,
+                    isGateway = gatewayKey != null && NormalizeMac(t.DeviceMac) == gatewayKey,
                     data = points.Select(p => new
                     {
                         time = p.Time.ToString("o"),
@@ -98,6 +168,9 @@ public static class DeviceHealthChartEndpoints
                         fan = p.FanSpeedRpm
                     }),
                     custom = customData?.ToDictionary(
+                        kvp => kvp.Key,
+                        kvp => kvp.Value.Select(v => new { time = v.Time.ToString("o"), value = v.Value })),
+                    checks = checkData?.ToDictionary(
                         kvp => kvp.Key,
                         kvp => kvp.Value.Select(v => new { time = v.Time.ToString("o"), value = v.Value }))
                 });
@@ -113,7 +186,7 @@ public static class DeviceHealthChartEndpoints
 
             var events = await BuildAnnotationsAsync(influx, db, macsByNormalized, queryFrom, queryTo, ct);
 
-            return Results.Ok(new { devices = result, customFields = customFieldDefs, events });
+            return Results.Ok(new { devices = result, customFields = customFieldDefs, healthChecks = healthCheckDefs, events, wanThroughput = wanRates });
         });
     }
 
@@ -124,7 +197,20 @@ public static class DeviceHealthChartEndpoints
     /// not just the ones recent enough to alert on.
     /// </summary>
     private static readonly HashSet<string> AlertTypesCoveredElsewhere =
-        new(StringComparer.OrdinalIgnoreCase) { DeviceRebootAlertEvaluator.RebootEventType };
+        new(StringComparer.OrdinalIgnoreCase) { DeviceRebootAlertEvaluator.RebootEventType, HealthCheckAlertTypes.Action };
+
+    /// <summary>Short label for a health check remedy mark: the check, then what it did.</summary>
+    internal static string ActionLabel(string checkName, string remedy)
+    {
+        var did = remedy switch
+        {
+            "RestartService" => "restarted service",
+            "KillProcess" => "killed process",
+            "RebootDevice" => "rebooted",
+            _ => "action",
+        };
+        return string.IsNullOrWhiteSpace(checkName) ? $"Health check {did}" : $"{checkName}: {did}";
+    }
 
     /// <summary>
     /// Reboot categories the operator did not ask for. Mirrors DeviceRebootReason.IsUnexpected,
@@ -152,13 +238,15 @@ public static class DeviceHealthChartEndpoints
     /// <param name="from">Window start.</param>
     /// <param name="to">Window end.</param>
     /// <param name="ct">Cancellation token.</param>
-    private static async Task<List<object>> BuildAnnotationsAsync(
+    /// <param name="excludeAlertTypes">Alert types the caller marks itself, left out here (SFP Stats' own SFP alerts).</param>
+    internal static async Task<List<object>> BuildAnnotationsAsync(
         MonitoringInfluxClient influx,
         NetworkOptimizerDbContext db,
         Dictionary<string, (string Key, string Name)> macsByNormalized,
         DateTime from,
         DateTime to,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlySet<string>? excludeAlertTypes = null)
     {
         // Carried alongside the payload so the two sources can be merged into one time-ordered
         // list; the payload itself stays an anonymous object to keep the JSON property names
@@ -194,6 +282,24 @@ public static class DeviceHealthChartEndpoints
             }));
         }
 
+        // Health check remedies. Long-term like reboots, and drawn as their own kind: the alert
+        // that announced the action is filtered out below so one restart is not marked twice.
+        foreach (var action in await influx.QueryHealthCheckEventsAsync(from, to, ct))
+        {
+            if (!macsByNormalized.TryGetValue(NormalizeMac(action.DeviceMac), out var series)) continue;
+            events.Add((action.At, new
+            {
+                key = series.Key,
+                device = series.Name,
+                time = action.At.ToString("o"),
+                kind = "action",
+                severity = action.Severity == "critical" ? "critical" : "warning",
+                title = ActionLabel(action.CheckName, action.Remedy),
+                detail = action.Detail,
+                reading = action.Value?.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture),
+            }));
+        }
+
         // Device-scoped alerts. DeviceId holds a MAC for the device evaluators but an unrelated
         // key for others ("all-wans", a WAN key, "network-audit"), and the MAC spelling is
         // whatever the publishing evaluator had. Narrowing in SQL to the spellings a charted
@@ -217,6 +323,7 @@ public static class DeviceHealthChartEndpoints
         foreach (var alert in alerts)
         {
             if (AlertTypesCoveredElsewhere.Contains(alert.EventType)) continue;
+            if (excludeAlertTypes?.Contains(alert.EventType) == true) continue;
             if (!macsByNormalized.TryGetValue(NormalizeMac(alert.DeviceId!), out var series)) continue;
 
             // TriggeredAt is written as UtcNow but comes back from SQLite as Unspecified, and "o"
@@ -321,13 +428,26 @@ public static class DeviceHealthChartEndpoints
     {
         "device.offline" => "Offline",
         "device.recovered" => "Recovered",
+        DeviceStateAlertEvaluator.UnmanagedEventType => "Not Reporting",
+        DeviceStateAlertEvaluator.ManagedEventType => "Reporting Again",
         "monitoring.target_offline" => "Device offline",
         "monitoring.target_recovered" => "Device back online",
         DeviceHealthAlertEvaluator.HighCpuEventType => "High CPU",
         DeviceHealthAlertEvaluator.HighMemoryEventType => "High memory",
         DeviceHealthAlertEvaluator.HighTemperatureEventType => "High temperature",
+        // The stored title already names the check; the device the chart shows is trimmed off.
+        HealthCheckAlertTypes.Failed or HealthCheckAlertTypes.Recovered => StripDeviceSuffix(title),
         _ => title,
     };
+
+    /// <summary>"JVM GC Thrash on Gateway (site x)" becomes "JVM GC Thrash" for the mark.</summary>
+    private static string StripDeviceSuffix(string title)
+    {
+        var site = title.LastIndexOf(" (site ", StringComparison.Ordinal);
+        if (site > 0 && title.EndsWith(')')) title = title[..site];
+        var on = title.LastIndexOf(" on ", StringComparison.Ordinal);
+        return on > 0 ? title[..on] : title;
+    }
 
     private static readonly Regex ReadingPattern = new(@"(\d+\.?\d*)\s*(%|°?C)(?!\w)", RegexOptions.Compiled);
 
@@ -350,6 +470,6 @@ public static class DeviceHealthChartEndpoints
     }
 
     /// <summary>Strips MAC separators and case so spellings from different sources compare equal.</summary>
-    private static string NormalizeMac(string mac) =>
+    internal static string NormalizeMac(string mac) =>
         mac.Replace(":", "").Replace("-", "").ToLowerInvariant();
 }

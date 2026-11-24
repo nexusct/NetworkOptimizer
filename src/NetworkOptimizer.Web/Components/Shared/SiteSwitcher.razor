@@ -6,6 +6,7 @@
 @inject SiteConnectionRegistry SiteConnections
 @inject SiteRegistryChangeNotifier ChangeNotifier
 @inject NavigationManager NavigationManager
+@inject AddressBarState AddressBar
 @implements IDisposable
 
 @if (_enabled && _sites.Count > 0)
@@ -37,7 +38,7 @@
                        data-site-switch="@site.Slug"
                        data-site-current="@(site.Slug == SiteContext.Slug ? "" : null)">
                         <span class="site-switcher-item-name">
-                            <span class="status-dot @(SiteConnections.GetFor(site.Slug).IsConnected ? "online" : "offline")"></span>
+                            <span class="status-dot @(site.HasNoConsole ? "empty" : SiteConnections.GetFor(site.Slug).IsConnected ? "online" : "offline")"></span>
                             @site.Name
                         </span>
                         <span class="site-switcher-item-slug">@site.Slug</span>
@@ -152,18 +153,11 @@
             || string.Equals(pathOnly, "denied", StringComparison.OrdinalIgnoreCase))
             return NavigationManager.BaseUri;
 
-        // A ?wan= names one site's WAN, and every reader of it matches by key or index - so
-        // carrying one across a switch either filters the new site to a WAN it does not have or,
-        // worse, quietly matches a different connection that happens to share the number. Dropped
-        // on every page; the rest of the query and the #fragment carry as before.
-        var target = SiteContextService.RemoveQueryParam(NavigationManager.Uri, "wan");
-
-        // Client Performance pins a specific client via ?ip= - that address
-        // belongs to the site being left, so a switch drops it and lands on the
-        // new site's own client view (tab/range params and the #fragment carry).
-        if (string.Equals(pathOnly, "client-dashboard", StringComparison.OrdinalIgnoreCase))
-            return SiteContextService.RemoveQueryParam(target, "ip");
-
-        return target;
+        // Whatever names something on the site being left (?wan= everywhere, Client Performance's
+        // ?ip=, device and target IDs, a Review Plan's ID) is dropped by the same rules every other
+        // switch uses; the rest of the query and the #fragment carry. The address bar as it stands,
+        // not Blazor's copy: a page that rewrote it behind the router (Live Traffic) would carry a
+        // filter the user already cleared.
+        return SiteSwitchService.StripSiteBoundParams(AddressBar.Current);
     }
 }

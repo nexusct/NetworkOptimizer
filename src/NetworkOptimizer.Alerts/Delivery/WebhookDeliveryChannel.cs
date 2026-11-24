@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging;
 using NetworkOptimizer.Alerts.Events;
 using NetworkOptimizer.Alerts.Models;
 using NetworkOptimizer.Core.Enums;
+using NetworkOptimizer.Core.Helpers;
 using Scriban;
 
 namespace NetworkOptimizer.Alerts.Delivery;
@@ -25,7 +26,7 @@ public class WebhookDeliveryChannel : IAlertDeliveryChannel
         _secretDecryptor = secretDecryptor;
     }
 
-    public async Task<bool> SendAsync(AlertEvent alertEvent, AlertHistoryEntry historyEntry, DeliveryChannel channel, CancellationToken cancellationToken = default)
+    public async Task<bool> SendAsync(AlertEvent alertEvent, AlertHistoryEntry historyEntry, DeliveryChannel channel, TimeZoneInfo timeZone, DisplayFormat format, CancellationToken cancellationToken = default)
     {
         var config = JsonSerializer.Deserialize<WebhookChannelConfig>(channel.ConfigJson);
         if (config == null || string.IsNullOrEmpty(config.Url)) return false;
@@ -52,7 +53,7 @@ public class WebhookDeliveryChannel : IAlertDeliveryChannel
                 threshold_value = alertEvent.ThresholdValue,
                 context = alertEvent.Context,
                 tags = alertEvent.Tags,
-                timestamp = alertEvent.Timestamp.ToString("o"),
+                timestamp = DateTimeUtilities.AsUtc(alertEvent.Timestamp).ToString("o"),
                 alert_id = historyEntry.Id,
                 source_url = alertEvent.SourceUrl
             }, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower });
@@ -61,7 +62,7 @@ public class WebhookDeliveryChannel : IAlertDeliveryChannel
         return await PostWithRetryAsync(config, payload, cancellationToken);
     }
 
-    public async Task<bool> SendDigestAsync(IReadOnlyList<AlertHistoryEntry> alerts, DeliveryChannel channel, DigestSummary summary, CancellationToken cancellationToken = default)
+    public async Task<bool> SendDigestAsync(IReadOnlyList<AlertHistoryEntry> alerts, DeliveryChannel channel, DigestSummary summary, TimeZoneInfo timeZone, DisplayFormat format, CancellationToken cancellationToken = default)
     {
         var config = JsonSerializer.Deserialize<WebhookChannelConfig>(channel.ConfigJson);
         if (config == null || string.IsNullOrEmpty(config.Url)) return false;
@@ -78,7 +79,7 @@ public class WebhookDeliveryChannel : IAlertDeliveryChannel
                 title = a.Title,
                 severity = a.Severity.ToString().ToLowerInvariant(),
                 source = a.Source,
-                triggered_at = a.TriggeredAt.ToString("o")
+                triggered_at = DateTimeUtilities.AsUtc(a.TriggeredAt).ToString("o")
             }),
             generated_at = DateTime.UtcNow.ToString("o")
         }, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower });
@@ -185,7 +186,7 @@ public class WebhookDeliveryChannel : IAlertDeliveryChannel
         threshold_value = alertEvent.ThresholdValue,
         context = alertEvent.Context,
         tags = alertEvent.Tags,
-        timestamp = alertEvent.Timestamp.ToString("o"),
+        timestamp = DateTimeUtilities.AsUtc(alertEvent.Timestamp).ToString("o"),
         source_url = alertEvent.SourceUrl
     };
 }

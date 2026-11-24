@@ -30,7 +30,7 @@
     else if (!alerts.Any())
     {
         <div class="no-alerts">
-            <div class="no-alerts-icon">✓</div>
+            <div class="no-alerts-icon"><AppIcon Name="check" /></div>
             <p>No active alerts. Your network is running smoothly!</p>
         </div>
     }
@@ -41,7 +41,7 @@
         {
             @foreach (var alert in GetDisplayAlerts())
             {
-                <div class="alert-item alert-@alert.Severity.ToLower()">
+                <div class="alert-item alert-item-@alert.Severity.ToLower()">
                     <div class="alert-icon">
                         @((MarkupString)GetAlertIcon(alert.Severity))
                     </div>
@@ -132,13 +132,28 @@
         }
     }
 
-    private async Task LoadAlerts()
+    // The audit this list shows; a newer one makes RefreshIfNewAuditAsync reload.
+    private DateTime? _loadedFor;
+
+    /// <summary>
+    /// Reloads in place, with no spinner, when an audit has run since this list loaded: one from Change Control or the
+    /// schedule as well as Run Audit. The Dashboard calls it on its refresh tick.
+    /// </summary>
+    public async Task RefreshIfNewAuditAsync()
     {
-        isLoading = true;
+        if (isLoading || AuditService.LastAuditTime == _loadedFor) return;
+        await LoadAlerts(showLoading: false);
+        StateHasChanged();
+    }
+
+    private async Task LoadAlerts(bool showLoading = true)
+    {
+        if (showLoading) isLoading = true;
+        _loadedFor = AuditService.LastAuditTime;
+        // Built aside and swapped in, so a quiet reload never shows an empty list.
+        var alerts = new List<AlertInfo>();
         try
         {
-            alerts.Clear();
-
             if (!ConnectionService.IsConnected)
             {
                 return;
@@ -178,6 +193,7 @@
         }
         finally
         {
+            this.alerts = alerts;
             isLoading = false;
         }
     }
@@ -262,7 +278,7 @@
         font-weight: 600;
         text-transform: uppercase;
         padding: 0.2rem 0.5rem;
-        border-radius: 4px;
+        border-radius: var(--border-radius);
         background: var(--bg-primary);
     }
 

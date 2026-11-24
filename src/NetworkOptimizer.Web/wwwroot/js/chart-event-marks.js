@@ -7,15 +7,18 @@
 // tooltip needs comes down with the event, so this module knows nothing about devices or ports.
 //
 // Event shape from the server:
-//   { key, time, kind: 'reboot'|'alert', severity: 'info'|'warning'|'critical',
-//     title, detail, device, port? }
+//   { key, time, kind: 'reboot'|'alert'|'action'|'speedtest', severity: 'info'|'warning'|'critical',
+//     title, detail, device, port?, color? }
+// color overrides the severity color, for a kind that is not a health event (a speed test).
 
 import { eventColor, chartSurfaceColor } from './chart-colors.js?v=2';
 
 // The glyph says which kind it is and the colour says how bad, so the two read independently -
 // a planned firmware restart and a panic are both ↻, in different colours, which is the
-// distinction the operator is actually scanning for.
-const EVENT_GLYPH = { reboot: '↻', alert: '⚠' };
+// distinction the operator is actually scanning for. An action is something Network Optimizer
+// did to the device on a health check's behalf.
+// \uFE0E holds a glyph to its text form: without it iOS draws these two as color emoji.
+const EVENT_GLYPH = { reboot: '↻', alert: '⚠\uFE0E', action: '⚙\uFE0E', speedtest: '⇅' };
 
 const SEVERITY_RANK = { info: 0, warning: 1, critical: 2 };
 
@@ -31,6 +34,8 @@ const MARK_COLLISION_PX = 24;
 // hitTarget bound the tooltip to.
 const TAGGED = 'data-mark-bound';
 
+let layerCount = 0;
+
 const _esc = document.createElement('span');
 function escapeHtml(s) { _esc.textContent = s ?? ''; return _esc.innerHTML; }
 
@@ -38,7 +43,7 @@ const DATE_TIME = { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-
 const TIME_ONLY = { hour: '2-digit', minute: '2-digit' };
 
 function formatTime(time, opts) {
-    return new Date(time).toLocaleString(undefined, opts);
+    return noTime.string(time, opts);
 }
 
 function row(label, value) {
@@ -64,19 +69,25 @@ function singleTooltip(mark) {
         rows.push(`<div class="device-tooltip-row chart-mark-row chart-mark-detail">`
             + `<span class="device-tooltip-label">Detail:</span> ${escapeHtml(mark.detail)}</div>`);
     }
+    if (mark._action) {
+        rows.push(`<div class="chart-mark-action" data-mark-action="${mark._action}">`
+            + `${escapeHtml(mark.actionLabel || 'Open')}</div>`);
+    }
     return rows.join('');
 }
 
 function foldedTooltip(marks) {
     // Time alone is ambiguous once a fold spans days, which it will at the 30d range.
-    const days = new Set(marks.map(m => new Date(m.time).toDateString()));
+    // Days on the viewer's clock, the one the labels are written on.
+    const days = new Set(marks.map(m => { const p = noTime.parts(m.time); return `${p.year}-${p.month}-${p.day}`; }));
     const opts = days.size > 1 ? DATE_TIME : TIME_ONLY;
 
     const items = marks.map(mark => {
         const extra = mark.firmware || mark.reading;
         const parts = [mark.device, mark.port ? `port ${mark.port}` : null, extra].filter(Boolean);
         const where = parts.join(' · ');
-        return `<div class="chart-mark-item">`
+        const action = mark._action ? ` chart-mark-item-action" data-mark-action="${mark._action}` : '';
+        return `<div class="chart-mark-item${action}">`
             + `<span class="chart-mark-item-time">${escapeHtml(formatTime(mark.time, opts))}</span>`
             + `<span class="chart-mark-item-body">`
             + `<span class="chart-mark-item-title">${escapeHtml(mark.title)}</span>`
@@ -95,12 +106,37 @@ function foldedTooltip(marks) {
  * @param {() => Array<[object, Element]>} options.charts Every chart to mark, paired with the
  *   element it rendered into - ApexCharts draws annotation labels as SVG text, so the tooltip is
  *   attached by walking that SVG afterwards.
+ * @param {(mark: object) => void} [options.onAction] Called when a mark carrying `actionId` is
+ *   clicked: its tooltip row (any pointer), or its box (a mouse; a tap there opens the tooltip).
  */
-export function createMarkLayer({ charts }) {
+export function createMarkLayer({ charts, onAction }) {
     let lastSignature = null;
     let lastClusters = [];
     let healPending = false;
     const watched = new WeakSet();
+    // Tooltips are HTML strings Tippy renders on document.body, so their clicks are caught there
+    // and mapped back to the mark by a token only this layer hands out.
+    const layerId = ++layerCount;
+    const actions = new Map();
+    // The tooltip goes only if the action moves the page: the first scroll after the click (any
+    // container, hence capture) hides the marker's own (Tippy keeps the instance on the reference)
+    // and any popper still open. An action that scrolls nothing leaves it standing.
+    const runAction = (mark, reference) => {
+        const hide = () => {
+            document.removeEventListener('scroll', hide, true);
+            reference?._tippy?.hide();
+            document.querySelectorAll('[data-tippy-root]').forEach(p => p._tippy?.hide());
+        };
+        document.addEventListener('scroll', hide, true);
+        setTimeout(() => document.removeEventListener('scroll', hide, true), 1500);
+        onAction(mark);
+    };
+    const onDocumentClick = (e) => {
+        const el = e.target.closest?.('[data-mark-action]');
+        const mark = el && actions.get(el.getAttribute('data-mark-action'));
+        if (mark) runAction(mark, null);
+    };
+    if (onAction) document.addEventListener('click', onDocumentClick);
 
     // Milliseconds per pixel of plot, from the charts' own geometry rather than the requested
     // range: gridWidth excludes the y-axis gutter, and minX/maxX are the extents ApexCharts
@@ -156,7 +192,11 @@ export function createMarkLayer({ charts }) {
                 c.marks.length === 1 ? singleTooltip(c.marks[0]) : foldedTooltip(c.marks));
             target.setAttribute('data-tooltip-interactive', '');
             target.setAttribute('data-tooltip-html', '');
-            target.style.cursor = 'help';
+            const actionable = c.marks.length === 1 && c.marks[0]._action;
+            target.style.cursor = actionable ? 'pointer' : 'help';
+            target.onclick = actionable
+                ? () => { if (!window.matchMedia?.('(pointer: coarse)').matches) runAction(c.marks[0], target); }
+                : null;
             label.setAttribute(TAGGED, '');
         });
     }
@@ -227,7 +267,16 @@ export function createMarkLayer({ charts }) {
         apply(events, visibility) {
             // Filtering here rather than server-side keeps the badge toggles instant: hiding a
             // series drops its marks without a refetch, the same way it drops its line.
-            const clusters = cluster((events || []).filter(e => visibility[e.key] !== false));
+            actions.clear();
+            let n = 0;
+            const visible = (events || []).filter(e => visibility[e.key] !== false).map(e => {
+                if (!onAction || e.actionId == null) return e;
+                const token = `${layerId}-${n++}`;
+                const mark = { ...e, _action: token };
+                actions.set(token, mark);
+                return mark;
+            });
+            const clusters = cluster(visible);
             lastClusters = clusters;
             for (const [, el] of charts()) watch(el);
 
@@ -242,7 +291,7 @@ export function createMarkLayer({ charts }) {
             const surface = chartSurfaceColor();
             const xaxis = clusters.map(c => {
                 const lead = dominant(c.marks);
-                const color = eventColor(lead.severity);
+                const color = lead.color || eventColor(lead.severity);
                 const glyph = EVENT_GLYPH[lead.kind] || EVENT_GLYPH.alert;
                 return {
                     x: c.at,
@@ -269,11 +318,13 @@ export function createMarkLayer({ charts }) {
             for (const [chart, el] of charts()) {
                 if (!chart) continue;
                 untag(el);
+                // Placed on this chart's own x: a wall-clock chart draws the viewer's clock.
+                const placed = xaxis.map(a => ({ ...a, x: noTime.chartX(a.x, chart.w) }));
                 // Wrapped rather than chained directly: the labels only exist once the update
                 // has rendered, and updateOptions is not promise-returning in every build.
                 // Fourth argument false: grouped charts otherwise take each other's options,
                 // and these marks belong to the chart they were measured against.
-                Promise.resolve(chart.updateOptions({ annotations: { xaxis } }, false, false, false))
+                Promise.resolve(chart.updateOptions({ annotations: { xaxis: placed } }, false, false, false))
                     .then(() => tag(el, clusters))
                     .catch(e => console.warn('Chart event marks failed to draw', e));
             }
@@ -281,5 +332,11 @@ export function createMarkLayer({ charts }) {
 
         /** Forgets the last drawn state, so the next apply always redraws. */
         reset() { lastSignature = null; },
+
+        /** Drops the document click listener, for a chart being torn down. */
+        dispose() {
+            document.removeEventListener('click', onDocumentClick);
+            actions.clear();
+        },
     };
 }

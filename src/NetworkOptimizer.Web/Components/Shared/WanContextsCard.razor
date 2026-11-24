@@ -108,7 +108,7 @@
                                 @if (IsOrphaned(wc))
                                 {
                                     <span class="wc-orphan-warn"
-                                          data-tooltip="This site is probed by its agent, so assign one to this WAN.">&#9888;</span>
+                                          data-tooltip="This site is probed by its agent, so assign one to this WAN."><AppIcon Name="warning" /></span>
                                 }
                                 @if (ProbeSourceOf(wc) is string source) { <code>@source</code> }
                                 else if (PinMatches(wc))
@@ -119,11 +119,11 @@
                                 {
                                     @if (PinFor(wc) is RoutePin misrouted)
                                     {
-                                        <span class="wc-orphan-warn" data-tooltip="@MisroutedWarning(misrouted)">&#9888;</span>
+                                        <span class="wc-orphan-warn" data-tooltip="@MisroutedWarning(misrouted)"><AppIcon Name="warning" /></span>
                                     }
                                     else if (BindsNothing(wc))
                                     {
-                                        <span class="wc-orphan-warn" data-tooltip="@UnboundWarning(wc)">&#9888;</span>
+                                        <span class="wc-orphan-warn" data-tooltip="@UnboundWarning(wc)"><AppIcon Name="warning" /></span>
                                     }
                                     <span class="text-muted">Default interface</span>
                                 }
@@ -580,7 +580,7 @@
         int.TryParse(_newAgentId, out var outdatedAgentId)
         && _agents.FirstOrDefault(a => a.Id == outdatedAgentId) is SiteAgent selected
         && NetworkOptimizer.Core.Helpers.VersionUtilities.IsOlderThan(
-            selected.LastVersion, NetworkOptimizer.Web.Services.AppVersionInfo.LatestAgentVersion);
+            selected.LastVersion, NetworkOptimizer.Web.Services.AppVersionInfo.RequiredAgentVersion);
 
     // WAN contexts are per-site data: route through the current site's database.
     private NetworkOptimizerDbContext CreateDb() => SiteDb.CreateForSite(SiteCtx.Slug, SiteCtx.IsDefault);
@@ -1180,6 +1180,9 @@
                 row.AgentId = agentId;
                 row.WanInterface = wanInterface;
                 row.InterfaceName = string.IsNullOrEmpty(interfaceName) ? null : interfaceName;
+                // A saved edit is the user's choice, so a vantage covering for an offline agent stays
+                // where it was saved rather than returning when that agent does.
+                NetworkOptimizer.Web.Services.Monitoring.StrandedVantageReassignment.Forget(row);
                 // The context's targets say which WAN their data describes; a context re-pointed
                 // at another WAN takes its targets' stamp with it, or the per-WAN readers would
                 // keep attributing their data to the old WAN.

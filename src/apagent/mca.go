@@ -194,9 +194,10 @@ type RadioScan struct {
 	Spectrum   []SpectrumEntry `json:"spectrum_table"`
 }
 
-// maxScanEntryAge drops neighbors the AP has not heard for this long: serving a stale sighting is
-// the console's under-detection problem in the other direction.
-const maxScanEntryAge = 300
+// maxScanEntryAge drops neighbors the AP has not heard for this long. Rows older than 5 minutes
+// are forwarded with their age so the server can keep the site's own APs, which a radio on another
+// channel hears only between off-channel scans; the server drops old external neighbors.
+const maxScanEntryAge = 3600
 
 // McaSnapshot is one mca-dump pass, reduced to the fields this agent serves. The 142 KB document
 // is never retained: only what is parsed out of it stays in memory.
@@ -335,6 +336,8 @@ func parseMcaFull(data []byte, now time.Time) (McaSnapshot, error) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return McaSnapshot{}, fmt.Errorf("parse mca-dump JSON: %w", err)
 	}
+	// Expected now and then on every model: mca-dump briefly omits radio_table, often on several APs
+	// in the same second, and the next tick succeeds. Not a bug to chase; one slow sample is lost.
 	if raw.RadioTable == nil {
 		return McaSnapshot{}, fmt.Errorf("mca-dump JSON has no radio_table")
 	}
@@ -384,6 +387,7 @@ func parseMcaFull(data []byte, now time.Time) (McaSnapshot, error) {
 				}
 				s.Vap = vap.Name
 				s.SnapshotAt = now
+				s.Signal = signalOrDerived(s.Signal, s.RSSI, s.Noise)
 				snap.Stations = append(snap.Stations, s)
 			}
 		}
@@ -401,6 +405,16 @@ func parseMcaFull(data []byte, now time.Time) (McaSnapshot, error) {
 		}
 	}
 	return snap, nil
+}
+
+// signalOrDerived fills a missing signal as rssi + noise (rssi is SNR; the sum held on all 26
+// stations checked across U7-Pro-XGS, U7PO, and E7). A reported signal always wins.
+func signalOrDerived(signal, rssi, noise *int) *int {
+	if signal != nil || rssi == nil || noise == nil || *rssi <= 0 || *noise >= 0 {
+		return signal
+	}
+	v := *rssi + *noise
+	return &v
 }
 
 // numericFields keeps only the numeric members of a raw JSON object. That is what lets the radio

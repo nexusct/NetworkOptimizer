@@ -44,6 +44,11 @@ public class AgentTunnelService : AgentTunnel.AgentTunnelBase
     private readonly AgentUwnService _uwn;
     private readonly AgentProbeService _probe;
     private readonly AgentSnmpQueryService _snmpQuery;
+    private readonly CableModemProviders.Uci.UciInformService _uciInforms;
+    private readonly GatewayAgentBlocklist _gatewayBlocklist;
+    private readonly WanFlood.WanFloodService _wanFlood;
+    private readonly ChangeControl.ChangeControlRegistry? _changeControl;
+    private readonly Monitoring.LiveTraffic.LiveTrafficRegistry? _liveTraffic;
     private readonly Licensing.LicenseStateService _licenseState;
     private readonly ILogger<AgentTunnelService> _logger;
 
@@ -56,9 +61,18 @@ public class AgentTunnelService : AgentTunnel.AgentTunnelBase
         AgentUwnService uwn,
         AgentProbeService probe,
         AgentSnmpQueryService snmpQuery,
+        CableModemProviders.Uci.UciInformService uciInforms,
+        GatewayAgentBlocklist gatewayBlocklist,
+        WanFlood.WanFloodService wanFlood,
         Licensing.LicenseStateService licenseState,
-        ILogger<AgentTunnelService> logger)
+        ILogger<AgentTunnelService> logger,
+        ChangeControl.ChangeControlRegistry? changeControl = null,
+        Monitoring.LiveTraffic.LiveTrafficRegistry? liveTraffic = null)
     {
+        _changeControl = changeControl;
+        _liveTraffic = liveTraffic;
+        _gatewayBlocklist = gatewayBlocklist;
+        _wanFlood = wanFlood;
         _enrollment = enrollment;
         _registry = registry;
         _probeResultSink = probeResultSink;
@@ -67,6 +81,7 @@ public class AgentTunnelService : AgentTunnel.AgentTunnelBase
         _uwn = uwn;
         _probe = probe;
         _snmpQuery = snmpQuery;
+        _uciInforms = uciInforms;
         _licenseState = licenseState;
         _logger = logger;
     }
@@ -145,6 +160,8 @@ public class AgentTunnelService : AgentTunnel.AgentTunnelBase
             livenessTask = WatchLivenessAsync(connection, streamCts.Token);
 
             await _probeResultSink.OnAgentConnectedAsync(connection, ct, initialConnect: true);
+            _gatewayBlocklist.OnAgentConnected(connection);
+            _wanFlood.OnAgentConnected(connection);
 
             while (await requestStream.MoveNext(ct))
             {
@@ -203,16 +220,16 @@ public class AgentTunnelService : AgentTunnel.AgentTunnelBase
                             connection.TrySend(new ServerMessage { ResultAck = new ResultAck { Sequence = message.Sequence } });
                         break;
                     case AgentMessage.PayloadOneofCase.Iperf3Result:
-                        _iperf3.OnResult(message.Iperf3Result);
+                        _iperf3.OnResult(connection, message.Iperf3Result);
                         break;
                     case AgentMessage.PayloadOneofCase.UwnResult:
-                        _uwn.OnResult(message.UwnResult);
+                        _uwn.OnResult(connection, message.UwnResult);
                         break;
                     case AgentMessage.PayloadOneofCase.ProbeResponse:
-                        _probe.OnResult(message.ProbeResponse);
+                        _probe.OnResult(connection, message.ProbeResponse);
                         break;
                     case AgentMessage.PayloadOneofCase.SnmpOidResult:
-                        _snmpQuery.OnResult(message.SnmpOidResult);
+                        _snmpQuery.OnResult(connection, message.SnmpOidResult);
                         break;
                     case AgentMessage.PayloadOneofCase.ConntrackSamples:
                         // Same site-gone fencing as the probe/SNMP batches. Live batches carry
@@ -221,6 +238,43 @@ public class AgentTunnelService : AgentTunnel.AgentTunnelBase
                         try
                         {
                             await _probeResultSink.RecordConntrackBatchAsync(connection, message.ConntrackSamples, ct);
+                        }
+                        catch (SqliteException ex) when (ex.SqliteErrorCode == SqliteCantOpen)
+                        {
+                            _logger.LogWarning("Site {Slug} has no database any more; closing this agent's tunnel", siteSlug);
+                            connection.Drop();
+                            break;
+                        }
+                        if (message.Sequence > 0)
+                            connection.TrySend(new ServerMessage { ResultAck = new ResultAck { Sequence = message.Sequence } });
+                        break;
+                    case AgentMessage.PayloadOneofCase.LiveTraffic:
+                        // Live only (sequence 0, never acked, never persisted): held in memory for viewers.
+                        _liveTraffic?.GetFor(siteSlug).Ingest(message.LiveTraffic);
+                        break;
+                    case AgentMessage.PayloadOneofCase.UciInformFrame:
+                        // Live only (sequence 0, never acked): a lost frame is superseded by the next
+                        // inform. Handled off this loop - see UciInformService.Accept.
+                        _uciInforms.Accept(connection, message.UciInformFrame);
+                        break;
+                    case AgentMessage.PayloadOneofCase.GatewayBlocklistStatus:
+                        _gatewayBlocklist.OnStatus(connection, message.GatewayBlocklistStatus);
+                        break;
+                    case AgentMessage.PayloadOneofCase.GatewayBlocklistHits:
+                        _gatewayBlocklist.OnHits(connection, message.GatewayBlocklistHits);
+                        break;
+                    case AgentMessage.PayloadOneofCase.WanFloodStatus:
+                        _wanFlood.OnStatus(connection, message.WanFloodStatus);
+                        break;
+                    case AgentMessage.PayloadOneofCase.ConfigRevertReport:
+                        if (_changeControl != null)
+                            await _changeControl.PlansFor(siteSlug).OnAgentReportAsync(agent.Id, message.ConfigRevertReport, ct);
+                        break;
+                    case AgentMessage.PayloadOneofCase.WanFloodIncident:
+                        // Store-and-forward like the result batches: acked once persisted, replayed otherwise.
+                        try
+                        {
+                            await _wanFlood.OnIncidentAsync(connection, message.WanFloodIncident, ct);
                         }
                         catch (SqliteException ex) when (ex.SqliteErrorCode == SqliteCantOpen)
                         {
@@ -247,18 +301,27 @@ public class AgentTunnelService : AgentTunnel.AgentTunnelBase
         }
         finally
         {
-            _registry.Unregister(connection);
+            var current = _registry.Unregister(connection);
             _proxy.OnAgentDisconnected(connection);
             _iperf3.OnAgentDisconnected(connection);
             _uwn.OnAgentDisconnected(connection);
             _probe.OnAgentDisconnected(connection);
             _snmpQuery.OnAgentDisconnected(connection);
             _probeResultSink.OnAgentDisconnected(connection);
+            // Per-agent state: a superseded connection's teardown would wipe what the new one just set.
+            if (current)
+            {
+                _gatewayBlocklist.OnAgentDisconnected(connection);
+                _wanFlood.OnAgentDisconnected(connection);
+            }
             streamCts.Cancel();
             await AwaitQuietlyAsync(pumpTask);
             await AwaitQuietlyAsync(refreshTask);
             await AwaitQuietlyAsync(livenessTask);
-            _logger.LogInformation("Agent {Name} (id {Id}) tunnel closed", agent.Name, agent.Id);
+            if (current)
+                _logger.LogInformation("Agent {Name} (id {Id}) tunnel closed", agent.Name, agent.Id);
+            else
+                _logger.LogInformation("Agent {Name} (id {Id}) tunnel closed; a newer tunnel replaced it", agent.Name, agent.Id);
         }
     }
 
@@ -305,13 +368,18 @@ public class AgentTunnelService : AgentTunnel.AgentTunnelBase
         {
             await Task.Delay(TimeSpan.FromSeconds(15), ct);
             var silent = DateTime.UtcNow - connection.LastMessageAt;
-            if (!flaggedStale && silent > AgentTunnelConnection.StaleThreshold)
+            if (!flaggedStale && silent > AgentTunnelConnection.StaleThreshold && _registry.IsCurrent(connection))
             {
                 flaggedStale = true;
                 _logger.LogInformation(
                     "Agent {Name} (id {Id}, site {Slug}) silent for {Silent:0}s; treating the tunnel as black-holed",
                     connection.AgentName, connection.AgentId, connection.SiteSlug, silent.TotalSeconds);
-                _probeResultSink.OnTunnelStale(connection);
+                // With another live agent the site keeps its console: new dials go through that agent
+                // (PickForSite), and closing this one's proxied sockets moves pooled ones over at once.
+                if (_registry.HasOtherLiveForSite(connection))
+                    _proxy.OnAgentDisconnected(connection);
+                else
+                    _probeResultSink.OnTunnelStale(connection);
             }
             if (silent <= LivenessTimeout) continue;
             _logger.LogWarning(

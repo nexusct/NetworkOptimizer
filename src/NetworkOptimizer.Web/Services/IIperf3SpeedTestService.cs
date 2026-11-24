@@ -84,6 +84,16 @@ public interface IIperf3SpeedTestService
     Task<Iperf3Result> RunSpeedTestAsync(DeviceSshConfiguration device);
 
     /// <summary>
+    /// Runs a full speed test to a UniFi device from the site's device list, starting its iperf3
+    /// server over SSH with the credentials <see cref="Ssh.DeviceSshRouter"/> picks for it.
+    /// </summary>
+    /// <param name="device">The discovered device to test.</param>
+    /// <returns>The test result containing throughput measurements and analysis.</returns>
+    [RequireRole(Roles.Operator)]
+    [AuditAction(AuditActions.SpeedTestRun, TargetType = "lan_speedtest")]
+    Task<Iperf3Result> RunSpeedTestAsync(NetworkOptimizer.UniFi.DiscoveredDevice device);
+
+    /// <summary>
     /// Runs a full speed test to a device with specific parameters.
     /// </summary>
     /// <param name="device">The device configuration to test.</param>
@@ -132,11 +142,11 @@ public interface IIperf3SpeedTestService
     /// grouped by AP MAC address.
     /// </summary>
     /// <param name="apIpToMac">Mapping of AP IP addresses to MAC addresses.</param>
-    /// <param name="countPerAp">Maximum results per AP (default 5).</param>
+    /// <param name="countPerAp">Maximum results per AP (default 3).</param>
     /// <returns>Dictionary keyed by AP MAC with recent test results.</returns>
     [RequireRole(Roles.Viewer)]
     Task<Dictionary<string, List<Iperf3Result>>> GetApDeviceTestsAsync(
-        Dictionary<string, string> apIpToMac, int countPerAp = 5);
+        Dictionary<string, string> apIpToMac, int countPerAp = 3);
 
     /// <summary>
     /// Deletes a single speed test result by ID.

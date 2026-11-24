@@ -1,10 +1,14 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using InfluxDB.Client;
 using InfluxDB.Client.Api.Domain;
 using InfluxDB.Client.Writes;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using NetworkOptimizer.Core;
 using NetworkOptimizer.Core.Enums;
 using NetworkOptimizer.Core.Helpers;
 using NetworkOptimizer.Core.Models;
@@ -30,9 +34,19 @@ public class MonitoringInfluxClient : IAsyncDisposable
     private readonly ILogger<MonitoringInfluxClient> _logger;
 
     private readonly SemaphoreSlim _configLock = new(1, 1);
+    private readonly SemaphoreSlim _speedTestMutationLock = new(1, 1);
     private readonly ConcurrentQueue<BufferedPoint> _writeBuffer = new();
     private readonly SemaphoreSlim _flushSemaphore = new(1, 1);
     private readonly CancellationTokenSource _timerCts = new();
+    private readonly object _backfillCancellationLock = new();
+    private CancellationTokenSource _backfillCancellation = new();
+    private int _pendingBackfillRefreshes;
+
+    // When each query or flush failure message last logged. A site whose buckets were never
+    // provisioned fails every read and write, so a repeat logs at Debug until the interval passes.
+    private readonly ConcurrentDictionary<string, DateTime> _failureLoggedAt = new(StringComparer.Ordinal);
+    private static readonly TimeSpan FailureLogInterval = TimeSpan.FromHours(1);
+    private const int MaxTrackedFailures = 256;
 
     private InfluxDBClient? _client;
     private WriteApiAsync? _writeApi;
@@ -51,6 +65,7 @@ public class MonitoringInfluxClient : IAsyncDisposable
     private bool _disposed;
     private bool _initialized;
     private string? _tokenHash;
+    private long _configurationVersion;
 
     private readonly SiteDbContextFactory? _siteDbFactory;
     private readonly string? _siteSlug;
@@ -84,6 +99,8 @@ public class MonitoringInfluxClient : IAsyncDisposable
 
     public string? CurrentUrl => _url;
     public bool IsConfigured => _client != null && !string.IsNullOrEmpty(_bucket);
+    /// <summary>Changes when connection settings change or an explicit refresh requests a backfill check.</summary>
+    public long ConfigurationVersion => Interlocked.Read(ref _configurationVersion);
 
     /// <summary>The primary bucket this client actually reads/writes, after resolution
     /// (slug-prefixed for non-default sites; collisions with main are corrected). Null
@@ -98,11 +115,45 @@ public class MonitoringInfluxClient : IAsyncDisposable
     /// Build (or rebuild) the client from current MonitoringSettings. Safe to call repeatedly.
     /// Returns true if a usable client was constructed.
     /// </summary>
-    public async Task<bool> ReconfigureAsync(CancellationToken ct = default)
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="refreshSpeedTestBackfill">False for lifecycle checks; explicit setup/health refreshes also recheck bucket metadata.</param>
+    public async Task<bool> ReconfigureAsync(CancellationToken ct = default, bool refreshSpeedTestBackfill = true)
     {
-        await _configLock.WaitAsync(ct);
+        if (!refreshSpeedTestBackfill)
+            return await ReconfigureCoreAsync(ct, refreshSpeedTestBackfill: false);
+
+        ct.ThrowIfCancellationRequested();
+        CancellationTokenSource previous;
+        lock (_backfillCancellationLock)
+        {
+            _pendingBackfillRefreshes++;
+            previous = _backfillCancellation;
+            _backfillCancellation = new CancellationTokenSource();
+        }
         try
         {
+            await previous.CancelAsync();
+            return await ReconfigureCoreAsync(ct, refreshSpeedTestBackfill: true);
+        }
+        finally
+        {
+            previous.Dispose();
+            lock (_backfillCancellationLock)
+                _pendingBackfillRefreshes--;
+        }
+    }
+
+    private async Task<bool> ReconfigureCoreAsync(CancellationToken ct, bool refreshSpeedTestBackfill)
+    {
+        await _configLock.WaitAsync(ct);
+        var wasConfigured = IsConfigured;
+        var ownsFlushGate = false;
+        try
+        {
+            await _flushSemaphore.WaitAsync(ct);
+            ownsFlushGate = true;
+            if (refreshSpeedTestBackfill)
+                Interlocked.Increment(ref _configurationVersion);
             await using var db = await CreateSettingsContextAsync(ct);
             var settings = await db.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync(ct);
 
@@ -146,6 +197,10 @@ public class MonitoringInfluxClient : IAsyncDisposable
         }
         finally
         {
+            if (wasConfigured && !IsConfigured)
+                Interlocked.Increment(ref _configurationVersion);
+            if (ownsFlushGate)
+                _flushSemaphore.Release();
             _configLock.Release();
         }
     }
@@ -271,6 +326,7 @@ public class MonitoringInfluxClient : IAsyncDisposable
             _longtermBucket = SanitizeFluxString(string.IsNullOrWhiteSpace(longterm) ? bucket : longterm);
             _tokenHash = currentTokenHash;
             _initialized = true;
+            Interlocked.Increment(ref _configurationVersion);
 
             _flushTimer = new PeriodicTimer(TimeSpan.FromSeconds(_flushIntervalSeconds));
             _flushTask = RunFlushLoopAsync(_timerCts.Token);
@@ -320,18 +376,20 @@ public class MonitoringInfluxClient : IAsyncDisposable
             var queryApi = _client.GetQueryApi();
 
             // Probe the primary bucket
-            var flux = $@"from(bucket: ""{_bucket}"") |> range(start: -1m) |> limit(n: 1)";
+            var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)}) |> range(start: -1m) |> limit(n: 1)";
             await queryApi.QueryAsync(flux, _org, ct);
 
             // Probe the longterm bucket too - SFP/modem charts query it and users
             // get confused by 500s when only this one is missing.
             if (!string.IsNullOrEmpty(_longtermBucket) && _longtermBucket != _bucket)
             {
-                var ltFlux = $@"from(bucket: ""{_longtermBucket}"") |> range(start: -1m) |> limit(n: 1)";
+                var ltFlux = $@"from(bucket: {FluxLiteral.Quote(_longtermBucket)}) |> range(start: -1m) |> limit(n: 1)";
                 await queryApi.QueryAsync(ltFlux, _org, ct);
             }
 
             await PersistHealthAsync(true, null, ct);
+            // The next failure must log and store again, or the stored state keeps saying healthy.
+            _failureLoggedAt.Clear();
             return new InfluxHealthResult(true, null);
         }
         catch (InfluxDB.Client.Core.Exceptions.UnauthorizedException ex)
@@ -350,6 +408,27 @@ public class MonitoringInfluxClient : IAsyncDisposable
             await PersistHealthAsync(false, ex.Message, ct);
             return new InfluxHealthResult(false, ex.Message);
         }
+    }
+
+    /// <summary>
+    /// True when this failure message has not logged within <see cref="FailureLogInterval"/>,
+    /// and records it as logged now.
+    /// </summary>
+    private bool ShouldLogFailure(string message)
+    {
+        var now = DateTime.UtcNow;
+        // Record with TryUpdate/TryAdd, not an indexer write: concurrent failures of one query
+        // must produce one warning, so exactly one caller wins the slot.
+        if (_failureLoggedAt.TryGetValue(message, out var last))
+        {
+            if (now - last < FailureLogInterval)
+                return false;
+            // TryAdd covers a Clear that removed the key after the read.
+            return _failureLoggedAt.TryUpdate(message, now, last) || _failureLoggedAt.TryAdd(message, now);
+        }
+        // Bounded: distinct messages are few, but a server that varies them must not grow this forever.
+        if (_failureLoggedAt.Count >= MaxTrackedFailures) _failureLoggedAt.Clear();
+        return _failureLoggedAt.TryAdd(message, now);
     }
 
     private async Task PersistHealthAsync(bool reachable, string? error, CancellationToken ct)
@@ -372,6 +451,448 @@ public class MonitoringInfluxClient : IAsyncDisposable
     }
 
     // ---- Schema-aligned write helpers (Gate 1) ----
+
+    /// <summary>
+    /// Replays saved history once per destination and retention policy. Unlike live
+    /// buffered exports, completion is persisted only after acknowledged writes.
+    /// </summary>
+    public async Task<bool> BackfillSpeedTestResultsAsync(CancellationToken ct = default)
+    {
+        using var cancellation = CreateBackfillCancellation(ct);
+        try
+        {
+            return await BackfillSpeedTestResultsCoreAsync(cancellation.Token);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested && cancellation.IsCancellationRequested)
+        {
+            _logger.LogInformation("Speed test InfluxDB backfill interrupted by configuration refresh for site {Site}; will retry",
+                _siteSlug ?? SiteSlugs.Default);
+            return false;
+        }
+    }
+
+    private CancellationTokenSource CreateBackfillCancellation(CancellationToken ct)
+    {
+        lock (_backfillCancellationLock)
+        {
+            var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, _backfillCancellation.Token);
+            // A new pass must not slip ahead of an explicit refresh that is waiting for the config lock.
+            if (_pendingBackfillRefreshes > 0)
+                cancellation.Cancel();
+            return cancellation;
+        }
+    }
+
+    private async Task<bool> BackfillSpeedTestResultsCoreAsync(CancellationToken ct)
+    {
+        await using var db = await CreateSettingsContextAsync(ct);
+        var lastId = await db.Iperf3Results.MaxAsync(r => (int?)r.Id, ct);
+        if (!lastId.HasValue) return true;
+
+        await _configLock.WaitAsync(ct);
+        try
+        {
+            if (!IsConfigured || _client == null || _writeApi == null)
+                return false;
+
+            var buckets = await _client.GetBucketsApi().FindBucketsAsync(
+                org: _org, name: _longtermBucket, cancellationToken: ct);
+            var bucket = buckets.SingleOrDefault()
+                ?? throw new InvalidOperationException($"Speed test backfill bucket '{_longtermBucket}' was not found.");
+            var retentionSeconds = bucket.RetentionRules?
+                .Where(r => r.Type == BucketRetentionRules.TypeEnum.Expire)
+                .Select(r => r.EverySeconds ?? 0).SingleOrDefault() ?? 0;
+            if (retentionSeconds < 0)
+                throw new InvalidOperationException("Speed test backfill bucket has a negative retention period.");
+            var destination = JsonSerializer.Serialize(new { Url = _url?.TrimEnd('/'), Org = _org, Bucket = _longtermBucket });
+            var key = SystemSettingKeys.SpeedTestInfluxBackfillPrefix
+                + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(destination)));
+            var marker = await db.SystemSettings.FindAsync(new object[] { key }, ct);
+            SpeedTestBackfillCompletion? previous = null;
+            if (marker?.Value != null)
+            {
+                try
+                {
+                    previous = JsonSerializer.Deserialize<SpeedTestBackfillCompletion>(marker.Value);
+                }
+                catch (JsonException ex)
+                {
+                    _logger.LogWarning(ex, "Invalid speed test InfluxDB backfill marker for site {Site}; replaying history",
+                        _siteSlug ?? SiteSlugs.Default);
+                }
+            }
+            if (previous?.BucketId == bucket.Id && previous.RetentionSeconds == retentionSeconds)
+                return true;
+
+            var exported = 0;
+            var skipped = 0;
+            // Hold the write gate before reading SQLite: earlier live writes go first,
+            // and updates queued during the replay go afterwards, never before stale history.
+            await _flushSemaphore.WaitAsync(ct);
+            try
+            {
+                await FlushBufferedPointsBestEffortAsync(ct);
+                var cursor = 0;
+                while (cursor < lastId.Value)
+                {
+                    var results = await db.Iperf3Results.AsNoTracking()
+                        .Where(r => r.Id > cursor && r.Id <= lastId.Value)
+                        .OrderBy(r => r.Id).Take(500)
+                        .Select(r => new Iperf3Result
+                        {
+                            Id = r.Id,
+                            TestTime = r.TestTime,
+                            Direction = r.Direction,
+                            DeviceHost = r.DeviceHost,
+                            DeviceName = r.DeviceName,
+                            DeviceType = r.DeviceType,
+                            WanNetworkGroup = r.WanNetworkGroup,
+                            WanName = r.WanName,
+                            ExternalServerName = r.ExternalServerName,
+                            Success = r.Success,
+                            DownloadBitsPerSecond = r.DownloadBitsPerSecond,
+                            UploadBitsPerSecond = r.UploadBitsPerSecond,
+                            DurationSeconds = r.DurationSeconds,
+                            ParallelStreams = r.ParallelStreams,
+                            PingMs = r.PingMs,
+                            JitterMs = r.JitterMs,
+                            DownloadLatencyMs = r.DownloadLatencyMs,
+                            DownloadJitterMs = r.DownloadJitterMs,
+                            UploadLatencyMs = r.UploadLatencyMs,
+                            UploadJitterMs = r.UploadJitterMs,
+                            IdleLossPercent = r.IdleLossPercent,
+                            IdleLossProbes = r.IdleLossProbes,
+                            DownloadLossPercent = r.DownloadLossPercent,
+                            DownloadLossProbes = r.DownloadLossProbes,
+                            UploadLossPercent = r.UploadLossPercent,
+                            UploadLossProbes = r.UploadLossProbes,
+                            BackgroundDownloadMbps = r.BackgroundDownloadMbps,
+                            BackgroundUploadMbps = r.BackgroundUploadMbps,
+                            ExpectedDownloadMbps = r.ExpectedDownloadMbps,
+                            ExpectedUploadMbps = r.ExpectedUploadMbps,
+                            BackgroundLoadInvalid = r.BackgroundLoadInvalid
+                        }).ToListAsync(ct);
+                    if (results.Count == 0) break;
+                    cursor = results[^1].Id;
+                    var points = new List<PointData>();
+                    var cutoff = retentionSeconds > 0 ? DateTime.UtcNow.AddSeconds(-retentionSeconds) : DateTime.MinValue;
+                    foreach (var result in results)
+                    {
+                        var timestamp = DateTimeUtilities.AsUtc(result.TestTime);
+                        if (timestamp < cutoff)
+                        {
+                            skipped++;
+                            continue;
+                        }
+                        try
+                        {
+                            var unixTicks = timestamp.Ticks - DateTime.UnixEpoch.Ticks;
+                            if (unixTicks < long.MinValue / 100 || unixTicks > long.MaxValue / 100
+                                || new double?[]
+                                {
+                                    result.DownloadBitsPerSecond, result.UploadBitsPerSecond,
+                                    result.PingMs, result.JitterMs, result.DownloadLatencyMs,
+                                    result.DownloadJitterMs, result.UploadLatencyMs, result.UploadJitterMs,
+                                    result.IdleLossPercent, result.DownloadLossPercent, result.UploadLossPercent,
+                                    result.BackgroundDownloadMbps * 1_000_000, result.BackgroundUploadMbps * 1_000_000,
+                                    result.ExpectedDownloadMbps * 1_000_000, result.ExpectedUploadMbps * 1_000_000
+                                }.Any(value => value.HasValue && !double.IsFinite(value.Value)))
+                                throw new ArgumentException("Historical speed test has an invalid timestamp or non-finite measurement.");
+                            points.Add(BuildSpeedTestPoint(result));
+                        }
+                        catch (ArgumentException ex)
+                        {
+                            skipped++;
+                            _logger.LogWarning(ex, "Skipping invalid historical speed test {ResultId} during InfluxDB backfill", result.Id);
+                        }
+                    }
+                    if (points.Count == 0) continue;
+                    await _writeApi.WritePointsAsync(points, _longtermBucket, _org, ct);
+                    exported += points.Count;
+                }
+
+                var completion = new SpeedTestBackfillCompletion(bucket.Id, retentionSeconds, DateTime.UtcNow, exported, skipped);
+                if (marker == null)
+                {
+                    marker = new SystemSetting { Key = key };
+                    db.SystemSettings.Add(marker);
+                }
+                marker.Value = JsonSerializer.Serialize(completion);
+                marker.UpdatedAt = completion.CompletedAt;
+                await db.SaveChangesAsync(ct);
+            }
+            finally
+            {
+                _flushSemaphore.Release();
+            }
+            _logger.LogInformation("Speed test InfluxDB backfill complete for site {Site}: {Exported} exported, {Skipped} skipped",
+                _siteSlug ?? SiteSlugs.Default, exported, skipped);
+            return true;
+        }
+        catch (InfluxDB.Client.Core.Exceptions.HttpException) when (ct.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(ct);
+        }
+        finally
+        {
+            _configLock.Release();
+        }
+    }
+
+    private sealed record SpeedTestBackfillCompletion(
+        string BucketId, long RetentionSeconds, DateTime CompletedAt, int Exported, int Skipped);
+
+    /// <summary>Export a saved speed test to the existing long-term bucket.</summary>
+    public Task WriteSpeedTestResultAsync(Iperf3Result result) =>
+        EnqueueSpeedTestAsync(result, BuildSpeedTestPoint);
+
+    private async Task EnqueueSpeedTestAsync(Iperf3Result result, Func<Iperf3Result, PointData?> build)
+    {
+        await _speedTestMutationLock.WaitAsync();
+        try
+        {
+            if (!IsConfigured) return;
+            await using var db = await CreateSettingsContextAsync(CancellationToken.None);
+            var current = await db.Iperf3Results.AsNoTracking().Where(r => r.Id == result.Id)
+                .Select(r => new { r.Direction, r.DeviceHost, r.WanNetworkGroup, r.TestTime }).SingleOrDefaultAsync();
+            if (current == null || current.Direction != result.Direction || current.DeviceHost != result.DeviceHost
+                || current.WanNetworkGroup != result.WanNetworkGroup
+                || DateTimeUtilities.AsUtc(current.TestTime) != DateTimeUtilities.AsUtc(result.TestTime))
+                return;
+            var point = build(result);
+            if (point != null) Enqueue(point, longterm: true);
+        }
+        finally { _speedTestMutationLock.Release(); }
+    }
+
+    public async Task SynchronizeSpeedTestMutationAsync(Iperf3Result original)
+    {
+        await _configLock.WaitAsync();
+        try
+        {
+            if (!IsConfigured || _client == null || _writeApi == null) return;
+            await _speedTestMutationLock.WaitAsync();
+            try
+            {
+                await _flushSemaphore.WaitAsync();
+                try
+                {
+                    await FlushBufferedPointsBestEffortAsync();
+                    var (testType, runner, provider) = SpeedTestTags(original.Direction);
+                    static string Quote(string value) => "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+                    var predicate = $"_measurement=\"speed_test\" AND test_type={Quote(testType)} AND runner={Quote(runner)} AND provider={Quote(provider)}";
+                    if (testType == "lan")
+                        predicate += $" AND target_host={Quote(original.DeviceHost)}";
+                    else if (!string.IsNullOrWhiteSpace(original.WanNetworkGroup) || original.Direction != SpeedTestDirection.OpenSpeedTestWan)
+                        predicate += $" AND wan_network_group={Quote(string.IsNullOrWhiteSpace(original.WanNetworkGroup) ? "unknown" : original.WanNetworkGroup)}";
+                    var time = DateTimeUtilities.AsUtc(original.TestTime);
+                    await _client.GetDeleteApi().Delete(time, time.AddTicks(1), predicate, _longtermBucket, _org);
+                    await using var db = await CreateSettingsContextAsync(CancellationToken.None);
+                    var current = await db.Iperf3Results.AsNoTracking().SingleOrDefaultAsync(r => r.Id == original.Id);
+                    if (current != null)
+                        await _writeApi.WritePointsAsync(new List<PointData> { BuildSpeedTestPoint(current) }, _longtermBucket, _org);
+                }
+                finally { _flushSemaphore.Release(); }
+            }
+            finally { _speedTestMutationLock.Release(); }
+        }
+        finally { _configLock.Release(); }
+    }
+
+    public async Task ClearSpeedTestHistoryAsync(IReadOnlyList<Iperf3Result> cleared)
+    {
+        if (cleared.Count == 0) return;
+        var from = cleared.Min(r => DateTimeUtilities.AsUtc(r.TestTime));
+        var to = cleared.Max(r => DateTimeUtilities.AsUtc(r.TestTime)).AddTicks(1);
+        await _configLock.WaitAsync();
+        try
+        {
+            if (!IsConfigured || _client == null || _writeApi == null) return;
+            await _speedTestMutationLock.WaitAsync();
+            try
+            {
+                await _flushSemaphore.WaitAsync();
+                try
+                {
+                    await FlushBufferedPointsBestEffortAsync();
+                    await _client.GetDeleteApi().Delete(from, to, "_measurement=\"speed_test\" AND test_type=\"lan\"",
+                        _longtermBucket, _org);
+                    // A concurrent SQLite save may fall inside the cleared time range.
+                    // Restore survivors before queued live exports are allowed to resume.
+                    await using var db = await CreateSettingsContextAsync(CancellationToken.None);
+                    var lastId = await db.Iperf3Results.MaxAsync(r => (int?)r.Id) ?? 0;
+                    var cursor = 0;
+                    while (true)
+                    {
+                        var survivors = await db.Iperf3Results.AsNoTracking()
+                            .Where(r => r.Id > cursor && r.Id <= lastId && r.TestTime >= from && r.TestTime < to
+                                && (r.Direction == SpeedTestDirection.ServerToDevice
+                                    || r.Direction == SpeedTestDirection.ClientToServer
+                                    || r.Direction == SpeedTestDirection.BrowserToServer))
+                            .OrderBy(r => r.Id).Take(500).ToListAsync();
+                        if (survivors.Count == 0) break;
+                        cursor = survivors[^1].Id;
+                        await _writeApi.WritePointsAsync(survivors.Select(BuildSpeedTestPoint).ToList(), _longtermBucket, _org);
+                    }
+                }
+                finally { _flushSemaphore.Release(); }
+            }
+            finally { _speedTestMutationLock.Release(); }
+        }
+        finally { _configLock.Release(); }
+    }
+
+    internal static PointData BuildSpeedTestPoint(Iperf3Result result)
+    {
+        var point = BuildSpeedTestIdentity(result, out var isWan)
+            .Field("result_id", result.Id)
+            .Field("success", result.Success)
+            .Field("download_bps", result.DownloadBitsPerSecond)
+            .Field("upload_bps", result.UploadBitsPerSecond)
+            .Field("duration_s", result.DurationSeconds)
+            .Field("parallel_streams", result.ParallelStreams);
+
+        if (isWan && result.Success)
+        {
+            if (result.Direction == SpeedTestDirection.OpenSpeedTestWan)
+            {
+                if (!string.IsNullOrWhiteSpace(result.ExternalServerName))
+                    point = point.Field("server_name", result.ExternalServerName);
+            }
+            else if (!string.IsNullOrWhiteSpace(result.DeviceHost) && result.DeviceHost != "UWN Test")
+            {
+                point = point.Field("server_host", result.DeviceHost);
+            }
+            if (!string.IsNullOrEmpty(result.WanName)) point = point.Field("wan_name", result.WanName);
+        }
+
+        point = AddSpeedTestMetadata(point, result, isWan);
+        if (result.PingMs.HasValue) point = point.Field("ping_ms", result.PingMs.Value);
+        if (result.JitterMs.HasValue) point = point.Field("jitter_ms", result.JitterMs.Value);
+        if (result.DownloadLatencyMs.HasValue) point = point.Field("download_latency_ms", result.DownloadLatencyMs.Value);
+        if (result.DownloadJitterMs.HasValue) point = point.Field("download_jitter_ms", result.DownloadJitterMs.Value);
+        if (result.UploadLatencyMs.HasValue) point = point.Field("upload_latency_ms", result.UploadLatencyMs.Value);
+        if (result.UploadJitterMs.HasValue) point = point.Field("upload_jitter_ms", result.UploadJitterMs.Value);
+        if (isWan)
+        {
+            if (result.IdleLossPercent.HasValue) point = point.Field("idle_loss_percent", result.IdleLossPercent.Value);
+            if (result.IdleLossProbes.HasValue) point = point.Field("idle_loss_probes", result.IdleLossProbes.Value);
+            if (result.DownloadLossPercent.HasValue) point = point.Field("download_loss_percent", result.DownloadLossPercent.Value);
+            if (result.DownloadLossProbes.HasValue) point = point.Field("download_loss_probes", result.DownloadLossProbes.Value);
+            if (result.UploadLossPercent.HasValue) point = point.Field("upload_loss_percent", result.UploadLossPercent.Value);
+            if (result.UploadLossProbes.HasValue) point = point.Field("upload_loss_probes", result.UploadLossProbes.Value);
+            if (HasSpeedTestBackgroundLoad(result)) point = AddSpeedTestBackgroundLoad(point, result);
+        }
+        return point;
+    }
+
+    public Task WriteSpeedTestBackgroundLoadAsync(Iperf3Result result) =>
+        EnqueueSpeedTestAsync(result, BuildSpeedTestBackgroundLoadPoint);
+
+    internal static PointData? BuildSpeedTestBackgroundLoadPoint(Iperf3Result result)
+    {
+        if (!HasSpeedTestBackgroundLoad(result)) return null;
+        var point = BuildSpeedTestIdentity(result, out var isWan);
+        return isWan ? AddSpeedTestBackgroundLoad(point, result) : null;
+    }
+
+    private static bool HasSpeedTestBackgroundLoad(Iperf3Result result) =>
+        result.BackgroundDownloadMbps.HasValue || result.BackgroundUploadMbps.HasValue
+        || result.ExpectedDownloadMbps.HasValue || result.ExpectedUploadMbps.HasValue || result.BackgroundLoadInvalid;
+
+    private static PointData AddSpeedTestBackgroundLoad(PointData point, Iperf3Result result)
+    {
+        if (result.BackgroundDownloadMbps.HasValue)
+            point = point.Field("background_download_bps", result.BackgroundDownloadMbps.Value * 1_000_000);
+        if (result.BackgroundUploadMbps.HasValue)
+            point = point.Field("background_upload_bps", result.BackgroundUploadMbps.Value * 1_000_000);
+        if (result.ExpectedDownloadMbps.HasValue)
+            point = point.Field("expected_download_bps", result.ExpectedDownloadMbps.Value * 1_000_000);
+        if (result.ExpectedUploadMbps.HasValue)
+            point = point.Field("expected_upload_bps", result.ExpectedUploadMbps.Value * 1_000_000);
+        if (result.BackgroundDownloadMbps.HasValue || result.BackgroundUploadMbps.HasValue || result.BackgroundLoadInvalid)
+            point = point.Field("background_load_invalid", result.BackgroundLoadInvalid);
+        return point;
+    }
+
+    public Task WriteSpeedTestMetadataAsync(Iperf3Result result) =>
+        EnqueueSpeedTestAsync(result, BuildSpeedTestMetadataPoint);
+
+    internal static PointData? BuildSpeedTestMetadataPoint(Iperf3Result result)
+    {
+        if (!result.Success || (string.IsNullOrWhiteSpace(result.DeviceName) && string.IsNullOrWhiteSpace(result.DeviceType)))
+            return null;
+        var point = BuildSpeedTestIdentity(result, out var isWan);
+        if (isWan)
+        {
+            if (result.Direction == SpeedTestDirection.OpenSpeedTestWan || !HasSpeedTestServerName(result))
+                return null;
+        }
+        return AddSpeedTestMetadata(point, result, isWan);
+    }
+
+    private static PointData AddSpeedTestMetadata(PointData point, Iperf3Result result, bool isWan)
+    {
+        if (!result.Success) return point;
+        if (isWan)
+        {
+            if (result.Direction != SpeedTestDirection.OpenSpeedTestWan && HasSpeedTestServerName(result))
+                point = point.Field("server_name", result.DeviceName);
+        }
+        else
+        {
+            if (!string.IsNullOrWhiteSpace(result.DeviceName)) point = point.Field("target_name", result.DeviceName);
+            if (!string.IsNullOrWhiteSpace(result.DeviceType)) point = point.Field("target_type", result.DeviceType);
+        }
+        return point;
+    }
+
+    private static bool HasSpeedTestServerName(Iperf3Result result) =>
+        !string.IsNullOrWhiteSpace(result.DeviceName)
+        && !(result.Direction is SpeedTestDirection.UwnWan or SpeedTestDirection.UwnWanGateway && result.DeviceName == "UWN");
+
+    private static PointData BuildSpeedTestIdentity(Iperf3Result result, out bool isWan)
+    {
+        var (testType, runner, provider) = SpeedTestTags(result.Direction);
+        isWan = testType == "wan";
+        // SQLite reads UTC timestamps back with Unspecified kind.
+        var timestamp = DateTimeUtilities.AsUtc(result.TestTime);
+        var point = PointData.Measurement("speed_test")
+            .Tag("test_type", testType)
+            .Tag("runner", runner)
+            .Tag("provider", provider)
+            .Timestamp(timestamp, WritePrecision.Ns);
+
+        if (isWan)
+        {
+            if (!string.IsNullOrWhiteSpace(result.WanNetworkGroup))
+                point = point.Tag("wan_network_group", result.WanNetworkGroup);
+            else if (result.Direction != SpeedTestDirection.OpenSpeedTestWan)
+                point = point.Tag("wan_network_group", "unknown");
+        }
+        else
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(result.DeviceHost);
+            point = point.Tag("target_host", result.DeviceHost);
+        }
+
+        return point;
+    }
+
+    private static (string TestType, string Runner, string Provider) SpeedTestTags(SpeedTestDirection direction) =>
+        direction switch
+        {
+            SpeedTestDirection.CloudflareWan => ("wan", "server", "cloudflare"),
+            SpeedTestDirection.CloudflareWanGateway => ("wan", "gateway", "cloudflare"),
+            SpeedTestDirection.UwnWan => ("wan", "server", "uwn"),
+            SpeedTestDirection.UwnWanGateway => ("wan", "gateway", "uwn"),
+            SpeedTestDirection.OpenSpeedTestWan => ("wan", "client", "openspeedtest"),
+            SpeedTestDirection.ServerToDevice => ("lan", "server", "iperf3"),
+            SpeedTestDirection.ClientToServer => ("lan", "client", "iperf3"),
+            SpeedTestDirection.BrowserToServer => ("lan", "client", "openspeedtest"),
+            _ => throw new ArgumentOutOfRangeException(nameof(direction), direction,
+                "Unsupported speed test direction.")
+        };
 
     public Task WriteInterfaceCountersAsync(
         string deviceMac,
@@ -422,6 +943,37 @@ public class MonitoringInfluxClient : IAsyncDisposable
         if (mcastPktsOut is > 0) point = point.Field("mcast_pkts_out", mcastPktsOut.Value);
         if (bcastPktsIn is > 0) point = point.Field("bcast_pkts_in", bcastPktsIn.Value);
         if (bcastPktsOut is > 0) point = point.Field("bcast_pkts_out", bcastPktsOut.Value);
+
+        Enqueue(point, longterm: false);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Writes a port's negotiated link speed as the UniFi Console reports it, on the interface's
+    /// own series. Separate from <c>speed_bps</c>, which stays raw SNMP: on a gateway's built-in
+    /// switch ports SNMP reports the 10G switch conduit, never the port's negotiated rate.
+    /// </summary>
+    /// <param name="deviceMac">Device the port belongs to.</param>
+    /// <param name="ifName">Interface name, matching the SNMP series' <c>if_name</c>.</param>
+    /// <param name="linkSpeedMbps">Negotiated speed in Mbps.</param>
+    /// <param name="fullDuplex">Negotiated duplex, when the console reports it.</param>
+    /// <param name="timestamp">When the snapshot was taken, on this server's clock.</param>
+    public Task WriteLinkSpeedAsync(
+        string deviceMac,
+        string ifName,
+        int linkSpeedMbps,
+        bool? fullDuplex,
+        DateTime timestamp)
+    {
+        if (!IsConfigured) return Task.CompletedTask;
+        var point = PointData.Measurement("interface_counters")
+            .Tag("device_mac", NormalizeMac(deviceMac))
+            .Tag("if_name", ifName)
+            .Tag("port_id", ifName)
+            .Tag("direction", "unknown")
+            .Field(InfluxFieldNames.LinkSpeedMbps, linkSpeedMbps)
+            .Timestamp(timestamp.ToUniversalTime(), WritePrecision.Ns);
+        if (fullDuplex.HasValue) point = point.Field(InfluxFieldNames.LinkFullDuplex, fullDuplex.Value);
 
         Enqueue(point, longterm: false);
         return Task.CompletedTask;
@@ -762,9 +1314,9 @@ public class MonitoringInfluxClient : IAsyncDisposable
     {
         if (!IsConfigured) return Array.Empty<ClientWanRateSample>();
         var mac = NormalizeMac(clientMac);
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
-  |> filter(fn: (r) => r._measurement == ""client_wan"" and (r.client_mac == ""{mac}"" or r.client_mac == ""{ClientWanCoverageMarker}""))
+  |> filter(fn: (r) => r._measurement == ""client_wan"" and (r.client_mac == {FluxLiteral.Quote(mac)} or r.client_mac == {FluxLiteral.Quote(ClientWanCoverageMarker)}))
   |> filter(fn: (r) => r._field == ""down_bytes"" or r._field == ""up_bytes"" or r._field == ""window_seconds"")
   |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
   |> filter(fn: (r) => exists r.down_bytes and exists r.window_seconds and r.window_seconds > 0)
@@ -801,7 +1353,7 @@ public class MonitoringInfluxClient : IAsyncDisposable
     public async Task<int> RollupClientWanUsageHourAsync(DateTime hourStart, CancellationToken ct = default)
     {
         if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket)) return 0;
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(hourStart)}, stop: {ToFluxInstant(hourStart.AddHours(1))})
   |> filter(fn: (r) => r._measurement == ""client_wan"")
   |> filter(fn: (r) => r._field == ""down_bytes"" or r._field == ""up_bytes"" or r._field == ""window_seconds"" or r._field == ""recon_down_bytes"" or r._field == ""recon_up_bytes"")
@@ -841,7 +1393,7 @@ public class MonitoringInfluxClient : IAsyncDisposable
     private async Task<DateTime?> ClientWanRollupEdgeAsync(string edge, CancellationToken ct)
     {
         if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket)) return null;
-        var flux = $@"from(bucket: ""{_longtermBucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: -400d)
   |> filter(fn: (r) => r._measurement == ""client_wan"" and r._field == ""rollup_v"" and r._value >= {ClientWanRollupVersion})
   |> keep(columns: [""_time""])
@@ -864,9 +1416,9 @@ public class MonitoringInfluxClient : IAsyncDisposable
     {
         if (!IsConfigured) return Array.Empty<ClientWanPoint>();
         var mac = NormalizeMac(clientMac);
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
-  |> filter(fn: (r) => r._measurement == ""client_wan"" and r.client_mac == ""{mac}"")
+  |> filter(fn: (r) => r._measurement == ""client_wan"" and r.client_mac == {FluxLiteral.Quote(mac)})
   |> filter(fn: (r) => r._field == ""down_bytes"" or r._field == ""up_bytes"" or r._field == ""recon_down_bytes"" or r._field == ""recon_up_bytes"")
   |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
   |> filter(fn: (r) => exists r.down_bytes and exists r.up_bytes)
@@ -885,9 +1437,9 @@ public class MonitoringInfluxClient : IAsyncDisposable
     {
         if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket)) return Array.Empty<ClientWanPoint>();
         var mac = NormalizeMac(clientMac);
-        var flux = $@"from(bucket: ""{_longtermBucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
-  |> filter(fn: (r) => r._measurement == ""client_wan"" and r.client_mac == ""{mac}"")
+  |> filter(fn: (r) => r._measurement == ""client_wan"" and r.client_mac == {FluxLiteral.Quote(mac)})
   |> filter(fn: (r) => r._field == ""down_bytes_1h"" or r._field == ""up_bytes_1h"" or r._field == ""rollup_v"")
   |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
   |> filter(fn: (r) => exists r.down_bytes_1h and exists r.rollup_v and r.rollup_v >= {ClientWanRollupVersion})
@@ -936,7 +1488,7 @@ public class MonitoringInfluxClient : IAsyncDisposable
             if (lastRolled is { } lr && lr >= from && hourOfTo > from)
             {
                 rolledThrough = lr.AddHours(1) < hourOfTo ? lr.AddHours(1) : hourOfTo;
-                var flux = $@"from(bucket: ""{_longtermBucket}"")
+                var flux = $@"from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(rolledThrough)})
   |> filter(fn: (r) => r._measurement == ""client_wan"")
   |> filter(fn: (r) => r._field == ""down_bytes_1h"" or r._field == ""up_bytes_1h"" or r._field == ""rollup_v"")
@@ -959,7 +1511,7 @@ public class MonitoringInfluxClient : IAsyncDisposable
         // empty range rather than returning nothing.
         if (rolledThrough >= to)
             return totals.Select(kv => new ClientWanTotal(kv.Key, kv.Value.Down, kv.Value.Up)).ToList();
-        var rawFlux = $@"from(bucket: ""{_bucket}"")
+        var rawFlux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(rolledThrough)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""client_wan"")
   |> filter(fn: (r) => r._field == ""down_bytes"" or r._field == ""up_bytes"" or r._field == ""recon_down_bytes"" or r._field == ""recon_up_bytes"")
@@ -996,7 +1548,7 @@ public class MonitoringInfluxClient : IAsyncDisposable
     {
         if (!IsConfigured) return null;
         // Windows are ~6s but a stretched cadence can run longer; 90s of slack bounds the scan.
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(at.AddSeconds(-90))}, stop: {ToFluxInstant(at.AddSeconds(90))})
   |> filter(fn: (r) => r._measurement == ""client_wan"")
   |> filter(fn: (r) => r._field == ""down_bytes"" or r._field == ""up_bytes"" or r._field == ""window_seconds"")
@@ -1053,9 +1605,9 @@ public class MonitoringInfluxClient : IAsyncDisposable
         // empty range rather than returning nothing.
         if (rawStart < to)
         {
-            var rawFlux = $@"from(bucket: ""{_bucket}"")
+            var rawFlux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(rawStart)}, stop: {ToFluxInstant(to)})
-  |> filter(fn: (r) => r._measurement == ""client_wan"" and r.client_mac == ""{ClientWanCoverageMarker}"")
+  |> filter(fn: (r) => r._measurement == ""client_wan"" and r.client_mac == {FluxLiteral.Quote(ClientWanCoverageMarker)})
   |> filter(fn: (r) => r._field == ""window_seconds"")
   |> truncateTimeColumn(unit: 1h)
   |> group(columns: [""_time""])
@@ -1072,9 +1624,9 @@ public class MonitoringInfluxClient : IAsyncDisposable
         }
         if (!string.IsNullOrEmpty(_longtermBucket))
         {
-            var rolledFlux = $@"from(bucket: ""{_longtermBucket}"")
+            var rolledFlux = $@"from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
-  |> filter(fn: (r) => r._measurement == ""client_wan"" and r.client_mac == ""{ClientWanCoverageMarker}"")
+  |> filter(fn: (r) => r._measurement == ""client_wan"" and r.client_mac == {FluxLiteral.Quote(ClientWanCoverageMarker)})
   |> filter(fn: (r) => r._field == ""coverage_seconds_1h"")
   |> group(columns: [""_time""])
   |> sum()
@@ -1126,11 +1678,11 @@ public class MonitoringInfluxClient : IAsyncDisposable
         {
             var macs = deviceMacs.Select(NormalizeMac).Distinct().ToList();
             macFilter = "\n  |> filter(fn: (r) => " +
-                string.Join(" or ", macs.Select(m => $@"r.device_mac == ""{m}""")) + ")";
+                string.Join(" or ", macs.Select(m => $@"r.device_mac == {FluxLiteral.Quote(m)}")) + ")";
         }
 
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> {rangeClause}
   |> filter(fn: (r) => r._measurement == ""wired_client"")
   |> filter(fn: (r) => exists r.port)
@@ -1199,7 +1751,7 @@ from(bucket: ""{_bucket}"")
         if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket)) return Array.Empty<SfpLatestPoint>();
 
         var flux = $@"
-from(bucket: ""{_longtermBucket}"")
+from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: -6h)
   |> filter(fn: (r) => r._measurement == ""sfp"")
   |> last()
@@ -1270,13 +1822,30 @@ from(bucket: ""{_longtermBucket}"")
         "pon_link_status", "pon_link_status_prev", "onu_id", "ds_fec_enabled", "us_fec_enabled",
         "onu_response_time", "sfp_uptime_s", "ploam_elapsed_ms", "bip_errors", "fec_errors", "fec_corrected_words",
         "hec_corrected", "hec_uncorrected", "bwmap_corrected", "bwmap_uncorrected",
-        "gem_tx_frames", "gem_tx_idle_frames", "gem_rx_frames", "gem_rx_dropped",
+        "gem_tx_frames", "gem_tx_idle_frames", "gem_rx_frames", "gem_rx_idle_frames", "ds_superframe", "gem_rx_dropped",
+        "alloc_total", "gem_tx_bytes", "us_bursts", "us_dbru", "o5_seconds", "not_o5_seconds", "o5_exits",
+        "los_events", "los_seconds", "lof_events", "lof_seconds", "olt_deactivations", "boot_count", "last_reset_reason",
+        "ont_bias_ma", "bias_warn_high_ma", "transceiver_alarm_count", "transceiver_alarms", "fec_corrected_bits", "omci_rx_frames", "mib_data_sync", "omci_up", "omci_services", "ploam_request_key", "ploam_key_switch", "ploam_ranging_time", "td_pir_bytes_s", "td_cir_bytes_s", "host_link_up", "eqd_bits", "pon_id_age_s", "cpu_busy_s", "cpu_total_s",
+        "ont_tx_power_dbm", "ont_temperature_c",
+        "ds_superframe_sampled", "gem_rx_bytes", "olt_launch_power_dbm", "odn_class", "reach_extender", "path_loss_db",
         "alloc_lost", "lan_link_status", "lan_mode",
         "lan_rx_fcs_err", "lan_tx_drop_events", "lan_buffer_overflow",
+        "olt_vendor_id", "registration_status", "key_exchange_status", "firmware_version",
+        "olt_equipment_id", "olt_version", "aes_active", "gem_ports_encrypted", "gem_ports",
     };
 
     private static readonly string PonFieldFilter =
-        string.Join(" or ", PonFieldNames.Select(f => $@"r._field == ""{f}"""));
+        string.Join(" or ", PonFieldNames.Select(f => $@"r._field == {FluxLiteral.Quote(f)}"));
+
+    /// <summary>
+    /// The PON fields the PON load map reads: the idle frames against the superframe counter, the
+    /// FEC state that sets the payload, the uptime that marks a reboot, and the ONT's own bytes.
+    /// A month of points at this width instead of the whole PON set.
+    /// </summary>
+    private static readonly string PonLoadFieldFilter = string.Join(" or ", new[]
+    {
+        "gem_rx_idle_frames", "ds_superframe", "ds_superframe_sampled", "ds_fec_enabled", "sfp_uptime_s", "gem_rx_bytes",
+    }.Select(f => $@"r._field == {FluxLiteral.Quote(f)}"));
 
     /// <summary>Null when the row carries no PON field at all, which is every DDM-only module.</summary>
     private static PonSeriesPoint? ReadPonPoint(InfluxDB.Client.Core.Flux.Domain.FluxRecord record, DateTime time)
@@ -1303,6 +1872,49 @@ from(bucket: ""{_longtermBucket}"")
             GemTxFrames = AsLongOrNull(record.GetValueByKey("gem_tx_frames")),
             GemTxIdleFrames = AsLongOrNull(record.GetValueByKey("gem_tx_idle_frames")),
             GemRxFrames = AsLongOrNull(record.GetValueByKey("gem_rx_frames")),
+            GemRxIdleFrames = AsLongOrNull(record.GetValueByKey("gem_rx_idle_frames")),
+            DsSuperframe = AsLongOrNull(record.GetValueByKey("ds_superframe")),
+            DsSuperframeSampled = AsLongOrNull(record.GetValueByKey("ds_superframe_sampled")),
+            GemRxBytes = AsLongOrNull(record.GetValueByKey("gem_rx_bytes")),
+            OltLaunchPowerDbm = AsDoubleOrNull(record.GetValueByKey("olt_launch_power_dbm")),
+            OdnClass = AsLongOrNull(record.GetValueByKey("odn_class")),
+            ReachExtender = AsLongOrNull(record.GetValueByKey("reach_extender")),
+            PathLossDb = AsDoubleOrNull(record.GetValueByKey("path_loss_db")),
+            AllocTotal = AsLongOrNull(record.GetValueByKey("alloc_total")),
+            BiasMa = AsDoubleOrNull(record.GetValueByKey("ont_bias_ma")),
+            BiasWarnHighMa = AsDoubleOrNull(record.GetValueByKey("bias_warn_high_ma")),
+            TransceiverAlarmCount = AsLongOrNull(record.GetValueByKey("transceiver_alarm_count")),
+            TransceiverAlarms = record.GetValueByKey("transceiver_alarms") as string,
+            FecCorrectedBits = AsLongOrNull(record.GetValueByKey("fec_corrected_bits")),
+            OmciRxFrames = AsLongOrNull(record.GetValueByKey("omci_rx_frames")),
+            MibDataSync = AsLongOrNull(record.GetValueByKey("mib_data_sync")),
+            OmciUp = AsLongOrNull(record.GetValueByKey("omci_up")),
+            OmciServices = AsLongOrNull(record.GetValueByKey("omci_services")),
+            PloamRequestKey = AsLongOrNull(record.GetValueByKey("ploam_request_key")),
+            PloamKeySwitch = AsLongOrNull(record.GetValueByKey("ploam_key_switch")),
+            PloamRangingTime = AsLongOrNull(record.GetValueByKey("ploam_ranging_time")),
+            TrafficPirBytesPerSecond = AsLongOrNull(record.GetValueByKey("td_pir_bytes_s")),
+            TrafficCirBytesPerSecond = AsLongOrNull(record.GetValueByKey("td_cir_bytes_s")),
+            HostLinkUp = AsLongOrNull(record.GetValueByKey("host_link_up")),
+            EqdBits = AsLongOrNull(record.GetValueByKey("eqd_bits")),
+            PonIdAgeSeconds = AsDoubleOrNull(record.GetValueByKey("pon_id_age_s")),
+            CpuBusySeconds = AsDoubleOrNull(record.GetValueByKey("cpu_busy_s")),
+            CpuTotalSeconds = AsDoubleOrNull(record.GetValueByKey("cpu_total_s")),
+            OntTxPowerDbm = AsDoubleOrNull(record.GetValueByKey("ont_tx_power_dbm")),
+            OntTemperatureC = AsDoubleOrNull(record.GetValueByKey("ont_temperature_c")),
+            GemTxBytes = AsLongOrNull(record.GetValueByKey("gem_tx_bytes")),
+            UsBursts = AsLongOrNull(record.GetValueByKey("us_bursts")),
+            UsDbru = AsLongOrNull(record.GetValueByKey("us_dbru")),
+            O5Seconds = AsDoubleOrNull(record.GetValueByKey("o5_seconds")),
+            NotO5Seconds = AsDoubleOrNull(record.GetValueByKey("not_o5_seconds")),
+            O5Exits = AsLongOrNull(record.GetValueByKey("o5_exits")),
+            LosEvents = AsLongOrNull(record.GetValueByKey("los_events")),
+            LosSeconds = AsDoubleOrNull(record.GetValueByKey("los_seconds")),
+            LofEvents = AsLongOrNull(record.GetValueByKey("lof_events")),
+            LofSeconds = AsDoubleOrNull(record.GetValueByKey("lof_seconds")),
+            OltDeactivations = AsLongOrNull(record.GetValueByKey("olt_deactivations")),
+            BootCount = AsLongOrNull(record.GetValueByKey("boot_count")),
+            LastResetReason = record.GetValueByKey("last_reset_reason") as string,
             GemRxDropped = AsLongOrNull(record.GetValueByKey("gem_rx_dropped")),
             AllocLost = AsLongOrNull(record.GetValueByKey("alloc_lost")),
             LanLinkStatus = AsLongOrNull(record.GetValueByKey("lan_link_status")),
@@ -1310,6 +1922,15 @@ from(bucket: ""{_longtermBucket}"")
             LanRxFcsErrors = AsLongOrNull(record.GetValueByKey("lan_rx_fcs_err")),
             LanTxDropEvents = AsLongOrNull(record.GetValueByKey("lan_tx_drop_events")),
             LanBufferOverflow = AsLongOrNull(record.GetValueByKey("lan_buffer_overflow")),
+            OltVendorId = record.GetValueByKey("olt_vendor_id") as string,
+            RegistrationStatus = record.GetValueByKey("registration_status") as string,
+            KeyExchangeStatus = record.GetValueByKey("key_exchange_status") as string,
+            FirmwareVersion = record.GetValueByKey("firmware_version") as string,
+            OltModel = record.GetValueByKey("olt_equipment_id") as string,
+            OltVersion = record.GetValueByKey("olt_version") as string,
+            AesActive = record.GetValueByKey("aes_active") as bool?,
+            GemPortsEncrypted = AsLongOrNull(record.GetValueByKey("gem_ports_encrypted")),
+            GemPorts = AsLongOrNull(record.GetValueByKey("gem_ports")),
         };
     }
 
@@ -1330,6 +1951,10 @@ from(bucket: ""{_longtermBucket}"")
         if (stats.DsFecEnabled.HasValue) point = point.Field("ds_fec_enabled", stats.DsFecEnabled.Value);
         if (stats.UsFecEnabled.HasValue) point = point.Field("us_fec_enabled", stats.UsFecEnabled.Value);
         if (stats.OnuResponseTime.HasValue) point = point.Field("onu_response_time", stats.OnuResponseTime.Value);
+        if (stats.GemPorts.HasValue) point = point.Field("gem_ports", stats.GemPorts.Value);
+        if (stats.AesActive.HasValue) point = point.Field("aes_active", stats.AesActive.Value);
+        if (stats.GemPortsEncrypted.HasValue) point = point.Field("gem_ports_encrypted", stats.GemPortsEncrypted.Value);
+        if (stats.GponmgrEnc.HasValue) point = point.Field("gponmgr_enc", stats.GponmgrEnc.Value);
         if (stats.BipErrors.HasValue) point = point.Field("bip_errors", stats.BipErrors.Value);
         if (stats.FecErrors.HasValue) point = point.Field("fec_errors", stats.FecErrors.Value);
         if (stats.FecCorrectedWords.HasValue) point = point.Field("fec_corrected_words", stats.FecCorrectedWords.Value);
@@ -1340,6 +1965,56 @@ from(bucket: ""{_longtermBucket}"")
         if (stats.GemTxFrames.HasValue) point = point.Field("gem_tx_frames", stats.GemTxFrames.Value);
         if (stats.GemTxIdleFrames.HasValue) point = point.Field("gem_tx_idle_frames", stats.GemTxIdleFrames.Value);
         if (stats.GemRxFrames.HasValue) point = point.Field("gem_rx_frames", stats.GemRxFrames.Value);
+        if (stats.GemRxIdleFrames.HasValue) point = point.Field("gem_rx_idle_frames", stats.GemRxIdleFrames.Value);
+        if (stats.DsSuperframe.HasValue) point = point.Field("ds_superframe", stats.DsSuperframe.Value);
+        if (stats.DsSuperframeSampled.HasValue) point = point.Field("ds_superframe_sampled", stats.DsSuperframeSampled.Value);
+        if (stats.GemRxBytes.HasValue) point = point.Field("gem_rx_bytes", stats.GemRxBytes.Value);
+        if (stats.OltLaunchPowerDbm.HasValue) point = point.Field("olt_launch_power_dbm", stats.OltLaunchPowerDbm.Value);
+        if (stats.OdnClass.HasValue) point = point.Field("odn_class", stats.OdnClass.Value);
+        if (stats.ReachExtender.HasValue) point = point.Field("reach_extender", stats.ReachExtender.Value);
+        // Launch power less the ONT's own RX reading from the same poll. Stored rather than derived
+        // at query time: the chart aggregates with fn: last, and the sfp series' rx_power_dbm can be
+        // the host device's DDM read of the module instead of the ONT's own.
+        if (PonSupplementalStats.PathLossDb(stats.OltLaunchPowerDbm, stats.RxPowerDbm) is double pathLoss)
+            point = point.Field("path_loss_db", pathLoss);
+        if (stats.BiasMa.HasValue) point = point.Field("ont_bias_ma", stats.BiasMa.Value);
+        if (stats.BiasWarnHighMa.HasValue) point = point.Field("bias_warn_high_ma", stats.BiasWarnHighMa.Value);
+        if (stats.TransceiverAlarmCount.HasValue) point = point.Field("transceiver_alarm_count", stats.TransceiverAlarmCount.Value);
+        if (!string.IsNullOrEmpty(stats.TransceiverAlarms)) point = point.Field("transceiver_alarms", stats.TransceiverAlarms);
+        if (stats.FecCorrectedBits.HasValue) point = point.Field("fec_corrected_bits", stats.FecCorrectedBits.Value);
+        if (stats.OmciRxFrames.HasValue) point = point.Field("omci_rx_frames", stats.OmciRxFrames.Value);
+        if (stats.MibDataSync.HasValue) point = point.Field("mib_data_sync", stats.MibDataSync.Value);
+        if (stats.OmciUp.HasValue) point = point.Field("omci_up", stats.OmciUp.Value);
+        if (stats.OmciServices.HasValue) point = point.Field("omci_services", stats.OmciServices.Value);
+        if (stats.PloamRequestKey.HasValue) point = point.Field("ploam_request_key", stats.PloamRequestKey.Value);
+        if (stats.PloamKeySwitch.HasValue) point = point.Field("ploam_key_switch", stats.PloamKeySwitch.Value);
+        if (stats.PloamRangingTime.HasValue) point = point.Field("ploam_ranging_time", stats.PloamRangingTime.Value);
+        if (stats.TrafficPirBytesPerSecond.HasValue) point = point.Field("td_pir_bytes_s", stats.TrafficPirBytesPerSecond.Value);
+        if (stats.TrafficCirBytesPerSecond.HasValue) point = point.Field("td_cir_bytes_s", stats.TrafficCirBytesPerSecond.Value);
+        if (stats.HostLinkUp.HasValue) point = point.Field("host_link_up", stats.HostLinkUp.Value);
+        if (stats.EqdBits.HasValue) point = point.Field("eqd_bits", stats.EqdBits.Value);
+        if (stats.PonIdAgeSeconds.HasValue) point = point.Field("pon_id_age_s", stats.PonIdAgeSeconds.Value);
+        if (stats.CpuBusySeconds.HasValue) point = point.Field("cpu_busy_s", stats.CpuBusySeconds.Value);
+        if (stats.CpuTotalSeconds.HasValue) point = point.Field("cpu_total_s", stats.CpuTotalSeconds.Value);
+        // The ONT's own TX power and temperature beside its bias current, so the three a laser's
+        // ageing is read from come from one poll. Only where the source reports a bias current.
+        if (stats.BiasMa.HasValue && stats.TxPowerDbm.HasValue) point = point.Field("ont_tx_power_dbm", stats.TxPowerDbm.Value);
+        // The ONT's own sensor, kept apart from the host device's DDM temperature_c on the sfp series:
+        // the two can sit well over 10 C apart on one stick.
+        if (stats.TemperatureC.HasValue) point = point.Field("ont_temperature_c", stats.TemperatureC.Value);
+        if (stats.GemTxBytes.HasValue) point = point.Field("gem_tx_bytes", stats.GemTxBytes.Value);
+        if (stats.UsBursts.HasValue) point = point.Field("us_bursts", stats.UsBursts.Value);
+        if (stats.UsDbru.HasValue) point = point.Field("us_dbru", stats.UsDbru.Value);
+        if (stats.O5Seconds.HasValue) point = point.Field("o5_seconds", stats.O5Seconds.Value);
+        if (stats.NotO5Seconds.HasValue) point = point.Field("not_o5_seconds", stats.NotO5Seconds.Value);
+        if (stats.O5Exits.HasValue) point = point.Field("o5_exits", stats.O5Exits.Value);
+        if (stats.LosEvents.HasValue) point = point.Field("los_events", stats.LosEvents.Value);
+        if (stats.LosSeconds.HasValue) point = point.Field("los_seconds", stats.LosSeconds.Value);
+        if (stats.LofEvents.HasValue) point = point.Field("lof_events", stats.LofEvents.Value);
+        if (stats.LofSeconds.HasValue) point = point.Field("lof_seconds", stats.LofSeconds.Value);
+        if (stats.OltDeactivations.HasValue) point = point.Field("olt_deactivations", stats.OltDeactivations.Value);
+        if (stats.BootCount.HasValue) point = point.Field("boot_count", stats.BootCount.Value);
+        if (!string.IsNullOrEmpty(stats.LastResetReason)) point = point.Field("last_reset_reason", stats.LastResetReason);
         if (stats.GemRxDropped.HasValue) point = point.Field("gem_rx_dropped", stats.GemRxDropped.Value);
         if (stats.AllocTotal.HasValue) point = point.Field("alloc_total", stats.AllocTotal.Value);
         if (stats.AllocLost.HasValue) point = point.Field("alloc_lost", stats.AllocLost.Value);
@@ -1357,6 +2032,14 @@ from(bucket: ""{_longtermBucket}"")
         if (stats.LanRxFcsErrors.HasValue) point = point.Field("lan_rx_fcs_err", stats.LanRxFcsErrors.Value);
         if (stats.LanBufferOverflow.HasValue) point = point.Field("lan_buffer_overflow", stats.LanBufferOverflow.Value);
         if (stats.SfpUptimeS.HasValue) point = point.Field("sfp_uptime_s", stats.SfpUptimeS.Value);
+        // A field, not the ont measurement's olt_vendor tag: the sfp series key must not change.
+        if (!string.IsNullOrEmpty(stats.OltVendorId)) point = point.Field("olt_vendor_id", stats.OltVendorId);
+        if (!string.IsNullOrEmpty(stats.RegistrationStatus)) point = point.Field("registration_status", stats.RegistrationStatus);
+        if (!string.IsNullOrEmpty(stats.KeyExchangeStatus)) point = point.Field("key_exchange_status", stats.KeyExchangeStatus);
+        if (!string.IsNullOrEmpty(stats.FirmwareVersion)) point = point.Field("firmware_version", stats.FirmwareVersion);
+        // Not "olt_model": the ont measurement already has a tag by that name, and a field may not share it.
+        if (!string.IsNullOrEmpty(stats.OltModel)) point = point.Field("olt_equipment_id", stats.OltModel);
+        if (!string.IsNullOrEmpty(stats.OltVersion)) point = point.Field("olt_version", stats.OltVersion);
         return point;
     }
 
@@ -1649,6 +2332,175 @@ from(bucket: ""{_longtermBucket}"")
     }
 
     /// <summary>
+    /// Records that a device health check ran its remedy. Long-term, like reboots: the mark on the
+    /// chart is the whole point and a 30d view has to reach it.
+    /// </summary>
+    /// <param name="deviceMac">Device MAC.</param>
+    /// <param name="deviceType">Device type, matching the <c>device_health</c> tag values.</param>
+    /// <param name="checkName">Display name of the check.</param>
+    /// <param name="fieldName">The check's field name, so the mark lands on its own chart.</param>
+    /// <param name="remedy">Remedy that ran (RestartService, KillProcess, RebootDevice).</param>
+    /// <param name="severity">warning when it ran, critical when it failed to run.</param>
+    /// <param name="detail">One sentence for the tooltip.</param>
+    /// <param name="value">The reading that tripped the check.</param>
+    /// <param name="at">When the remedy ran.</param>
+    public Task WriteHealthCheckEventAsync(
+        string deviceMac,
+        string deviceType,
+        string checkName,
+        string fieldName,
+        string remedy,
+        string severity,
+        string detail,
+        double value,
+        DateTime at)
+    {
+        if (!IsConfigured) return Task.CompletedTask;
+
+        var point = PointData.Measurement("events")
+            .Tag("device_mac", NormalizeMac(deviceMac))
+            .Tag("event_type", HealthCheckEventType)
+            .Tag("severity", severity)
+            .Tag("device_type", deviceType.ToLowerInvariant())
+            .Timestamp(at.ToUniversalTime(), WritePrecision.Ns)
+            .Field("detail", detail)
+            .Field("check_name", checkName)
+            .Field("check_field", fieldName)
+            .Field("remedy", remedy)
+            .Field("value", value);
+
+        Enqueue(point, longterm: true);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>A stored health check remedy record.</summary>
+    public class HealthCheckEventPoint
+    {
+        public string DeviceMac { get; init; } = "";
+        public string CheckName { get; init; } = "";
+        public string CheckField { get; init; } = "";
+        public string Remedy { get; init; } = "";
+        public string Severity { get; init; } = "";
+        public string? Detail { get; init; }
+        public double? Value { get; init; }
+        public DateTime At { get; init; }
+    }
+
+    /// <summary>Every health check remedy that ran in the window, across all devices.</summary>
+    public async Task<IReadOnlyList<HealthCheckEventPoint>> QueryHealthCheckEventsAsync(
+        DateTime from, DateTime to, CancellationToken ct = default)
+    {
+        if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket))
+            return Array.Empty<HealthCheckEventPoint>();
+
+        var flux = $@"
+from(bucket: {FluxLiteral.Quote(_longtermBucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == ""events"")
+  |> filter(fn: (r) => r.event_type == {FluxLiteral.Quote(HealthCheckEventType)})
+  |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
+";
+        var results = new List<HealthCheckEventPoint>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+        {
+            var deviceMac = record.GetValueByKey("device_mac") as string ?? "";
+            if (deviceMac.Length == 0) continue;
+            results.Add(new HealthCheckEventPoint
+            {
+                DeviceMac = deviceMac,
+                CheckName = record.GetValueByKey("check_name") as string ?? "",
+                CheckField = record.GetValueByKey("check_field") as string ?? "",
+                Remedy = record.GetValueByKey("remedy") as string ?? "",
+                Severity = record.GetValueByKey("severity") as string ?? "info",
+                Detail = record.GetValueByKey("detail") as string,
+                Value = AsDoubleOrNull(record.GetValueByKey("value")),
+                At = ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow),
+            });
+        }
+        results.Sort((a, b) => a.At.CompareTo(b.At));
+        return results;
+    }
+
+    /// <summary>Event type tag for health check remedy records on the <c>events</c> measurement.</summary>
+    public const string HealthCheckEventType = "health_check";
+
+    /// <summary>Event type tag for cable modem DOCSIS event log entries on the <c>events</c> measurement.</summary>
+    public const string CableModemLogEventType = "cable_modem_log";
+
+    /// <summary>
+    /// Records one entry from a cable modem's own DOCSIS event log, at the time the modem logged it.
+    /// Long-term, like reboots: the marks on Cable Modem Signal History have to reach a 30d view.
+    /// Tagged with <c>cm_id</c> so the marks join the <c>cable_modem</c> series they annotate.
+    /// </summary>
+    /// <param name="cmId">Cable modem config id, matching the <c>cable_modem</c> cm_id tag.</param>
+    /// <param name="cmName">Cable modem name, for tooltips.</param>
+    /// <param name="level">Log level as the modem wrote it (Critical, Notice, ...).</param>
+    /// <param name="kind">Recognised event kind (t3_timeout, ...), or null.</param>
+    /// <param name="text">Event text without time and level.</param>
+    /// <param name="raw">The full log line; the identity that tells entries apart.</param>
+    /// <param name="at">When the modem logged it.</param>
+    public Task WriteCableModemLogEventAsync(
+        string cmId, string cmName, string level, string? kind, string text, string raw, DateTime at)
+    {
+        if (!IsConfigured) return Task.CompletedTask;
+
+        var point = PointData.Measurement("events")
+            .Tag("cm_id", cmId)
+            .Tag("event_type", CableModemLogEventType)
+            .Tag("severity", string.IsNullOrWhiteSpace(level) ? "info" : level.Trim().ToLowerInvariant())
+            .Timestamp(at.ToUniversalTime(), WritePrecision.Ns)
+            .Field("detail", text)
+            .Field("raw", raw)
+            .Field("cm_name", cmName);
+        if (!string.IsNullOrEmpty(kind))
+            point = point.Field("kind", kind);
+
+        Enqueue(point, longterm: true);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>A stored cable modem DOCSIS event log entry.</summary>
+    public class CableModemLogEventPoint
+    {
+        public string Level { get; init; } = "";
+        public string? Kind { get; init; }
+        public string Text { get; init; } = "";
+        public string Raw { get; init; } = "";
+        public DateTime At { get; init; }
+    }
+
+    /// <summary>One cable modem's DOCSIS event log entries in the window, oldest first.</summary>
+    public async Task<IReadOnlyList<CableModemLogEventPoint>> QueryCableModemLogEventsAsync(
+        string cmId, DateTime from, DateTime to, CancellationToken ct = default)
+    {
+        if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket))
+            return Array.Empty<CableModemLogEventPoint>();
+
+        var flux = $@"
+from(bucket: {FluxLiteral.Quote(_longtermBucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == ""events"")
+  |> filter(fn: (r) => r.event_type == {FluxLiteral.Quote(CableModemLogEventType)})
+  |> filter(fn: (r) => r.cm_id == {FluxLiteral.Quote(cmId)})
+  |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
+";
+        var results = new List<CableModemLogEventPoint>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+        {
+            results.Add(new CableModemLogEventPoint
+            {
+                Level = record.GetValueByKey("severity") as string ?? "",
+                Kind = record.GetValueByKey("kind") as string,
+                Text = record.GetValueByKey("detail") as string ?? "",
+                Raw = record.GetValueByKey("raw") as string ?? "",
+                At = ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow),
+            });
+        }
+        results.Sort((a, b) => a.At.CompareTo(b.At));
+        return results;
+    }
+
+    /// <summary>
     /// Event type tag used for device reboot records on the <c>events</c> measurement.
     /// </summary>
     public const string DeviceRebootEventType = "device_reboot";
@@ -1774,10 +2626,10 @@ from(bucket: ""{_longtermBucket}"")
             return Array.Empty<DeviceRebootPoint>();
 
         var flux = $@"
-from(bucket: ""{_longtermBucket}"")
+from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: -{(int)Math.Max(1, lookback.TotalHours)}h)
   |> filter(fn: (r) => r._measurement == ""events"")
-  |> filter(fn: (r) => r.event_type == ""{DeviceRebootEventType}"")
+  |> filter(fn: (r) => r.event_type == {FluxLiteral.Quote(DeviceRebootEventType)})
   |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
   |> group(columns: [""device_mac""])
   |> sort(columns: [""_time""])
@@ -1830,10 +2682,10 @@ from(bucket: ""{_longtermBucket}"")
             return Array.Empty<DeviceRebootPoint>();
 
         var flux = $@"
-from(bucket: ""{_longtermBucket}"")
+from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""events"")
-  |> filter(fn: (r) => r.event_type == ""{DeviceRebootEventType}"")
+  |> filter(fn: (r) => r.event_type == {FluxLiteral.Quote(DeviceRebootEventType)})
   |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
 ";
         var results = new List<DeviceRebootPoint>();
@@ -2008,7 +2860,7 @@ from(bucket: ""{_longtermBucket}"")
         var macs = string.Join(" or ", deviceMacs
             .Select(NormalizeMac)
             .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Select(m => $@"r.device_mac == ""{m}"""));
+            .Select(m => $@"r.device_mac == {FluxLiteral.Quote(m)}"));
 
         // A plain disjunction of tag regexes, NEVER the if/else that expresses port_id-then-if_name
         // precedence exactly - the conditional runs per row (82 s vs 0.26 s; see remarks). The two
@@ -2020,7 +2872,7 @@ from(bucket: ""{_longtermBucket}"")
             : "";
 
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""interface_counters"")
   |> filter(fn: (r) => {macs})
@@ -2063,10 +2915,10 @@ from(bucket: ""{_bucket}"")
         var window = aggregateWindow ?? PickAggregateWindow(to - from);
         var mac = NormalizeMac(deviceMac);
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""interface_counters"")
-  |> filter(fn: (r) => r.device_mac == ""{mac}"")
+  |> filter(fn: (r) => r.device_mac == {FluxLiteral.Quote(mac)})
   |> filter(fn: (r) => r._field == ""rate_in_bps"" or r._field == ""rate_out_bps"")
   |> aggregateWindow(every: {ToFluxDuration(window)}, fn: mean, createEmpty: false)
   |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
@@ -2105,10 +2957,10 @@ from(bucket: ""{_bucket}"")
         if (!IsConfigured) return Array.Empty<InterfaceLinkStatePoint>();
         var mac = NormalizeMac(deviceMac);
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""interface_counters"")
-  |> filter(fn: (r) => r.device_mac == ""{mac}"")
+  |> filter(fn: (r) => r.device_mac == {FluxLiteral.Quote(mac)})
   |> filter(fn: (r) => r._field == ""oper_status"")
 ";
         var results = new List<InterfaceLinkStatePoint>();
@@ -2127,6 +2979,81 @@ from(bucket: ""{_bucket}"")
     }
 
     /// <summary>
+    /// The console link speed sample nearest <paramref name="at"/> for one interface, when one lies
+    /// within a console poll or so of it. Further away it may describe a different negotiation.
+    /// </summary>
+    private static int? NearestLinkSpeed(
+        Dictionary<string, List<(DateTime Time, int Mbps)>> linkSpeeds, string ifName, DateTime at)
+    {
+        if (!linkSpeeds.TryGetValue(ifName, out var samples) || samples.Count == 0) return null;
+        var nearest = samples.MinBy(s => (s.Time - at).Duration());
+        return (nearest.Time - at).Duration() <= TimeSpan.FromSeconds(90) ? nearest.Mbps : null;
+    }
+
+    /// <summary>
+    /// The fastest console-reported link speed one port reached over a window, or null when none
+    /// was recorded. Negotiated speed cannot read higher than the link really reached, so the
+    /// maximum is what the port is capable of with its current partner.
+    /// </summary>
+    public async Task<int?> QueryMaxLinkSpeedAsync(
+        string deviceMac,
+        string ifName,
+        DateTime from,
+        DateTime to,
+        CancellationToken ct = default)
+    {
+        if (!IsConfigured) return null;
+        var flux = $@"
+from(bucket: {FluxLiteral.Quote(_bucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == ""interface_counters"")
+  |> filter(fn: (r) => r.device_mac == {FluxLiteral.Quote(NormalizeMac(deviceMac))})
+  |> filter(fn: (r) => r.if_name == {FluxLiteral.Quote(ifName)})
+  |> filter(fn: (r) => r._field == {FluxLiteral.Quote(InfluxFieldNames.LinkSpeedMbps)})
+  |> max()
+";
+        int? max = null;
+        await foreach (var record in QueryFluxAsync(flux, ct))
+        {
+            if (AsIntOrNull(record.GetValueByKey("_value")) is { } v && v > (max ?? 0)) max = v;
+        }
+        return max;
+    }
+
+    /// <summary>
+    /// One port's console-reported link speed over a window, as the slowest speed in each
+    /// <paramref name="window"/>. A window holding any downshift reads as the downshifted speed.
+    /// Windows with no snapshot are absent.
+    /// </summary>
+    public async Task<IReadOnlyList<(DateTime Time, int MinMbps)>> QueryLinkSpeedWindowsAsync(
+        string deviceMac,
+        string ifName,
+        DateTime from,
+        DateTime to,
+        TimeSpan window,
+        CancellationToken ct = default)
+    {
+        if (!IsConfigured) return Array.Empty<(DateTime, int)>();
+        var flux = $@"
+from(bucket: {FluxLiteral.Quote(_bucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == ""interface_counters"")
+  |> filter(fn: (r) => r.device_mac == {FluxLiteral.Quote(NormalizeMac(deviceMac))})
+  |> filter(fn: (r) => r.if_name == {FluxLiteral.Quote(ifName)})
+  |> filter(fn: (r) => r._field == {FluxLiteral.Quote(InfluxFieldNames.LinkSpeedMbps)})
+  |> aggregateWindow(every: {ToFluxDuration(window)}, fn: min, createEmpty: false)
+";
+        var results = new List<(DateTime Time, int MinMbps)>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+        {
+            if (AsIntOrNull(record.GetValueByKey("_value")) is not { } v) continue;
+            results.Add((ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow), v));
+        }
+        results.Sort((a, b) => a.Time.CompareTo(b.Time));
+        return results;
+    }
+
+    /// <summary>
     /// Raw interface rate query for a single device - no aggregateWindow, no pivot.
     /// Returns raw rate_in_bps and rate_out_bps points paired in C#. Much cheaper
     /// than the aggregated variant for short-range playback where data is already
@@ -2141,16 +3068,18 @@ from(bucket: ""{_bucket}"")
         if (!IsConfigured) return Array.Empty<InterfaceRatePoint>();
         var mac = NormalizeMac(deviceMac);
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""interface_counters"")
-  |> filter(fn: (r) => r.device_mac == ""{mac}"")
-  |> filter(fn: (r) => r._field == ""rate_in_bps"" or r._field == ""rate_out_bps"")
+  |> filter(fn: (r) => r.device_mac == {FluxLiteral.Quote(mac)})
+  |> filter(fn: (r) => r._field == ""rate_in_bps"" or r._field == ""rate_out_bps"" or r._field == ""speed_bps"" or r._field == {FluxLiteral.Quote(InfluxFieldNames.LinkSpeedMbps)})
 ";
         var rateIn = new Dictionary<(string ifName, long ticks), double>();
         var rateOut = new Dictionary<(string ifName, long ticks), double>();
+        var speeds = new Dictionary<(string ifName, long ticks), long>();
         var times = new Dictionary<(string ifName, long ticks), DateTime>();
         var portIds = new Dictionary<(string ifName, long ticks), string?>();
+        var linkSpeeds = new Dictionary<string, List<(DateTime Time, int Mbps)>>(StringComparer.OrdinalIgnoreCase);
 
         await foreach (var record in QueryFluxAsync(flux, ct))
         {
@@ -2161,6 +3090,17 @@ from(bucket: ""{_bucket}"")
             if (value == null) continue;
 
             var key = (ifName, time.Ticks);
+            // Speed only annotates a rate sample. A sample with speed and no rate must not become
+            // a point, or a nearest-point reader would take it as a zero rate.
+            if (field == "speed_bps") { speeds[key] = (long)value.Value; continue; }
+            // Console link speed lands on its own timestamps, so it is matched to rate samples by
+            // nearness below rather than by key.
+            if (field == InfluxFieldNames.LinkSpeedMbps)
+            {
+                if (!linkSpeeds.TryGetValue(ifName, out var list)) linkSpeeds[ifName] = list = new();
+                list.Add((time, (int)value.Value));
+                continue;
+            }
             times[key] = time;
             portIds[key] = record.GetValueByKey("port_id") as string;
             if (field == "rate_in_bps") rateIn[key] = value.Value;
@@ -2179,6 +3119,8 @@ from(bucket: ""{_bucket}"")
                 PortId = portIds.TryGetValue(key, out var pid) ? pid : null,
                 RateInBps = rateIn.TryGetValue(key, out var ri) ? ri : null,
                 RateOutBps = rateOut.TryGetValue(key, out var ro) ? ro : null,
+                SpeedBps = speeds.TryGetValue(key, out var sp) ? sp : null,
+                LinkSpeedMbps = NearestLinkSpeed(linkSpeeds, key.ifName, time),
             });
         }
         // Order on assembly: the Flux result is NOT globally ordered. pivot emits a separate table
@@ -2198,7 +3140,7 @@ from(bucket: ""{_bucket}"")
     {
         if (!IsConfigured) return null;
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: -90d)
   |> filter(fn: (r) => r._measurement == ""interface_counters"")
   |> filter(fn: (r) => r._field == ""rate_in_bps"")
@@ -2230,9 +3172,9 @@ from(bucket: ""{_bucket}"")
         if (macs.Count == 0) return new Dictionary<string, List<InterfaceRatePoint>>(StringComparer.OrdinalIgnoreCase);
 
         var window = aggregateWindow ?? PickAggregateWindow(to - from);
-        var macFilter = string.Join(" or ", macs.Select(m => $@"r.device_mac == ""{m}"""));
+        var macFilter = string.Join(" or ", macs.Select(m => $@"r.device_mac == {FluxLiteral.Quote(m)}"));
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""interface_counters"")
   |> filter(fn: (r) => {macFilter})
@@ -2308,11 +3250,11 @@ from(bucket: ""{_bucket}"")
         {
             var macs = deviceMacs.Select(NormalizeMac).Distinct().ToList();
             macFilter = "\n  |> filter(fn: (r) => " +
-                string.Join(" or ", macs.Select(m => $@"r.device_mac == ""{m}""")) + ")";
+                string.Join(" or ", macs.Select(m => $@"r.device_mac == {FluxLiteral.Quote(m)}")) + ")";
         }
 
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> {rangeClause}
   |> filter(fn: (r) => r._measurement == ""interface_counters""){macFilter}{lastClause}
   |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
@@ -2341,9 +3283,16 @@ from(bucket: ""{_bucket}"")
                 ErrorsOut = AsLongOrNull(record.GetValueByKey("errors_out")),
                 DiscardsIn = AsLongOrNull(record.GetValueByKey("discards_in")),
                 DiscardsOut = AsLongOrNull(record.GetValueByKey("discards_out")),
+                LinkSpeedMbps = AsIntOrNull(record.GetValueByKey(InfluxFieldNames.LinkSpeedMbps)),
                 Time = ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow),
             });
         }
+
+        // Console link-speed points land on their own timestamps and carry nothing else. Keep them
+        // out of the coalescing below so they never decide a row's time or create a row on their own
+        // (a gateway with SNMP off has only these), and attach the best one to the row afterwards.
+        var linkOnly = raw.Where(IsLinkSpeedOnly).ToList();
+        raw = raw.Where(p => !IsLinkSpeedOnly(p)).ToList();
 
         // Different fields can land on different timestamps - rate_in/out are only
         // written when a rate is computable, so a fresh point may carry oper_status
@@ -2384,11 +3333,27 @@ from(bucket: ""{_bucket}"")
                     ErrorsOut = FirstLong(p => p.ErrorsOut),
                     DiscardsIn = FirstLong(p => p.DiscardsIn),
                     DiscardsOut = FirstLong(p => p.DiscardsOut),
+                    LinkSpeedMbps = ordered.Select(p => p.LinkSpeedMbps)
+                        .Concat(BestLinkSpeed(g.Key.DeviceMac, g.Key.IfName))
+                        .FirstOrDefault(v => v.HasValue),
                     Time = ordered[0].Time,
                 };
             })
             .ToList();
+
+        IEnumerable<int?> BestLinkSpeed(string mac, string ifName)
+        {
+            var points = linkOnly.Where(p => TupleMacIfComparer.Equals((p.DeviceMac, p.IfName), (mac, ifName)));
+            var ordered = atUtc.HasValue
+                ? points.OrderBy(p => Math.Abs((p.Time - atUtc.Value).Ticks))
+                : points.OrderByDescending(p => p.Time);
+            return ordered.Select(p => p.LinkSpeedMbps).Take(1);
+        }
     }
+
+    private static bool IsLinkSpeedOnly(PortStatsPoint p) =>
+        p.LinkSpeedMbps.HasValue && p.OperStatus == null && p.SpeedBps == null
+        && p.BytesIn == null && p.BytesOut == null && p.RateInBps == null && p.RateOutBps == null;
 
     private static readonly IEqualityComparer<(string DeviceMac, string IfName)> TupleMacIfComparer =
         new MacIfTupleComparer();
@@ -2407,8 +3372,9 @@ from(bucket: ""{_bucket}"")
     /// Gateway WAN throughput from the SNMP interface counters, for the interface(s) named.
     ///
     /// CONTRACT: passing more than one interface SUMS them into a single combined series
-    /// (grouped per (_time, _field)). That is correct for exactly ONE caller class - the
-    /// all-WAN usage fingerprint, which asks "was the user doing anything on any WAN" - and
+    /// (grouped per (_time, _field)). That is correct for exactly ONE caller class - site-total
+    /// traffic that is never compared to a plan: the all-WAN usage fingerprint, which asks "was
+    /// the user doing anything on any WAN", and the Device Stats WAN Throughput chart - and
     /// wrong for every load/utilization computation, because a summed multi-WAN series divided
     /// by one WAN's plan speeds silently understates or overstates load (and ISP Health's
     /// packet-loss ceiling scales with load QUADRATICALLY, so the damage compounds). Per-WAN
@@ -2444,7 +3410,7 @@ from(bucket: ""{_bucket}"")
         var window = aggregateWindow ?? PickAggregateWindow(to - from, sampleIntervalSeconds);
         var mac = NormalizeMac(deviceMac);
         var ifFilter = string.Join(" or ", wanIfNames.Select(n =>
-            $@"r.if_name == ""{SanitizeFluxString(n)}"""));
+            $@"r.if_name == {FluxLiteral.Quote(n)}"));
         // Summing across interfaces groups by (_time, _field), which on a long window at a fine
         // aggregate means one server-side group per sample - measured at 6657ms against 490ms without,
         // for 148k samples over 30 days. With a single WAN there is nothing to sum: the stage returns
@@ -2457,10 +3423,10 @@ from(bucket: ""{_bucket}"")
   |> group()"
             : string.Empty;
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""interface_counters"")
-  |> filter(fn: (r) => r.device_mac == ""{mac}"")
+  |> filter(fn: (r) => r.device_mac == {FluxLiteral.Quote(mac)})
   |> filter(fn: (r) => {ifFilter})
   |> filter(fn: (r) => r._field == ""rate_in_bps"" or r._field == ""rate_out_bps"")
   |> aggregateWindow(every: {ToFluxDuration(window)}, fn: mean, createEmpty: false){multiWanSum}
@@ -2511,10 +3477,10 @@ from(bucket: ""{_bucket}"")
         var window = aggregateWindow ?? PickAggregateWindow(to - from);
         var mac = NormalizeMac(deviceMac);
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""device_health"")
-  |> filter(fn: (r) => r.device_mac == ""{mac}"")
+  |> filter(fn: (r) => r.device_mac == {FluxLiteral.Quote(mac)})
   |> filter(fn: (r) => r._field == ""cpu_percent"" or r._field == ""memory_used_percent"" or r._field == ""temperature_c"" or r._field == ""uptime_seconds"" or r._field == ""fan_speed_rpm"")
   |> map(fn: (r) => ({{ r with _value: if r._field == ""temperature_c"" and float(v: r._value) > {FluxMillidegreeThreshold} then float(v: r._value) / {FluxMillidegreeDivisor} else float(v: r._value) }}))
   |> aggregateWindow(every: {ToFluxDuration(window)}, fn: mean, createEmpty: false)
@@ -2543,6 +3509,294 @@ from(bucket: ""{_bucket}"")
     }
 
     /// <summary>
+    /// One device's CPU, one mean per window. A single field with no map stage, so the window
+    /// aggregate pushes down to storage over long ranges (<see cref="QueryDeviceHealthAsync"/> does not).
+    /// </summary>
+    public async Task<IReadOnlyList<(DateTime Time, double Value)>> QueryDeviceCpuAsync(
+        string deviceMac, DateTime from, DateTime to, TimeSpan window, CancellationToken ct = default)
+    {
+        if (!IsConfigured) return Array.Empty<(DateTime, double)>();
+        var flux = $@"
+from(bucket: {FluxLiteral.Quote(_bucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == ""device_health"")
+  |> filter(fn: (r) => r.device_mac == {FluxLiteral.Quote(NormalizeMac(deviceMac))})
+  |> filter(fn: (r) => r._field == ""cpu_percent"")
+  |> aggregateWindow(every: {ToFluxDuration(window)}, fn: mean, createEmpty: false)
+";
+        var results = new List<(DateTime, double)>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+            if (AsDoubleOrNull(record.GetValue()) is { } v)
+                results.Add((ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow), v));
+        results.Sort((a, b) => a.Item1.CompareTo(b.Item1));
+        return results;
+    }
+
+    /// <summary>One ISP or Transit target's mean RTT and loss in one window.</summary>
+    public sealed record TargetLatencyMean(DateTime Time, string TargetId, string TargetType, double? RttAvgMs, double? LossPercent);
+
+    /// <summary>
+    /// Per-target RTT and loss means across the ISP and Transit targets, one row per target per
+    /// window. Never group before the window aggregate here: that defeats storage pushdown and pulls
+    /// every raw point into Flux memory. Callers combine targets themselves.
+    /// </summary>
+    /// <param name="includeInternetService">Also read internet-service targets (the loss pool's anycast DNS), for a
+    /// caller that falls back to them when the site has no ISP or transit hop.</param>
+    public async Task<IReadOnlyList<TargetLatencyMean>> QueryIspTransitLatencyByTargetAsync(
+        DateTime from, DateTime to, IReadOnlyList<string>? targetIds, TimeSpan window, CancellationToken ct = default,
+        LatencyWanScope? wanScope = null, bool includeInternetService = false)
+    {
+        if (!IsConfigured) await ReconfigureAsync(ct);
+        if (!IsConfigured) return Array.Empty<TargetLatencyMean>();
+        var idFilter = targetIds is { Count: > 0 }
+            ? $"\n  |> filter(fn: (r) => {string.Join(" or ", targetIds.Select(id => $@"r.target_id == {FluxLiteral.Quote(id)}"))})"
+            : "";
+        var internetService = includeInternetService ? @" or r.target_type == ""internetservice""" : "";
+        var flux = $@"
+from(bucket: {FluxLiteral.Quote(_bucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == ""latency"")
+  |> filter(fn: (r) => r.target_type == ""accessisp"" or r.target_type == ""transit""{internetService}){idFilter}{BuildWanScopeFilter(wanScope)}
+  |> filter(fn: (r) => r._field == ""rtt_avg_ms"" or r._field == ""loss_percent"")
+  |> aggregateWindow(every: {ToFluxDuration(window)}, fn: mean, createEmpty: false)
+";
+        var rows = new Dictionary<(DateTime, string), (string Type, double? Rtt, double? Loss)>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+        {
+            if (record.GetValueByKey("target_id") is not string id) continue;
+            var key = (ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow), id);
+            var row = rows.TryGetValue(key, out var r) ? r : (record.GetValueByKey("target_type") as string ?? "", null, null);
+            var value = AsDoubleOrNull(record.GetValue());
+            rows[key] = record.GetField() == "rtt_avg_ms" ? row with { Rtt = value } : row with { Loss = value };
+        }
+        return rows.Select(kv => new TargetLatencyMean(kv.Key.Item1, kv.Key.Item2, kv.Value.Type, kv.Value.Rtt, kv.Value.Loss))
+            .OrderBy(p => p.Time).ToList();
+    }
+
+    /// <summary>
+    /// Distinct Wi-Fi clients per window and band ("2.4ghz", "5ghz", "6ghz"). Up to two days reads
+    /// the raw client_mac field (one field, no pivot); longer ranges count per day from the daily
+    /// rollup, where client_mac is a tag and the count pushes down, plus raw days for whatever the
+    /// rollup has not reached yet. A client that moved band inside a window counts on both.
+    /// </summary>
+    public async Task<IReadOnlyList<(DateTime Time, string Band, int Clients)>> QueryWifiClientCountsAsync(
+        DateTime from, DateTime to, TimeSpan window, CancellationToken ct = default)
+    {
+        if (!IsConfigured) return Array.Empty<(DateTime, string, int)>();
+        if (to - from <= TimeSpan.FromDays(2) || string.IsNullOrEmpty(_longtermBucket))
+            return await RawWifiClientCountsAsync(from, to, window, ct);
+
+        var day = TimeSpan.FromDays(1);
+        var perDay = new Dictionary<(DateTime Day, string Band), HashSet<string>>();
+        // Rollup rows are stamped at UTC midnight: start at the first day's midnight so the partial
+        // first day is read (its point sits before `from`, where a chart clamps it to the edge).
+        var flux = $@"
+from(bucket: {FluxLiteral.Quote(_longtermBucket)})
+  |> range(start: {ToFluxInstant(DateTime.SpecifyKind(from.ToUniversalTime().Date, DateTimeKind.Utc))}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == ""wifi_client_daily"" and r._field == ""samples"")
+  |> aggregateWindow(every: 1d, fn: count, createEmpty: false, timeSrc: ""_start"")
+";
+        await foreach (var record in QueryFluxAsync(flux, ct))
+        {
+            if (record.GetValueByKey("client_mac") is not string mac || (AsDoubleOrNull(record.GetValue()) ?? 0) <= 0) continue;
+            var key = (ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow).Date, record.GetValueByKey("band") as string ?? "");
+            if (!perDay.TryGetValue(key, out var macs)) perDay[key] = macs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            macs.Add(mac);
+        }
+        var result = perDay.Select(kv => (DateTime.SpecifyKind(kv.Key.Day, DateTimeKind.Utc), kv.Key.Band, kv.Value.Count)).ToList();
+        var rolledThrough = perDay.Count == 0 ? from : DateTime.SpecifyKind(perDay.Keys.Max(k => k.Day), DateTimeKind.Utc) + day;
+        if (rolledThrough < to)
+            result.AddRange(await RawWifiClientCountsAsync(rolledThrough, to, day, ct));
+        result.Sort((a, b) => a.Item1.CompareTo(b.Item1));
+        return result;
+    }
+
+    /// <summary>
+    /// Mean Wi-Fi TX PHY rate (AP to client) per window and band, weighted by sample: per-series
+    /// sum and count push down, and the bands are combined here.
+    /// </summary>
+    public async Task<IReadOnlyList<(DateTime Time, string Band, double Kbps)>> QueryWifiPhyByBandAsync(
+        DateTime from, DateTime to, TimeSpan window, CancellationToken ct = default)
+    {
+        if (!IsConfigured) return Array.Empty<(DateTime, string, double)>();
+        string Flux(string fn) => $@"
+from(bucket: {FluxLiteral.Quote(_bucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == ""wifi_client"" and r._field == ""tx_rate_kbps"")
+  |> aggregateWindow(every: {ToFluxDuration(window)}, fn: {fn}, createEmpty: false)
+";
+        async Task<Dictionary<(DateTime, string), double>> Read(string fn)
+        {
+            var totals = new Dictionary<(DateTime, string), double>();
+            await foreach (var record in QueryFluxAsync(Flux(fn), ct))
+            {
+                var key = (ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow), record.GetValueByKey("band") as string ?? "");
+                totals[key] = totals.GetValueOrDefault(key) + (AsDoubleOrNull(record.GetValue()) ?? 0);
+            }
+            return totals;
+        }
+        var sums = Read("sum");
+        var counts = Read("count");
+        await Task.WhenAll(sums, counts);
+        return counts.Result.Where(kv => kv.Value > 0 && sums.Result.ContainsKey(kv.Key))
+            .Select(kv => (kv.Key.Item1, kv.Key.Item2, sums.Result[kv.Key] / kv.Value))
+            .OrderBy(p => p.Item1).ToList();
+    }
+
+    // ---- Site Health reads (hourly, pushdown shapes; window stamped at its start) ----
+
+    /// <summary>
+    /// Per-target RTT and loss means per window, stamped at the window's start. Filters by target id when
+    /// given, else by target type (e.g. "fabric"). No group before the aggregate, so it pushes down.
+    /// </summary>
+    public async Task<IReadOnlyList<TargetLatencyMean>> QueryTargetLatencyMeansAsync(
+        DateTime from, DateTime to, IReadOnlyList<string>? targetIds, string? targetType, TimeSpan window,
+        LatencyWanScope? wanScope = null, CancellationToken ct = default)
+    {
+        if (!IsConfigured) return Array.Empty<TargetLatencyMean>();
+        var selector = targetIds is { Count: > 0 }
+            ? $"\n  |> filter(fn: (r) => {string.Join(" or ", targetIds.Select(id => $@"r.target_id == {FluxLiteral.Quote(id)}"))})"
+            : targetType != null ? $@"
+  |> filter(fn: (r) => r.target_type == {FluxLiteral.Quote(targetType)})" : null;
+        if (selector == null) return Array.Empty<TargetLatencyMean>();
+        var flux = $@"
+from(bucket: {FluxLiteral.Quote(_bucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == ""latency""){selector}{BuildWanScopeFilter(wanScope)}
+  |> filter(fn: (r) => r._field == ""rtt_avg_ms"" or r._field == ""loss_percent"")
+  |> aggregateWindow(every: {ToFluxDuration(window)}, fn: mean, createEmpty: false, timeSrc: ""_start"")
+";
+        var rows = new Dictionary<(DateTime, string), (string Type, double? Rtt, double? Loss)>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+        {
+            if (record.GetValueByKey("target_id") is not string id) continue;
+            var key = (ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow), id);
+            var row = rows.TryGetValue(key, out var r) ? r : (record.GetValueByKey("target_type") as string ?? "", null, null);
+            var value = AsDoubleOrNull(record.GetValue());
+            rows[key] = record.GetField() == "rtt_avg_ms" ? row with { Rtt = value } : row with { Loss = value };
+        }
+        return rows.Select(kv => new TargetLatencyMean(kv.Key.Item1, kv.Key.Item2, kv.Value.Type, kv.Value.Rtt, kv.Value.Loss))
+            .OrderBy(p => p.Time).ToList();
+    }
+
+    /// <summary>One AP radio's satisfaction sample counts in one hour.</summary>
+    public sealed record SatisfactionCounts(DateTime Hour, string DeviceMac, string Band, int Total, int Below80, int Below60);
+
+    /// <summary>
+    /// Wi-Fi satisfaction sample counts per hour and AP radio: all samples, under 80, and under 60.
+    /// Three counts, each a pushdown (31 ms for 7 days on the test site).
+    /// </summary>
+    public async Task<IReadOnlyList<SatisfactionCounts>> QuerySatisfactionCountsAsync(DateTime from, DateTime to, CancellationToken ct = default)
+    {
+        if (!IsConfigured) return Array.Empty<SatisfactionCounts>();
+        async Task<Dictionary<(DateTime, string, string), int>> Count(string cond)
+        {
+            var flux = $@"
+from(bucket: {FluxLiteral.Quote(_bucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == ""wifi_client"" and r._field == ""satisfaction""){cond}
+  |> aggregateWindow(every: 1h, fn: count, createEmpty: false, timeSrc: ""_start"")
+";
+            var counts = new Dictionary<(DateTime, string, string), int>();
+            await foreach (var record in QueryFluxAsync(flux, ct))
+            {
+                var key = (ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow), record.GetValueByKey("device_mac") as string ?? "", record.GetValueByKey("band") as string ?? "");
+                counts[key] = counts.GetValueOrDefault(key) + (int)(AsDoubleOrNull(record.GetValue()) ?? 0);
+            }
+            return counts;
+        }
+        var total = Count("");
+        var below80 = Count("\n  |> filter(fn: (r) => r._value < 80)");
+        var below60 = Count("\n  |> filter(fn: (r) => r._value < 60)");
+        await Task.WhenAll(total, below80, below60);
+        return total.Result.Select(kv => new SatisfactionCounts(kv.Key.Item1, kv.Key.Item2, kv.Key.Item3, kv.Value,
+                below80.Result.GetValueOrDefault(kv.Key), below60.Result.GetValueOrDefault(kv.Key)))
+            .OrderBy(c => c.Hour).ToList();
+    }
+
+    /// <summary>
+    /// Distinct clients per hour per device from wifi_client (per AP) or wired_client (per switch).
+    /// Raw distinct, not a pushdown: callers read at most a day at a time.
+    /// </summary>
+    public async Task<IReadOnlyList<(DateTime Hour, string DeviceMac, int Clients)>> QueryDistinctClientsByDeviceAsync(
+        string measurement, DateTime from, DateTime to, CancellationToken ct = default)
+    {
+        if (!IsConfigured || measurement is not ("wifi_client" or "wired_client")) return Array.Empty<(DateTime, string, int)>();
+        var flux = $@"
+from(bucket: {FluxLiteral.Quote(_bucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == {FluxLiteral.Quote(measurement)} and r._field == ""client_mac"")
+  |> group(columns: [""device_mac""])
+  |> window(every: 1h)
+  |> distinct()
+  |> count()
+";
+        var results = new List<(DateTime, string, int)>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+            if (record.GetStart() is { } start && record.GetValueByKey("device_mac") is string mac)
+                results.Add((start.ToDateTimeUtc(), mac, (int)(AsDoubleOrNull(record.GetValue()) ?? 0)));
+        return results;
+    }
+
+    /// <summary>
+    /// Per interface per hour: the rise in input errors and in unicast packets received. Each port is
+    /// its own series, so max minus min per window is the counter's rise (a reset reads as no rise).
+    /// Two pushdown aggregates.
+    /// </summary>
+    public async Task<IReadOnlyList<(DateTime Hour, string DeviceMac, string IfName, double Errors, double Packets)>> QueryPortErrorRisesAsync(
+        DateTime from, DateTime to, CancellationToken ct = default)
+    {
+        if (!IsConfigured) return Array.Empty<(DateTime, string, string, double, double)>();
+        async Task<Dictionary<(DateTime, string, string, string), double>> Agg(string fn)
+        {
+            var flux = $@"
+from(bucket: {FluxLiteral.Quote(_bucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == ""interface_counters"" and (r._field == ""errors_in"" or r._field == ""ucast_pkts_in""))
+  |> aggregateWindow(every: 1h, fn: {fn}, createEmpty: false, timeSrc: ""_start"")
+";
+            var values = new Dictionary<(DateTime, string, string, string), double>();
+            await foreach (var record in QueryFluxAsync(flux, ct))
+            {
+                var key = (ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow), record.GetValueByKey("device_mac") as string ?? "",
+                    (record.GetValueByKey("if_name") as string ?? "") + "|" + (record.GetValueByKey("port_id") as string ?? ""), record.GetField() ?? "");
+                if (AsDoubleOrNull(record.GetValue()) is { } v) values[key] = v;
+            }
+            return values;
+        }
+        var max = Agg("max");
+        var min = Agg("min");
+        await Task.WhenAll(max, min);
+        return max.Result
+            .Select(kv => (kv.Key, Rise: Math.Max(0, kv.Value - min.Result.GetValueOrDefault(kv.Key, kv.Value))))
+            .GroupBy(x => (x.Key.Item1, x.Key.Item2, x.Key.Item3))
+            .Select(g => (g.Key.Item1, g.Key.Item2, g.Key.Item3.Split('|')[0],
+                g.Where(x => x.Key.Item4 == "errors_in").Sum(x => x.Rise),
+                g.Where(x => x.Key.Item4 == "ucast_pkts_in").Sum(x => x.Rise)))
+            .ToList();
+    }
+
+    // Not a pushdown shape (distinct needs the raw values), so callers keep it to two days or less.
+    private async Task<List<(DateTime, string, int)>> RawWifiClientCountsAsync(DateTime from, DateTime to, TimeSpan window, CancellationToken ct)
+    {
+        var flux = $@"
+from(bucket: {FluxLiteral.Quote(_bucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == ""wifi_client"")
+  |> filter(fn: (r) => r._field == ""client_mac"")
+  |> group(columns: [""band""])
+  |> window(every: {ToFluxDuration(window)})
+  |> distinct()
+  |> count()
+";
+        var results = new List<(DateTime, string, int)>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+            if (record.GetStart() is { } start)
+                results.Add((start.ToDateTimeUtc(), record.GetValueByKey("band") as string ?? "", (int)(AsDoubleOrNull(record.GetValue()) ?? 0)));
+        return results;
+    }
+
+    /// <summary>
     /// Query custom OID field values from device_health for a specific device.
     /// Returns a time series per field name.
     /// </summary>
@@ -2559,12 +3813,12 @@ from(bucket: ""{_bucket}"")
 
         var window = aggregateWindow ?? PickAggregateWindow(to - from);
         var mac = NormalizeMac(deviceMac);
-        var fieldFilter = string.Join(" or ", fieldNames.Select(f => $"r._field == \"{f}\""));
+        var fieldFilter = string.Join(" or ", fieldNames.Select(f => $"r._field == {FluxLiteral.Quote(f)}"));
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""device_health"")
-  |> filter(fn: (r) => r.device_mac == ""{mac}"")
+  |> filter(fn: (r) => r.device_mac == {FluxLiteral.Quote(mac)})
   |> filter(fn: (r) => {fieldFilter})
   |> aggregateWindow(every: {ToFluxDuration(window)}, fn: mean, createEmpty: false)
 ";
@@ -2592,10 +3846,10 @@ from(bucket: ""{_bucket}"")
         if (!IsConfigured) return Array.Empty<DeviceHealthPoint>();
         var mac = NormalizeMac(deviceMac);
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""device_health"")
-  |> filter(fn: (r) => r.device_mac == ""{mac}"")
+  |> filter(fn: (r) => r.device_mac == {FluxLiteral.Quote(mac)})
   |> filter(fn: (r) => r._field == ""cpu_percent"" or r._field == ""memory_used_percent"" or r._field == ""temperature_c"" or r._field == ""uptime_seconds"" or r._field == ""fan_speed_rpm"")
 ";
         var cpu = new Dictionary<long, double>();
@@ -2640,9 +3894,9 @@ from(bucket: ""{_bucket}"")
         var typeTag = targetType.ToString().ToLowerInvariant();
         var typeFilter = targetType == MonitoringTargetType.InternetService
             ? @"r.target_type == ""internetservice"" or r.target_type == ""wan"""
-            : $@"r.target_type == ""{typeTag}""";
+            : $@"r.target_type == {FluxLiteral.Quote(typeTag)}";
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""latency"")
   |> filter(fn: (r) => {typeFilter})
@@ -2691,10 +3945,10 @@ from(bucket: ""{_bucket}"")
         // InternetService replaced Wan — old data has target_type=wan, new has internetservice.
         var typeFilter = targetType == MonitoringTargetType.InternetService
             ? @"r.target_type == ""internetservice"" or r.target_type == ""wan"""
-            : $@"r.target_type == ""{typeTag}""";
+            : $@"r.target_type == {FluxLiteral.Quote(typeTag)}";
 
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""latency"")
   |> filter(fn: (r) => {typeFilter}){BuildWanScopeFilter(wanScope)}
@@ -2770,7 +4024,7 @@ from(bucket: ""{_bucket}"")
         clauses.AddRange(scope.WanTags
             .Where(t => !string.IsNullOrEmpty(t))
             .Distinct(StringComparer.Ordinal)
-            .Select(t => $@"r.wan == ""{SanitizeFluxString(t)}"""));
+            .Select(t => $@"r.wan == {FluxLiteral.Quote(t)}"));
         if (clauses.Count == 0)
             // A tags-only scope with no usable tag values can match nothing; emit an
             // always-false predicate rather than silently returning every WAN's data.
@@ -2799,10 +4053,10 @@ from(bucket: ""{_bucket}"")
         var typeTag = targetType.ToString().ToLowerInvariant();
         var typeFilter = targetType == MonitoringTargetType.InternetService
             ? @"r.target_type == ""internetservice"" or r.target_type == ""wan"""
-            : $@"r.target_type == ""{typeTag}""";
+            : $@"r.target_type == {FluxLiteral.Quote(typeTag)}";
 
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""latency"")
   |> filter(fn: (r) => {typeFilter}){BuildWanScopeFilter(wanScope)}
@@ -2837,10 +4091,10 @@ from(bucket: ""{_bucket}"")
         if (!IsConfigured) return new List<LatencySeriesPoint>();
         var window = aggregateWindow ?? PickAggregateWindow(to - from);
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""latency"")
-  |> filter(fn: (r) => r.target_id == ""{targetId}"")
+  |> filter(fn: (r) => r.target_id == {FluxLiteral.Quote(targetId)})
   |> filter(fn: (r) => r._field == ""rtt_avg_ms"" or r._field == ""rtt_max_ms"" or r._field == ""jitter_ms"" or r._field == ""loss_percent"")
   |> aggregateWindow(every: {ToFluxDuration(window)}, fn: mean, createEmpty: false)
   |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
@@ -2863,101 +4117,6 @@ from(bucket: ""{_bucket}"")
         public double? LossPercent { get; init; }
     }
 
-    /// <summary>Mean RTT and loss across all ISP+Transit targets, aggregated per time window.
-    /// Averages each target into a per-window mean first (normalizing uneven probe
-    /// intervals), then averages within each target_type, then averages the two category
-    /// means - the same weighting as /api/monitoring/live-stats, so the WAN live chart
-    /// doesn't jump when its buffer swaps between history and live samples.</summary>
-    /// <param name="wanScope">
-    /// Which WAN's points count. Filtering by target id alone is not enough: a host reachable from
-    /// two WANs is probed under each, and a row that has changed context keeps its older points
-    /// under the tag they were written with - so one id can hold more than one WAN's readings, and
-    /// an unscoped read draws another WAN's loss on this one's chart.
-    /// </param>
-    public async Task<IReadOnlyList<LatencyPoint>> QueryMeanIspTransitLatencyAsync(
-        DateTime from,
-        DateTime to,
-        IReadOnlyList<string>? enabledTargetIds = null,
-        TimeSpan? aggregateWindow = null,
-        LatencyWanScope? wanScope = null,
-        CancellationToken ct = default)
-    {
-        if (!IsConfigured) await ReconfigureAsync(ct);
-        if (!IsConfigured) return Array.Empty<LatencyPoint>();
-        var window = aggregateWindow ?? TimeSpan.FromSeconds(
-            Math.Max(10, (int)((to - from).TotalSeconds / 150)));
-        // Query extra lead-in so every target has probed at least once before the first
-        // visible point, priming fill(usePrevious). Without it, the oldest windows
-        // average a partial subset of targets and the left edge of the chart skews high
-        // or low depending on which targets happen to be missing. Warmup rows are
-        // dropped from the results below.
-        var warmup = TimeSpan.FromSeconds(60) + window;
-        var queryFrom = from - warmup;
-        var targetFilter = "";
-        if (enabledTargetIds is { Count: > 0 })
-        {
-            var idFilter = string.Join(" or ", enabledTargetIds.Select(id =>
-                $@"r.target_id == ""{SanitizeFluxString(id)}"""));
-            targetFilter = $"\n  |> filter(fn: (r) => {idFilter})";
-        }
-        var flux = $@"
-base = from(bucket: ""{_bucket}"")
-  |> range(start: {ToFluxInstant(queryFrom)}, stop: {ToFluxInstant(to)})
-  |> filter(fn: (r) => r._measurement == ""latency"")
-  |> filter(fn: (r) => r.target_type == ""accessisp"" or r.target_type == ""transit""){targetFilter}{BuildWanScopeFilter(wanScope)}
-
-rtt = base
-  |> filter(fn: (r) => r._field == ""rtt_avg_ms"")
-  |> group(columns: [""target_id"", ""target_type""])
-  |> aggregateWindow(every: {ToFluxDuration(window)}, fn: mean, createEmpty: true)
-  |> fill(usePrevious: true)
-  |> filter(fn: (r) => exists r._value)
-  |> group(columns: [""target_type"", ""_time""])
-  |> mean()
-  |> group(columns: [""_time""])
-  |> mean()
-  |> group()
-  |> sort(columns: [""_time""])
-  |> map(fn: (r) => ({{_time: r._time, _value: r._value, _field: ""rtt_avg_ms""}}))
-
-loss = base
-  |> filter(fn: (r) => r._field == ""loss_percent"")
-  |> group(columns: [""target_id"", ""target_type""])
-  |> aggregateWindow(every: {ToFluxDuration(window)}, fn: mean, createEmpty: true)
-  |> fill(usePrevious: true)
-  |> filter(fn: (r) => exists r._value)
-  |> group(columns: [""target_type"", ""_time""])
-  |> mean()
-  |> group(columns: [""_time""])
-  |> mean()
-  |> group()
-  |> sort(columns: [""_time""])
-  |> map(fn: (r) => ({{_time: r._time, _value: r._value, _field: ""loss_percent""}}))
-
-union(tables: [rtt, loss])
-  |> group()
-  |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
-";
-        var results = new List<LatencyPoint>();
-        await foreach (var record in QueryFluxAsync(flux, ct))
-        {
-            var time = ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow);
-            if (time < from) continue;
-            results.Add(new LatencyPoint
-            {
-                Time = time,
-                RttAvgMs = AsDoubleOrNull(record.GetValueByKey("rtt_avg_ms")),
-                LossPercent = AsDoubleOrNull(record.GetValueByKey("loss_percent"))
-            });
-        }
-        // Order on assembly: the Flux result is NOT globally ordered. pivot emits a separate table
-        // whenever a row's field set differs, and those tables arrive after the main one - so an
-        // interval where a device reported some fields but not others comes back at the END.
-        results.Sort((a, b) => a.Time.CompareTo(b.Time));
-
-        return results;
-    }
-
     /// <summary>Time-series of RTT and loss for a single monitoring target.</summary>
     public async Task<IReadOnlyList<LatencyPoint>> QueryLatencyAsync(
         string targetId,
@@ -2969,10 +4128,10 @@ union(tables: [rtt, loss])
         if (!IsConfigured) return Array.Empty<LatencyPoint>();
         var window = aggregateWindow ?? PickAggregateWindow(to - from);
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""latency"")
-  |> filter(fn: (r) => r.target_id == ""{targetId}"")
+  |> filter(fn: (r) => r.target_id == {FluxLiteral.Quote(targetId)})
   |> filter(fn: (r) => r._field == ""rtt_avg_ms"" or r._field == ""loss_percent"")
   |> aggregateWindow(every: {ToFluxDuration(window)}, fn: mean, createEmpty: false)
   |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
@@ -3012,12 +4171,12 @@ from(bucket: ""{_bucket}"")
         var window = (aggregateWindow is null or { Ticks: 0 }) ? PickAggregateWindow(to - from) : aggregateWindow.Value;
 
         var macFilter = string.Join(" or ", modules.Select(m =>
-            $@"(r.device_mac == ""{NormalizeMac(m.DeviceMac)}"" and r.port_name == ""{SanitizeFluxString(m.PortName)}"")"));
+            $@"(r.device_mac == {FluxLiteral.Quote(NormalizeMac(m.DeviceMac))} and r.port_name == {FluxLiteral.Quote(m.PortName)})"));
 
         var aggregateLine = raw ? "" : $@"  |> aggregateWindow(every: {ToFluxDuration(window)}, fn: mean, createEmpty: false)
 ";
         var flux = $@"
-from(bucket: ""{_longtermBucket}"")
+from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""sfp"")
   |> filter(fn: (r) => {macFilter})
@@ -3079,6 +4238,49 @@ from(bucket: ""{_longtermBucket}"")
         public long? GemTxFrames { get; set; }
         public long? GemTxIdleFrames { get; set; }
         public long? GemRxFrames { get; set; }
+        public long? GemRxIdleFrames { get; set; }
+        public long? DsSuperframe { get; set; }
+        public long? DsSuperframeSampled { get; set; }
+        public long? GemRxBytes { get; set; }
+        public double? OltLaunchPowerDbm { get; set; }
+        public long? OdnClass { get; set; }
+        public long? ReachExtender { get; set; }
+        public double? PathLossDb { get; set; }
+        public long? AllocTotal { get; set; }
+        public double? BiasMa { get; set; }
+        public double? BiasWarnHighMa { get; set; }
+        public long? TransceiverAlarmCount { get; set; }
+        public string? TransceiverAlarms { get; set; }
+        public long? FecCorrectedBits { get; set; }
+        public long? OmciRxFrames { get; set; }
+        public long? MibDataSync { get; set; }
+        public long? OmciUp { get; set; }
+        public long? OmciServices { get; set; }
+        public long? PloamRequestKey { get; set; }
+        public long? PloamKeySwitch { get; set; }
+        public long? PloamRangingTime { get; set; }
+        public long? TrafficPirBytesPerSecond { get; set; }
+        public long? TrafficCirBytesPerSecond { get; set; }
+        public long? HostLinkUp { get; set; }
+        public long? EqdBits { get; set; }
+        public double? PonIdAgeSeconds { get; set; }
+        public double? CpuBusySeconds { get; set; }
+        public double? CpuTotalSeconds { get; set; }
+        public double? OntTxPowerDbm { get; set; }
+        public double? OntTemperatureC { get; set; }
+        public long? GemTxBytes { get; set; }
+        public long? UsBursts { get; set; }
+        public long? UsDbru { get; set; }
+        public double? O5Seconds { get; set; }
+        public double? NotO5Seconds { get; set; }
+        public long? O5Exits { get; set; }
+        public long? LosEvents { get; set; }
+        public double? LosSeconds { get; set; }
+        public long? LofEvents { get; set; }
+        public double? LofSeconds { get; set; }
+        public long? OltDeactivations { get; set; }
+        public long? BootCount { get; set; }
+        public string? LastResetReason { get; set; }
         public long? GemRxDropped { get; set; }
         public long? AllocLost { get; set; }
         public long? HecCorrected { get; set; }
@@ -3089,37 +4291,52 @@ from(bucket: ""{_longtermBucket}"")
         public long? LanRxFcsErrors { get; set; }
         public long? LanTxDropEvents { get; set; }
         public long? LanBufferOverflow { get; set; }
+        public string? OltVendorId { get; set; }
+        public string? RegistrationStatus { get; set; }
+        public string? KeyExchangeStatus { get; set; }
+        public string? FirmwareVersion { get; set; }
+        public string? OltModel { get; set; }
+        public string? OltVersion { get; set; }
+        public bool? AesActive { get; set; }
+        public long? GemPortsEncrypted { get; set; }
+        /// <summary>GEM ports provisioned, the OMCI port included.</summary>
+        public long? GemPorts { get; set; }
     }
 
     /// <summary>
     /// Supplemental PON-layer time-series for a set of (device_mac, port_name) pairs.
     /// Only modules with an attached ONT config have these fields; others return no rows.
     /// Aggregates with fn: last (counters are cumulative - mean would distort deltas).
+    /// <paramref name="loadFieldsOnly"/> reads only what the PON load map needs.
     /// </summary>
     public async Task<Dictionary<string, List<PonSeriesPoint>>> QuerySfpPonByModulesAsync(
         IReadOnlyList<(string DeviceMac, string PortName)> modules,
         DateTime from,
         DateTime to,
         TimeSpan? aggregateWindow = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool loadFieldsOnly = false)
     {
         if (!IsConfigured) await ReconfigureAsync(ct);
         if (!IsConfigured || modules.Count == 0) return new Dictionary<string, List<PonSeriesPoint>>();
-        var window = aggregateWindow ?? PickAggregateWindow(to - from);
+        // TimeSpan.Zero requests RAW points, one per poll, as QueryOntAsync does.
+        var raw = aggregateWindow == TimeSpan.Zero;
+        var window = (aggregateWindow is null or { Ticks: 0 }) ? PickAggregateWindow(to - from) : aggregateWindow.Value;
 
         var macFilter = string.Join(" or ", modules.Select(m =>
-            $@"(r.device_mac == ""{NormalizeMac(m.DeviceMac)}"" and r.port_name == ""{SanitizeFluxString(m.PortName)}"")"));
+            $@"(r.device_mac == {FluxLiteral.Quote(NormalizeMac(m.DeviceMac))} and r.port_name == {FluxLiteral.Quote(m.PortName)})"));
 
-        var fieldFilter = PonFieldFilter;
+        var fieldFilter = loadFieldsOnly ? PonLoadFieldFilter : PonFieldFilter;
+        var aggregateLine = raw ? "" : $@"  |> aggregateWindow(every: {ToFluxDuration(window)}, fn: last, createEmpty: false)
+";
 
         var flux = $@"
-from(bucket: ""{_longtermBucket}"")
+from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""sfp"")
   |> filter(fn: (r) => {macFilter})
   |> filter(fn: (r) => {fieldFilter})
-  |> aggregateWindow(every: {ToFluxDuration(window)}, fn: last, createEmpty: false)
-  |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
+{aggregateLine}  |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
 ";
         var results = new Dictionary<string, List<PonSeriesPoint>>();
         await foreach (var record in QueryFluxAsync(flux, ct))
@@ -3145,6 +4362,135 @@ from(bucket: ""{_longtermBucket}"")
     }
 
     /// <summary>
+    /// One numeric field of one longterm device, as a mean per window: the Dashboard's access-network
+    /// sparklines. Every matching series is merged, so a modem that writes the field under both
+    /// network modes, or a module seen under two device types, still draws one line. Merged after the
+    /// window aggregate, in C#: grouping first defeats storage pushdown.
+    /// </summary>
+    /// <param name="tags">Exact tag matches that pick the device, e.g. ("cm_id", "3").</param>
+    /// <param name="excludeTags">Tag values to leave out, e.g. ("network_mode", "LTE") for a modem's NR leg.</param>
+    public async Task<List<(DateTime Time, double Value)>> QueryFieldSeriesAsync(
+        string measurement,
+        IReadOnlyList<(string Tag, string Value)> tags,
+        string field,
+        DateTime from,
+        DateTime to,
+        TimeSpan window,
+        IReadOnlyList<(string Tag, string Value)>? excludeTags = null,
+        CancellationToken ct = default)
+    {
+        if (!IsConfigured) await ReconfigureAsync(ct);
+        if (!IsConfigured || tags.Count == 0) return new List<(DateTime, double)>();
+
+        // device_mac is written normalized, so a caller's dashed or uppercase MAC is matched the same way.
+        var tagFilter = string.Join(" and ", tags.Select(t =>
+            $@"r.{SanitizeFluxIdentifier(t.Tag)} == {FluxLiteral.Quote(t.Tag == "device_mac" ? NormalizeMac(t.Value) : t.Value)}"));
+        foreach (var t in excludeTags ?? [])
+            tagFilter += $@" and r.{SanitizeFluxIdentifier(t.Tag)} != {FluxLiteral.Quote(t.Value)}";
+        var flux = $@"
+from(bucket: {FluxLiteral.Quote(_longtermBucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == {FluxLiteral.Quote(measurement)} and r._field == {FluxLiteral.Quote(field)})
+  |> filter(fn: (r) => {tagFilter})
+  |> aggregateWindow(every: {ToFluxDuration(window)}, fn: mean, createEmpty: false)
+";
+        var rows = new List<(DateTime Time, double Value)>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+        {
+            if (AsDoubleOrNull(record.GetValue()) is double v && double.IsFinite(v)
+                && record.GetTimeInDateTime() is DateTime t)
+                rows.Add((ToUtc(t), v));
+        }
+        return MergeSeries(rows);
+    }
+
+    /// <summary>Window means of several series of one reading, merged into one: the mean per window, in time order.</summary>
+    private static List<(DateTime Time, double Value)> MergeSeries(IEnumerable<(DateTime Time, double Value)> rows) =>
+        rows.GroupBy(r => r.Time).Select(g => (g.Key, g.Average(r => r.Value))).OrderBy(r => r.Item1).ToList();
+
+    /// <summary>
+    /// Latency fields for a set of targets as per-target window means, one query for every Live View
+    /// latency tile (Gateway, ISP, Transit; RTT and loss). Each target's vantages and WANs are merged
+    /// after the window aggregate (grouping first defeats storage pushdown); combining targets the way
+    /// a tile does is the caller's. Fast bucket, windows stamped at their start.
+    /// </summary>
+    public async Task<Dictionary<(string TargetId, string Field), List<(DateTime Time, double Value)>>> QueryTargetFieldSeriesAsync(
+        IReadOnlyList<string> targetIds,
+        IReadOnlyList<string> fields,
+        DateTime from,
+        DateTime to,
+        TimeSpan window,
+        CancellationToken ct = default)
+    {
+        var results = new Dictionary<(string TargetId, string Field), List<(DateTime Time, double Value)>>();
+        if (!IsConfigured) await ReconfigureAsync(ct);
+        if (!IsConfigured || targetIds.Count == 0 || fields.Count == 0) return results;
+
+        var idFilter = string.Join(" or ", targetIds.Distinct(StringComparer.Ordinal)
+            .Select(id => $@"r.target_id == {FluxLiteral.Quote(id)}"));
+        var fieldFilter = string.Join(" or ", fields.Select(f => $@"r._field == {FluxLiteral.Quote(f)}"));
+        var flux = $@"
+from(bucket: {FluxLiteral.Quote(_bucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == ""latency"" and ({fieldFilter}))
+  |> filter(fn: (r) => {idFilter})
+  |> aggregateWindow(every: {ToFluxDuration(window)}, fn: mean, createEmpty: false, timeSrc: ""_start"")
+";
+        var raw = new Dictionary<(string TargetId, string Field), List<(DateTime Time, double Value)>>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+        {
+            if (AsDoubleOrNull(record.GetValue()) is not double v || !double.IsFinite(v)
+                || record.GetTimeInDateTime() is not DateTime t) continue;
+            var key = (record.GetValueByKey("target_id") as string ?? "", record.GetField() ?? "");
+            if (!raw.TryGetValue(key, out var list)) raw[key] = list = new();
+            list.Add((ToUtc(t), v));
+        }
+        foreach (var (key, list) in raw) results[key] = MergeSeries(list);
+        return results;
+    }
+
+    /// <summary>
+    /// Several device_health fields of one device as window means, one query for Live View's
+    /// gateway CPU, memory, and temperature tiles. A device seen under two device types is merged
+    /// after the window aggregate. Fast bucket.
+    /// </summary>
+    public async Task<Dictionary<string, List<(DateTime Time, double Value)>>> QueryDeviceHealthFieldSeriesAsync(
+        string deviceMac,
+        IReadOnlyList<string> fields,
+        DateTime from,
+        DateTime to,
+        TimeSpan window,
+        CancellationToken ct = default)
+    {
+        var results = new Dictionary<string, List<(DateTime Time, double Value)>>();
+        if (!IsConfigured) await ReconfigureAsync(ct);
+        if (!IsConfigured || string.IsNullOrEmpty(deviceMac) || fields.Count == 0) return results;
+
+        var fieldFilter = string.Join(" or ", fields.Select(f => $@"r._field == {FluxLiteral.Quote(f)}"));
+        var flux = $@"
+from(bucket: {FluxLiteral.Quote(_bucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == ""device_health"" and ({fieldFilter}))
+  |> filter(fn: (r) => r.device_mac == {FluxLiteral.Quote(NormalizeMac(deviceMac))})
+  |> aggregateWindow(every: {ToFluxDuration(window)}, fn: mean, createEmpty: false)
+";
+        var raw = new Dictionary<string, List<(DateTime Time, double Value)>>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+        {
+            if (AsDoubleOrNull(record.GetValue()) is not double v || !double.IsFinite(v)
+                || record.GetTimeInDateTime() is not DateTime t) continue;
+            var field = record.GetField() ?? "";
+            if (!raw.TryGetValue(field, out var list)) raw[field] = list = new();
+            list.Add((ToUtc(t), v));
+        }
+        foreach (var (field, list) in raw) results[field] = MergeSeries(list);
+        return results;
+    }
+    /// <summary>A tag name for a Flux record member: letters, digits, and underscores only.</summary>
+    private static string SanitizeFluxIdentifier(string name) =>
+        new(name.Where(c => char.IsAsciiLetterOrDigit(c) || c == '_').ToArray());
+
+    /// <summary>
     /// Query cellular modem signal metrics over time. Groups by modem_id + network_mode
     /// so LTE and NR5G are separate series (important for NSA dual-connectivity).
     /// Reads from the longterm bucket.
@@ -3161,11 +4507,11 @@ from(bucket: ""{_longtermBucket}"")
         var window = aggregateWindow ?? PickAggregateWindow(to - from);
 
         var modemFilter = !string.IsNullOrEmpty(modemId)
-            ? $@"|> filter(fn: (r) => r.modem_id == ""{SanitizeFluxString(modemId)}"")"
+            ? $@"|> filter(fn: (r) => r.modem_id == {FluxLiteral.Quote(modemId)})"
             : "";
 
         var flux = $@"
-from(bucket: ""{_longtermBucket}"")
+from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""cellular"")
   {modemFilter}
@@ -3230,19 +4576,19 @@ from(bucket: ""{_longtermBucket}"")
         var window = aggregateWindow ?? PickAggregateWindow(to - from);
 
         var cmFilter = !string.IsNullOrEmpty(cmId)
-            ? $@"|> filter(fn: (r) => r.cm_id == ""{SanitizeFluxString(cmId)}"")"
+            ? $@"|> filter(fn: (r) => r.cm_id == {FluxLiteral.Quote(cmId)})"
             : "";
 
         var winDur = ToFluxDuration(window);
         var flux = $@"
-gauges = from(bucket: ""{_longtermBucket}"")
+gauges = from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""cable_modem"")
   {cmFilter}
   |> filter(fn: (r) => r._field == ""ds_power_avg_dbmv"" or r._field == ""ds_snr_avg_db"" or r._field == ""us_power_avg_dbmv"" or r._field == ""locked_ds_channels"" or r._field == ""locked_us_channels"")
   |> aggregateWindow(every: {winDur}, fn: last, createEmpty: false)
 
-deltas = from(bucket: ""{_longtermBucket}"")
+deltas = from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""cable_modem"")
   {cmFilter}
@@ -3298,26 +4644,26 @@ union(tables: [gauges, deltas])
         var window = aggregateWindow ?? PickAggregateWindow(to - from);
 
         var idFilter = !string.IsNullOrEmpty(starlinkId)
-            ? $@"|> filter(fn: (r) => r.starlink_id == ""{SanitizeFluxString(starlinkId)}"")"
+            ? $@"|> filter(fn: (r) => r.starlink_id == {FluxLiteral.Quote(starlinkId)})"
             : "";
 
         var winDur = ToFluxDuration(window);
         var flux = $@"
-gauges = from(bucket: ""{_longtermBucket}"")
+gauges = from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""starlink"")
   {idFilter}
   |> filter(fn: (r) => r._field == ""power_in_avg_w"" or r._field == ""ping_drop_rate_avg"" or r._field == ""fraction_obstructed"" or r._field == ""eth_speed_mbps"" or r._field == ""uptime_s"" or r._field == ""gps_sats"" or r._field == ""alignment_offset_deg"" or r._field == ""alert_count"")
   |> aggregateWindow(every: {winDur}, fn: last, createEmpty: false)
 
-peaks = from(bucket: ""{_longtermBucket}"")
+peaks = from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""starlink"")
   {idFilter}
   |> filter(fn: (r) => r._field == ""power_in_max_w"" or r._field == ""ping_drop_rate_max"")
   |> aggregateWindow(every: {winDur}, fn: max, createEmpty: false)
 
-deltas = from(bucket: ""{_longtermBucket}"")
+deltas = from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""starlink"")
   {idFilter}
@@ -3364,7 +4710,8 @@ union(tables: [gauges, peaks, deltas])
 
     /// <summary>
     /// Query external ONT metrics over a time range.
-    /// Returns dict keyed by ont_id.
+    /// Returns dict keyed by ont_id. <paramref name="ponLoadOnly"/> reads only the PON fields the
+    /// PON load map needs, and no DDM fields.
     /// </summary>
     public async Task<Dictionary<string, List<OntPoint>>> QueryOntAsync(
         DateTime from,
@@ -3372,8 +4719,10 @@ union(tables: [gauges, peaks, deltas])
         string? ontId = null,
         TimeSpan? aggregateWindow = null,
         bool includePon = false,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool ponLoadOnly = false)
     {
+        if (ponLoadOnly) includePon = true;
         if (!IsConfigured) await ReconfigureAsync(ct);
         if (!IsConfigured) return new Dictionary<string, List<OntPoint>>();
         // TimeSpan.Zero requests RAW points so ISP Health gets per-poll FEC/BIP deltas comparable to
@@ -3382,7 +4731,7 @@ union(tables: [gauges, peaks, deltas])
         var window = (aggregateWindow is null or { Ticks: 0 }) ? PickAggregateWindow(to - from) : aggregateWindow.Value;
 
         var ontFilter = !string.IsNullOrEmpty(ontId)
-            ? $@"|> filter(fn: (r) => r.ont_id == ""{SanitizeFluxString(ontId)}"")"
+            ? $@"|> filter(fn: (r) => r.ont_id == {FluxLiteral.Quote(ontId)})"
             : "";
 
         var aggregateLine = raw ? "" : $@"  |> aggregateWindow(every: {ToFluxDuration(window)}, fn: last, createEmpty: false)
@@ -3393,9 +4742,10 @@ union(tables: [gauges, peaks, deltas])
         {
             "rx_power_dbm", "tx_power_dbm", "temperature_c", "voltage_v", "bias_ma",
             "fec_errors", "bip_errors", "pon_link_status", "link_uptime_seconds",
-        }.Select(f => $@"r._field == ""{f}""")) + (includePon ? $" or {PonFieldFilter}" : "");
+        }.Select(f => $@"r._field == {FluxLiteral.Quote(f)}")) + (includePon ? $" or {PonFieldFilter}" : "");
+        if (ponLoadOnly) ontFieldFilter = PonLoadFieldFilter;
         var flux = $@"
-from(bucket: ""{_longtermBucket}"")
+from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""ont"")
   {ontFilter}
@@ -3507,13 +4857,13 @@ from(bucket: ""{_longtermBucket}"")
         var flux = $@"import ""date""
 import ""math""
 
-means = from(bucket: ""{_bucket}"")
+means = from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""wifi_client"")
   |> filter(fn: (r) => r._field == ""tx_rate_kbps"" or r._field == ""tx_throughput_bps"" or r._field == ""rx_throughput_bps"" or r._field == ""signal_dbm"" or r._field == ""nss"")
   |> aggregateWindow(every: {ClientRateWindowEvery}, fn: mean, createEmpty: false)
 
-chan = from(bucket: ""{_bucket}"")
+chan = from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""wifi_client"")
   |> filter(fn: (r) => r._field == ""channel"" or r._field == ""channel_width"")
@@ -3604,9 +4954,9 @@ union(tables: [means, chan])
         // A port-tagged wired row with no rate is kept: the console's per-client counters move
         // every few minutes, so a quiet wired client's only regular row is that one, and it is
         // what says the client was on the port at the instant.
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
-  |> filter(fn: (r) => r._measurement == ""{measurement}"")
+  |> filter(fn: (r) => r._measurement == {FluxLiteral.Quote(measurement)})
   |> filter(fn: (r) => r._field == ""tx_throughput_bps"" or r._field == ""rx_throughput_bps"" or r._field == ""client_mac"" or r._field == ""signal_dbm"" or r._field == ""tx_rate_kbps"" or r._field == ""rx_rate_kbps"" or r._field == ""client_name"")
   |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
   |> filter(fn: (r) => (exists r.tx_throughput_bps and r.tx_throughput_bps > 0.0) or (exists r.rx_throughput_bps and r.rx_throughput_bps > 0.0) or exists r.signal_dbm or (exists r.port and exists r.client_mac))";
@@ -3657,10 +5007,11 @@ union(tables: [means, chan])
     /// 2: per-source differencing for wireless counters and zero-read rejection for ports.
     /// 3: the sample after a 32-bit read is dropped by the hc_counters flip, not by a speed cap.
     /// 4: Wi-Fi counters zero negative deltas instead of skipping them, so a roam-back counts.
+    /// 5: Wi-Fi rows tag client_mac; before it, clients sharing a radio overwrote one another's hour.
     /// The port fall-detection rework deliberately shipped without a bump: re-rolling every
     /// site's history was not worth the load for LAN-only undercounts.
     /// </summary>
-    public const int RollupVersion = 4;
+    public const int RollupVersion = 5;
 
     // A rollup row a reader may count: built at the current version. An hour rolled the old way
     // reads as empty until the rollup service rebuilds it (newest first, within minutes for a day),
@@ -3713,12 +5064,12 @@ union(tables: [means, chan])
     {
         if (!IsConfigured) return Array.Empty<ByteUsagePoint>();
         var mac = NormalizeMac(clientMac);
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""wifi_client"")
   |> filter(fn: (r) => r._field == ""client_mac"" or r._field == ""tx_bytes"" or r._field == ""rx_bytes"" {WifiCounterSourceFields})
   |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
-  |> filter(fn: (r) => r.client_mac == ""{mac}"" and exists r.tx_bytes and exists r.rx_bytes)
+  |> filter(fn: (r) => r.client_mac == {FluxLiteral.Quote(mac)} and exists r.tx_bytes and exists r.rx_bytes)
   {WifiCounterSourceColumn}
   |> group(columns: [""src""])
   |> sort(columns: [""_time""])
@@ -3747,11 +5098,11 @@ union(tables: [means, chan])
     {
         if (!IsConfigured || ifNames.Count == 0) return Array.Empty<ByteUsagePoint>();
         var mac = NormalizeMac(deviceMac);
-        var ifFilter = string.Join(" or ", ifNames.Select(n => $@"r.if_name == ""{n.Replace("\"", "")}"""));
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var ifFilter = string.Join(" or ", ifNames.Select(n => $@"r.if_name == {FluxLiteral.Quote(n)}"));
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""interface_counters"")
-  |> filter(fn: (r) => r.device_mac == ""{mac}"")
+  |> filter(fn: (r) => r.device_mac == {FluxLiteral.Quote(mac)})
   |> filter(fn: (r) => {ifFilter})
   |> filter(fn: (r) => r._field == ""bytes_in"" or r._field == ""bytes_out"")
   |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
@@ -3809,13 +5160,14 @@ union(tables: [means, chan])
     // per client per hour to the longterm bucket, as added fields on the existing measurements:
     // wifi_client carries tx_bytes_1h / rx_bytes_1h (same frame as tx_bytes: AP to client),
     // interface_counters carries bytes_in_1h / bytes_out_1h. Written at the hour start, so a re-run
-    // overwrites rather than double counts.
+    // overwrites rather than double counts. A Wi-Fi row tags client_mac (a field in the raw rows):
+    // every client on one radio shares that timestamp, so without the tag they are one point.
 
     /// <summary>Rolls one hour of every wireless client's counters into the longterm bucket.</summary>
     public async Task<int> RollupWifiClientUsageHourAsync(DateTime hourStart, CancellationToken ct = default)
     {
         if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket)) return 0;
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(hourStart - RollupLeadIn)}, stop: {ToFluxInstant(hourStart.AddHours(1))})
   |> filter(fn: (r) => r._measurement == ""wifi_client"")
   |> filter(fn: (r) => r._field == ""client_mac"" or r._field == ""tx_bytes"" or r._field == ""rx_bytes"" {WifiCounterSourceFields})
@@ -3836,7 +5188,7 @@ union(tables: [means, chan])
             var point = PointData.Measurement("wifi_client")
                 .Tag("device_mac", total.DeviceMac ?? "")
                 .Tag("band", total.Band ?? "")
-                .Field("client_mac", mac)
+                .Tag("client_mac", mac)
                 .Field("tx_bytes_1h", total.ToClientBytes)
                 .Field("rx_bytes_1h", total.FromClientBytes)
                 .Field("rollup_v", (long)RollupVersion)
@@ -3880,7 +5232,7 @@ union(tables: [means, chan])
     public async Task<int> RollupPortUsageHourAsync(DateTime hourStart, CancellationToken ct = default)
     {
         if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket)) return 0;
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(hourStart - RollupLeadIn)}, stop: {ToFluxInstant(hourStart.AddHours(1))})
   |> filter(fn: (r) => r._measurement == ""interface_counters"")
   |> filter(fn: (r) => r._field == ""bytes_in"" or r._field == ""bytes_out"")
@@ -3928,7 +5280,7 @@ union(tables: [means, chan])
     public async Task<DateTime?> QueryLastUsageRollupHourAsync(int minVersion = 0, CancellationToken ct = default)
     {
         if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket)) return null;
-        var flux = $@"from(bucket: ""{_longtermBucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: -400d)
   |> filter(fn: (r) => r._measurement == ""wifi_client"" or r._measurement == ""interface_counters"")
   {RollupHourFilter(minVersion)}
@@ -3951,7 +5303,7 @@ union(tables: [means, chan])
     public async Task<DateTime?> QueryFirstUsageRollupHourAsync(int minVersion = 0, CancellationToken ct = default)
     {
         if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket)) return null;
-        var flux = $@"from(bucket: ""{_longtermBucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: -400d)
   |> filter(fn: (r) => r._measurement == ""wifi_client"" or r._measurement == ""interface_counters"")
   {RollupHourFilter(minVersion)}
@@ -3966,18 +5318,38 @@ union(tables: [means, chan])
         return null;
     }
 
+    /// <summary>
+    /// Whether the current-version rollup reaches back to <paramref name="at"/>: a row within the
+    /// hour after it. The rollup fills contiguously newest first, so this answers what
+    /// <see cref="QueryFirstUsageRollupHourAsync"/> would without scanning its whole history.
+    /// </summary>
+    public async Task<bool> UsageRollupReachesAsync(DateTime at, CancellationToken ct = default)
+    {
+        if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket)) return false;
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_longtermBucket)})
+  |> range(start: {ToFluxInstant(at)}, stop: {ToFluxInstant(at.AddHours(1).AddSeconds(1))})
+  |> filter(fn: (r) => r._measurement == ""wifi_client"" or r._measurement == ""interface_counters"")
+  {RollupHourFilter(RollupVersion)}
+  |> keep(columns: [""_time""])
+  |> group()
+  |> limit(n: 1)";
+        await foreach (var _ in QueryFluxAsync(flux, ct))
+            return true;
+        return false;
+    }
+
     /// <summary>A wireless client's rolled-up bytes per hour from the longterm bucket.</summary>
     public async Task<IReadOnlyList<ByteUsagePoint>> QueryWifiClientUsageRollupAsync(
         string clientMac, DateTime from, DateTime to, CancellationToken ct = default)
     {
         if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket)) return Array.Empty<ByteUsagePoint>();
         var mac = NormalizeMac(clientMac);
-        var flux = $@"from(bucket: ""{_longtermBucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
-  |> filter(fn: (r) => r._measurement == ""wifi_client"")
-  |> filter(fn: (r) => r._field == ""client_mac"" or r._field == ""tx_bytes_1h"" or r._field == ""rx_bytes_1h"" or r._field == ""rollup_v"")
+  |> filter(fn: (r) => r._measurement == ""wifi_client"" and r.client_mac == {FluxLiteral.Quote(mac)})
+  |> filter(fn: (r) => r._field == ""tx_bytes_1h"" or r._field == ""rx_bytes_1h"" or r._field == ""rollup_v"")
   |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
-  |> filter(fn: (r) => r.client_mac == ""{mac}"" and exists r.tx_bytes_1h and {RollupRowCurrent})
+  |> filter(fn: (r) => exists r.tx_bytes_1h and {RollupRowCurrent})
   |> group(columns: [""_time""])
   |> reduce(fn: (r, accumulator) => ({{to: accumulator.to + r.tx_bytes_1h, from: accumulator.from + r.rx_bytes_1h}}), identity: {{to: 0, from: 0}})
   |> group()
@@ -3991,11 +5363,11 @@ union(tables: [means, chan])
     {
         if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket) || ifNames.Count == 0) return Array.Empty<ByteUsagePoint>();
         var mac = NormalizeMac(deviceMac);
-        var ifFilter = string.Join(" or ", ifNames.Select(n => $@"r.if_name == ""{n.Replace("\"", "")}"""));
-        var flux = $@"from(bucket: ""{_longtermBucket}"")
+        var ifFilter = string.Join(" or ", ifNames.Select(n => $@"r.if_name == {FluxLiteral.Quote(n)}"));
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""interface_counters"")
-  |> filter(fn: (r) => r.device_mac == ""{mac}"")
+  |> filter(fn: (r) => r.device_mac == {FluxLiteral.Quote(mac)})
   |> filter(fn: (r) => {ifFilter})
   |> filter(fn: (r) => r._field == ""bytes_in_1h"" or r._field == ""bytes_out_1h"" or r._field == ""rollup_v"")
   |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
@@ -4033,7 +5405,7 @@ union(tables: [means, chan])
         DateTime from, DateTime to, CancellationToken ct = default)
     {
         if (!IsConfigured) return Array.Empty<ClientByteTotal>();
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""wifi_client"")
   |> filter(fn: (r) => r._field == ""client_mac"" or r._field == ""tx_bytes"" or r._field == ""rx_bytes"" {WifiCounterSourceFields})
@@ -4057,7 +5429,7 @@ union(tables: [means, chan])
     {
         if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket))
             return new UsageRollup<ClientByteTotal>(Array.Empty<ClientByteTotal>(), null, null);
-        var flux = $@"from(bucket: ""{_longtermBucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""wifi_client"")
   |> filter(fn: (r) => r._field == ""client_mac"" or r._field == ""tx_bytes_1h"" or r._field == ""rx_bytes_1h"" or r._field == ""rollup_v"")
@@ -4087,7 +5459,7 @@ union(tables: [means, chan])
         // seconds hands this half a million points per field for a two-hour top-up, and a total
         // over a window needs only the endpoints. Costs the opening minute of each interface
         // (the bytes before its first kept sample), a few tenths of a percent on a day.
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""interface_counters"")
   |> filter(fn: (r) => r._field == ""bytes_in"" or r._field == ""bytes_out"")
@@ -4112,7 +5484,7 @@ union(tables: [means, chan])
     {
         if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket))
             return new UsageRollup<PortByteTotal>(Array.Empty<PortByteTotal>(), null, null);
-        var flux = $@"from(bucket: ""{_longtermBucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""interface_counters"")
   |> filter(fn: (r) => r._field == ""bytes_in_1h"" or r._field == ""bytes_out_1h"" or r._field == ""rollup_v"")
@@ -4141,7 +5513,7 @@ union(tables: [means, chan])
         var decimate = to - from > TimeSpan.FromHours(6)
             ? "\n  |> aggregateWindow(every: 15m, fn: last, createEmpty: false)"
             : "";
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""wired_client"")
   |> filter(fn: (r) => exists r.port)
@@ -4180,7 +5552,7 @@ union(tables: [means, chan])
         var decimate = to - from > TimeSpan.FromHours(6)
             ? "\n  |> aggregateWindow(every: 15m, fn: last, createEmpty: false)"
             : "";
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""wired_client"")
   |> filter(fn: (r) => exists r.port)
@@ -4217,11 +5589,11 @@ union(tables: [means, chan])
         if (!IsConfigured) return null;
         var mac = NormalizeMac(clientMac);
         if (mac.Length == 0) return null;
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""wired_client"")
   |> filter(fn: (r) => exists r.port)
-  |> filter(fn: (r) => r._field == ""client_mac"" and r._value == ""{mac}"")
+  |> filter(fn: (r) => r._field == ""client_mac"" and r._value == {FluxLiteral.Quote(mac)})
   |> group(columns: [""device_mac"", ""port""])
   |> count()";
         (string Device, int Port, long Samples)? best = null;
@@ -4279,9 +5651,9 @@ union(tables: [means, chan])
     /// <summary>The oldest and newest hours a rollup field carries in the window; nulls when none.</summary>
     private async Task<(DateTime? First, DateTime? Last)> RollupHourSpanAsync(string measurement, string field, DateTime from, DateTime to, CancellationToken ct)
     {
-        var flux = $@"span = from(bucket: ""{_longtermBucket}"")
+        var flux = $@"span = from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
-  |> filter(fn: (r) => r._measurement == ""{measurement}"" and r._field == ""rollup_v"" and r._value >= {RollupVersion})
+  |> filter(fn: (r) => r._measurement == {FluxLiteral.Quote(measurement)} and r._field == ""rollup_v"" and r._value >= {RollupVersion})
   |> keep(columns: [""_time"", ""_value""])
   |> group()
   |> sort(columns: [""_time""])
@@ -4308,12 +5680,12 @@ span |> last() |> yield(name: ""last"")";
     {
         if (!IsConfigured) return Array.Empty<ClientThroughputPoint>();
         var mac = NormalizeMac(clientMac);
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
-  |> filter(fn: (r) => r._measurement == ""{measurement}"")
+  |> filter(fn: (r) => r._measurement == {FluxLiteral.Quote(measurement)})
   |> filter(fn: (r) => r._field == ""tx_throughput_bps"" or r._field == ""rx_throughput_bps"" or r._field == ""client_mac"")
   |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
-  |> filter(fn: (r) => r.client_mac == ""{mac}"")";
+  |> filter(fn: (r) => r.client_mac == {FluxLiteral.Quote(mac)})";
 
         var results = new List<ClientThroughputPoint>();
         await foreach (var record in QueryFluxAsync(flux, ct))
@@ -4333,6 +5705,127 @@ span |> last() |> yield(name: ""last"")";
         return results;
     }
 
+    /// <summary>One window of a client's throughput, toward (tx) and from (rx) the client: the mean of
+    /// its samples and the highest one. Raw, not smoothed: a smoothed peak flattens the short
+    /// downloads and speed tests the peak exists to show.</summary>
+    public sealed record ThroughputWindowPoint(DateTime Time, double TxMeanBps, double RxMeanBps, double TxPeakBps, double RxPeakBps);
+
+    /// <summary>
+    /// One client's throughput per window from <c>wifi_client</c> or <c>wired_client</c>, mean and peak.
+    /// client_mac is a field, so the pivot that pairs a reading with its client must run before any
+    /// aggregation. A first read of the client_mac field alone finds the series (AP and band, or
+    /// switch) the client was on, and the pivot runs over those only: several times faster than
+    /// pivoting the whole measurement on a busy site. A point with no rate is an idle client: zero.
+    /// </summary>
+    public async Task<IReadOnlyList<ThroughputWindowPoint>> QueryClientThroughputWindowsAsync(
+        string measurement, string clientMac, DateTime from, DateTime to, TimeSpan window, CancellationToken ct = default)
+    {
+        if (!IsConfigured) return Array.Empty<ThroughputWindowPoint>();
+        var mac = NormalizeMac(clientMac);
+        var range = $"range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})";
+        var seriesFlux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
+  |> {range}
+  |> filter(fn: (r) => r._measurement == {FluxLiteral.Quote(measurement)} and r._field == ""client_mac"")
+  |> filter(fn: (r) => r._value == {FluxLiteral.Quote(mac)})
+  |> first()
+  |> keep(columns: [""device_mac"", ""band""])";
+        var series = new HashSet<string>();
+        await foreach (var record in QueryFluxAsync(seriesFlux, ct))
+        {
+            if (record.GetValueByKey("device_mac") is not string device || device.Length == 0) continue;
+            series.Add(record.GetValueByKey("band") is string band && band.Length > 0
+                ? $@"(r.device_mac == {FluxLiteral.Quote(device)} and r.band == {FluxLiteral.Quote(band)})"
+                : $@"r.device_mac == {FluxLiteral.Quote(device)}");
+        }
+        if (series.Count == 0) return Array.Empty<ThroughputWindowPoint>();
+
+        // Not experimental.unpivot: user InfluxDB versions vary. Flux shares the pivoted base
+        // between the four branches, so this costs about one pass.
+        var every = ToFluxDuration(window);
+        var flux = $@"base = from(bucket: {FluxLiteral.Quote(_bucket)})
+  |> {range}
+  |> filter(fn: (r) => r._measurement == {FluxLiteral.Quote(measurement)})
+  |> filter(fn: (r) => {string.Join(" or ", series)})
+  |> filter(fn: (r) => r._field == ""tx_throughput_bps"" or r._field == ""rx_throughput_bps"" or r._field == ""client_mac"")
+  |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
+  |> filter(fn: (r) => r.client_mac == {FluxLiteral.Quote(mac)})
+  |> group()
+tx = base |> map(fn: (r) => ({{_time: r._time, _value: if exists r.tx_throughput_bps then float(v: r.tx_throughput_bps) else 0.0}}))
+rx = base |> map(fn: (r) => ({{_time: r._time, _value: if exists r.rx_throughput_bps then float(v: r.rx_throughput_bps) else 0.0}}))
+union(tables: [
+  tx |> aggregateWindow(every: {every}, fn: mean, createEmpty: false, timeSrc: ""_start"") |> set(key: ""s"", value: ""tx_mean""),
+  tx |> aggregateWindow(every: {every}, fn: max, createEmpty: false, timeSrc: ""_start"") |> set(key: ""s"", value: ""tx_max""),
+  rx |> aggregateWindow(every: {every}, fn: mean, createEmpty: false, timeSrc: ""_start"") |> set(key: ""s"", value: ""rx_mean""),
+  rx |> aggregateWindow(every: {every}, fn: max, createEmpty: false, timeSrc: ""_start"") |> set(key: ""s"", value: ""rx_max"")])";
+        return await ReadThroughputWindowsAsync(flux, ct);
+    }
+
+    /// <summary>
+    /// A switch port's rates per window, mean and peak, stated toward (out) and from (in) the client.
+    /// Aggregated straight off the tag filter, so storage does the windowing. The port's interface
+    /// names and its SNMP and console series are alternative sources for one link, so where two
+    /// cover the same window the larger reading stands rather than their sum.
+    ///
+    /// Each window is capped at the link's speed (its highest speed_bps there). A rate is a counter
+    /// delta over the poll interval, and a switch that refreshes its counters slower than the poll
+    /// stores single samples well past line rate. Wi-Fi rates need no cap: none exceeds its PHY.
+    /// </summary>
+    public async Task<IReadOnlyList<ThroughputWindowPoint>> QueryInterfaceRateWindowsAsync(
+        string deviceMac, IReadOnlyCollection<string> ifNames, DateTime from, DateTime to, TimeSpan window, CancellationToken ct = default)
+    {
+        if (!IsConfigured || ifNames.Count == 0) return Array.Empty<ThroughputWindowPoint>();
+        var mac = NormalizeMac(deviceMac);
+        var ifFilter = string.Join(" or ", ifNames.Select(n => $@"r.if_name == {FluxLiteral.Quote(n)}"));
+        var every = ToFluxDuration(window);
+        var port = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
+  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
+  |> filter(fn: (r) => r._measurement == ""interface_counters"" and r.device_mac == {FluxLiteral.Quote(mac)})
+  |> filter(fn: (r) => {ifFilter})";
+        var flux = $@"base = {port}
+  |> filter(fn: (r) => r._field == ""rate_out_bps"" or r._field == ""rate_in_bps"")
+speed = {port}
+  |> filter(fn: (r) => r._field == ""speed_bps"")
+union(tables: [
+  base |> aggregateWindow(every: {every}, fn: mean, createEmpty: false, timeSrc: ""_start"") |> map(fn: (r) => ({{r with s: if r._field == ""rate_out_bps"" then ""tx_mean"" else ""rx_mean""}})),
+  base |> aggregateWindow(every: {every}, fn: max, createEmpty: false, timeSrc: ""_start"") |> map(fn: (r) => ({{r with s: if r._field == ""rate_out_bps"" then ""tx_max"" else ""rx_max""}})),
+  speed |> aggregateWindow(every: {every}, fn: max, createEmpty: false, timeSrc: ""_start"") |> map(fn: (r) => ({{r with s: ""cap"", _value: float(v: r._value)}}))])";
+        return await ReadThroughputWindowsAsync(flux, ct);
+    }
+
+    /// <summary>Assembles rows tagged <c>s</c> = tx_mean / tx_max / rx_mean / rx_max into one point
+    /// per window. Several rows for one window and statistic (alternative series) keep the largest.
+    /// A <c>cap</c> row (link speed) bounds the window's figures; a window without one is uncapped.</summary>
+    private async Task<IReadOnlyList<ThroughputWindowPoint>> ReadThroughputWindowsAsync(string flux, CancellationToken ct)
+    {
+        var byTime = new Dictionary<DateTime, double[]>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+        {
+            var time = record.GetTimeInDateTime();
+            var value = AsDoubleOrNull(record.GetValueByKey("_value"));
+            if (time == null || value == null) continue;
+            var slot = (record.GetValueByKey("s") as string) switch
+            {
+                "tx_mean" => 0,
+                "rx_mean" => 1,
+                "tx_max" => 2,
+                "rx_max" => 3,
+                "cap" => 4,
+                _ => -1
+            };
+            if (slot < 0) continue;
+            var t = ToUtc(time.Value);
+            // [5] marks a window that has a rate at all: link speed alone (a port that is down) is no point.
+            if (!byTime.TryGetValue(t, out var v)) byTime[t] = v = new double[6];
+            v[slot] = Math.Max(v[slot], value.Value);
+            if (slot < 4) v[5] = 1;
+        }
+        double Cap(double[] v, int i) => v[4] > 0 ? Math.Min(v[i], v[4]) : v[i];
+        return byTime.Where(kv => kv.Value[5] > 0)
+            .OrderBy(kv => kv.Key)
+            .Select(kv => new ThroughputWindowPoint(kv.Key, Cap(kv.Value, 0), Cap(kv.Value, 1), Cap(kv.Value, 2), Cap(kv.Value, 3)))
+            .ToList();
+    }
+
     public async Task<IReadOnlyList<WifiClientHistoryPoint>> QueryWifiClientHistoryAsync(
         string apMac,
         string? band,
@@ -4347,12 +5840,12 @@ span |> last() |> yield(name: ""last"")";
         var ap = NormalizeMac(apMac);
 
         var fluxBuilder = new System.Text.StringBuilder();
-        fluxBuilder.AppendLine($@"from(bucket: ""{_bucket}"")");
+        fluxBuilder.AppendLine($@"from(bucket: {FluxLiteral.Quote(_bucket)})");
         fluxBuilder.AppendLine($@"  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})");
         fluxBuilder.AppendLine($@"  |> filter(fn: (r) => r._measurement == ""wifi_client"")");
-        fluxBuilder.AppendLine($@"  |> filter(fn: (r) => r.device_mac == ""{ap}"")");
+        fluxBuilder.AppendLine($@"  |> filter(fn: (r) => r.device_mac == {FluxLiteral.Quote(ap)})");
         if (!string.IsNullOrEmpty(band))
-            fluxBuilder.AppendLine($@"  |> filter(fn: (r) => r.band == ""{band.ToLowerInvariant()}"")");
+            fluxBuilder.AppendLine($@"  |> filter(fn: (r) => r.band == {FluxLiteral.Quote(band.ToLowerInvariant())})");
         // The fields we want pivoted into one row per timestamp.
         fluxBuilder.AppendLine(@"  |> filter(fn: (r) => r._field == ""signal_dbm"" or r._field == ""tx_throughput_bps"" or r._field == ""rx_throughput_bps"" or r._field == ""tx_rate_kbps"" or r._field == ""rx_rate_kbps"" or r._field == ""client_mac"")");
         fluxBuilder.AppendLine($@"  |> aggregateWindow(every: {ToFluxDuration(window)}, fn: last, createEmpty: false)");
@@ -4361,7 +5854,7 @@ span |> last() |> yield(name: ""last"")";
         if (!string.IsNullOrEmpty(clientMac))
         {
             var c = NormalizeMac(clientMac);
-            fluxBuilder.AppendLine($@"  |> filter(fn: (r) => r.client_mac == ""{c}"")");
+            fluxBuilder.AppendLine($@"  |> filter(fn: (r) => r.client_mac == {FluxLiteral.Quote(c)})");
         }
 
         var results = new List<WifiClientHistoryPoint>();
@@ -4441,7 +5934,7 @@ span |> last() |> yield(name: ""last"")";
         // client_mac is a field rather than a tag (cardinality control), so the pivot is what makes
         // a row readable at all, and filtering on a client can only happen after it.
         var builder = new System.Text.StringBuilder();
-        builder.AppendLine($@"from(bucket: ""{_bucket}"")");
+        builder.AppendLine($@"from(bucket: {FluxLiteral.Quote(_bucket)})");
         builder.AppendLine($@"  |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})");
         builder.AppendLine(@"  |> filter(fn: (r) => r._measurement == ""wifi_client"")");
         builder.AppendLine(@"  |> filter(fn: (r) => r._field == ""client_mac"" or r._field == ""signal_dbm"" or r._field == ""noise_dbm"" or r._field == ""rssi"" or r._field == ""tx_rate_kbps"" or r._field == ""rx_rate_kbps"" or r._field == ""tx_throughput_bps"" or r._field == ""rx_throughput_bps"" or r._field == ""channel"" or r._field == ""channel_width"" or r._field == ""satisfaction"" or r._field == ""nss"" or r._field == ""ccq"" or r._field == ""tx_retries"" or r._field == ""tx_attempts"" or r._field == ""latency_avg_ms"" or r._field == ""idle_seconds"")");
@@ -4450,7 +5943,7 @@ span |> last() |> yield(name: ""last"")";
         builder.AppendLine(@"  |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")");
         builder.AppendLine(@"  |> filter(fn: (r) => exists r.client_mac)");
         if (!string.IsNullOrEmpty(clientMac))
-            builder.AppendLine($@"  |> filter(fn: (r) => r.client_mac == ""{NormalizeMac(clientMac)}"")");
+            builder.AppendLine($@"  |> filter(fn: (r) => r.client_mac == {FluxLiteral.Quote(NormalizeMac(clientMac))})");
 
         var results = new List<WifiClientSamplePoint>();
         await foreach (var record in QueryFluxAsync(builder.ToString(), ct))
@@ -4511,7 +6004,7 @@ span |> last() |> yield(name: ""last"")";
     public async Task<int> RollupWifiClientDayAsync(DateTime dayStart, CancellationToken ct = default)
     {
         if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket)) return 0;
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(dayStart)}, stop: {ToFluxInstant(dayStart.AddDays(1))})
   |> filter(fn: (r) => r._measurement == ""wifi_client"")
   |> filter(fn: (r) => r._field == ""client_mac"" or r._field == ""channel_width"" or r._field == ""nss"" or r._field == ""channel"" or r._field == ""signal_dbm"" or r._field == ""tx_rate_kbps"" or r._field == ""rx_rate_kbps"")
@@ -4573,7 +6066,7 @@ span |> last() |> yield(name: ""last"")";
     private async Task<DateTime?> WifiClientDailyRollupEdgeAsync(string edge, CancellationToken ct)
     {
         if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket)) return null;
-        var flux = $@"from(bucket: ""{_longtermBucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: -400d)
   |> filter(fn: (r) => r._measurement == ""wifi_client_daily"" and r._field == ""rollup_v"" and r._value >= {WifiClientDailyRollupVersion})
   |> keep(columns: [""_time""])
@@ -4602,7 +6095,7 @@ span |> last() |> yield(name: ""last"")";
         var result = new Dictionary<string, IReadOnlyDictionary<string, int>>(StringComparer.OrdinalIgnoreCase);
         if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket)) return result;
 
-        var flux = $@"from(bucket: ""{_longtermBucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""wifi_client_daily"" and r._field == ""width_max"")
   |> group(columns: [""client_mac"", ""band""])
@@ -4634,7 +6127,7 @@ span |> last() |> yield(name: ""last"")";
         var bands = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase);
         if (!IsConfigured) return bands;
 
-        var flux = $@"from(bucket: ""{_bucket}"")
+        var flux = $@"from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""wifi_client"")
   |> filter(fn: (r) => r._field == ""client_mac"")
@@ -4673,8 +6166,7 @@ span |> last() |> yield(name: ""last"")";
             or InfluxDB.Client.Core.Exceptions.BadRequestException
             or InfluxDB.Client.Core.Exceptions.UnauthorizedException)
         {
-            _logger.LogWarning("InfluxDB query failed ({Error}) — check Settings > Monitoring", ex.Message);
-            _ = PersistHealthAsync(false, ex.Message, CancellationToken.None);
+            LogQueryFailure(ex);
             yield break;
         }
 
@@ -4786,9 +6278,23 @@ span |> last() |> yield(name: ""last"")";
             or InfluxDB.Client.Core.Exceptions.BadRequestException
             or InfluxDB.Client.Core.Exceptions.UnauthorizedException)
         {
-            _logger.LogWarning("InfluxDB query failed ({Error}) — check Settings > Monitoring", ex.Message);
-            _ = PersistHealthAsync(false, ex.Message, CancellationToken.None);
+            LogQueryFailure(ex);
         }
+    }
+
+    /// <summary>
+    /// Warns and stores the failure for Settings > Monitoring the first time within the interval;
+    /// a repeat logs at Debug and skips the database write, since the stored state already says so.
+    /// </summary>
+    private void LogQueryFailure(Exception ex)
+    {
+        if (!ShouldLogFailure(ex.Message))
+        {
+            _logger.LogDebug("InfluxDB query failed ({Error})", ex.Message);
+            return;
+        }
+        _logger.LogWarning("InfluxDB query failed ({Error}) — check Settings > Monitoring", ex.Message);
+        _ = PersistHealthAsync(false, ex.Message, CancellationToken.None);
     }
 
     /// <summary>
@@ -5129,7 +6635,7 @@ span |> last() |> yield(name: ""last"")";
         var targetFilter = "";
         if (enabledTargetIds != null && enabledTargetIds.Count > 0)
         {
-            var conditions = string.Join(" or ", enabledTargetIds.Select(id => $"r.target_id == \"{id}\""));
+            var conditions = string.Join(" or ", enabledTargetIds.Select(id => $"r.target_id == {FluxLiteral.Quote(id)}"));
             targetFilter = $"\n  |> filter(fn: (r) => {conditions})";
         }
 
@@ -5137,7 +6643,7 @@ span |> last() |> yield(name: ""last"")";
         // events in memory. The caller bounds the window to just before/after the current event
         // (via before/after), so the boundary event we want is fully inside the range.
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(rangeStart)}, stop: {ToFluxInstant(rangeStop)})
   |> filter(fn: (r) => r._measurement == ""latency"")
   |> filter(fn: (r) => r.target_type == ""accessisp"" or r.target_type == ""transit"" or r.target_type == ""internetservice"" or r.target_type == ""wan""){targetFilter}
@@ -5183,15 +6689,15 @@ from(bucket: ""{_bucket}"")
         var targetFilter = "";
         if (enabledTargetIds != null && enabledTargetIds.Count > 0)
         {
-            var conditions = string.Join(" or ", enabledTargetIds.Select(id => $"r.target_id == \"{id}\""));
+            var conditions = string.Join(" or ", enabledTargetIds.Select(id => $"r.target_id == {FluxLiteral.Quote(id)}"));
             targetFilter = $"\n  |> filter(fn: (r) => {conditions})";
         }
         var mac = NormalizeMac(gatewayMac);
-        var ifFilter = string.Join(" or ", wanIfNames.Select(n => $@"r.if_name == ""{SanitizeFluxString(n)}"""));
+        var ifFilter = string.Join(" or ", wanIfNames.Select(n => $@"r.if_name == {FluxLiteral.Quote(n)}"));
 
         var flux = $@"
 import ""join""
-loss = from(bucket: ""{_bucket}"")
+loss = from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(rangeStart)}, stop: {ToFluxInstant(rangeStop)})
   |> filter(fn: (r) => r._measurement == ""latency"")
   |> filter(fn: (r) => r.target_type == ""accessisp"" or r.target_type == ""transit"" or r.target_type == ""internetservice"" or r.target_type == ""wan""){targetFilter}
@@ -5201,10 +6707,10 @@ loss = from(bucket: ""{_bucket}"")
   |> group()
   |> keep(columns: [""_time"", ""_value"", ""target_id"", ""target_type""])
 
-load = from(bucket: ""{_bucket}"")
+load = from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(rangeStart)}, stop: {ToFluxInstant(rangeStop)})
   |> filter(fn: (r) => r._measurement == ""interface_counters"")
-  |> filter(fn: (r) => r.device_mac == ""{mac}"")
+  |> filter(fn: (r) => r.device_mac == {FluxLiteral.Quote(mac)})
   |> filter(fn: (r) => {ifFilter})
   |> filter(fn: (r) => r._field == ""rate_in_bps"" or r._field == ""rate_out_bps"")
   |> aggregateWindow(every: 1m, fn: max, createEmpty: false)
@@ -5245,11 +6751,11 @@ join.inner(left: loss, right: load, on: (l, r) => l._time == r._time, as: (l, r)
     {
         if (!IsConfigured) await ReconfigureAsync(ct);
         if (!IsConfigured || targetIds.Count == 0) return null;
-        var idFilter = string.Join(" or ", targetIds.Select(id => $@"r.target_id == ""{SanitizeFluxString(id)}"""));
+        var idFilter = string.Join(" or ", targetIds.Select(id => $@"r.target_id == {FluxLiteral.Quote(id)}"));
         // group() collapses every target's per-sample loss into one table so mean() is the pooled
         // average across the whole set, not per target.
         var flux = $@"
-from(bucket: ""{_bucket}"")
+from(bucket: {FluxLiteral.Quote(_bucket)})
   |> range(start: {ToFluxInstant(from)}, stop: {ToFluxInstant(to)})
   |> filter(fn: (r) => r._measurement == ""latency"")
   |> filter(fn: (r) => {idFilter})
@@ -5277,7 +6783,7 @@ from(bucket: ""{_bucket}"")
         var lookback = DateTime.UtcNow.AddDays(-7);
 
         var flux = $@"
-from(bucket: ""{_longtermBucket}"")
+from(bucket: {FluxLiteral.Quote(_longtermBucket)})
   |> range(start: {ToFluxInstant(lookback)})
   |> filter(fn: (r) => r._measurement == ""sfp"")
   |> filter(fn: (r) => r._field == ""temp_c"" or r._field == ""rx_power_dbm"")
@@ -5388,6 +6894,13 @@ from(bucket: ""{_longtermBucket}"")
         public string? PortId { get; init; }
         public double? RateInBps { get; init; }
         public double? RateOutBps { get; init; }
+        /// <summary>Negotiated link speed at this sample. Set by the raw query only.</summary>
+        public long? SpeedBps { get; init; }
+        /// <summary>
+        /// The console-reported link speed nearest this sample (gateways only). Set by the raw query
+        /// only. Prefer it over <see cref="SpeedBps"/>, which reads the switch conduit on a gateway.
+        /// </summary>
+        public int? LinkSpeedMbps { get; init; }
     }
 
     /// <summary>One interface's link state at one sample: ifOperStatus, 1 for up.</summary>
@@ -5425,6 +6938,8 @@ from(bucket: ""{_longtermBucket}"")
         public string PortId { get; init; } = "";
         public int? OperStatus { get; init; }
         public long? SpeedBps { get; init; }
+        /// <summary>Console-reported negotiated speed (gateways only); null where none was recorded.</summary>
+        public int? LinkSpeedMbps { get; init; }
         public double? RateInBps { get; init; }
         public double? RateOutBps { get; init; }
         public long? BytesIn { get; init; }
@@ -5577,38 +7092,57 @@ from(bucket: ""{_longtermBucket}"")
         if (!await _flushSemaphore.WaitAsync(0)) return;
         try
         {
-            var primary = new List<PointData>();
-            var longterm = new List<PointData>();
-            while (_writeBuffer.TryDequeue(out var buffered))
-            {
-                if (buffered.Longterm) longterm.Add(buffered.Point);
-                else primary.Add(buffered.Point);
-            }
-
-            if (primary.Count > 0 && _writeApi != null && !string.IsNullOrEmpty(_bucket))
-            {
-                await _writeApi.WritePointsAsync(primary, _bucket, _org);
-            }
-            if (longterm.Count > 0 && _writeApi != null && !string.IsNullOrEmpty(_longtermBucket))
-            {
-                await _writeApi.WritePointsAsync(longterm, _longtermBucket, _org);
-            }
-
-            if (primary.Count + longterm.Count > 0)
-            {
-                _logger.LogDebug(
-                    "Flushed {Primary} points to {Bucket}, {Longterm} to {LongtermBucket}",
-                    primary.Count, _bucket, longterm.Count, _longtermBucket);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to flush monitoring points to InfluxDB — points dropped");
+            await FlushBufferedPointsBestEffortAsync();
         }
         finally
         {
             _flushSemaphore.Release();
         }
+    }
+
+    // Caller must hold _flushSemaphore; neither flush helper acquires it.
+    private async Task FlushBufferedPointsBestEffortAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            await FlushBufferedPointsAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (InfluxDB.Client.Core.Exceptions.HttpException) when (ct.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(ct);
+        }
+        catch (Exception ex)
+        {
+            if (ShouldLogFailure(ex.Message))
+                _logger.LogError(ex, "Failed to flush monitoring points to InfluxDB — points dropped");
+            else
+                _logger.LogDebug("Failed to flush monitoring points to InfluxDB ({Error}) — points dropped", ex.Message);
+        }
+    }
+
+    private async Task FlushBufferedPointsAsync(CancellationToken ct = default)
+    {
+        var primary = new List<PointData>();
+        var longterm = new List<PointData>();
+        while (_writeBuffer.TryDequeue(out var buffered))
+        {
+            if (buffered.Longterm) longterm.Add(buffered.Point);
+            else primary.Add(buffered.Point);
+        }
+
+        if (primary.Count > 0 && _writeApi != null && !string.IsNullOrEmpty(_bucket))
+            await _writeApi.WritePointsAsync(primary, _bucket, _org, ct);
+        if (longterm.Count > 0 && _writeApi != null && !string.IsNullOrEmpty(_longtermBucket))
+            await _writeApi.WritePointsAsync(longterm, _longtermBucket, _org, ct);
+
+        if (primary.Count + longterm.Count > 0)
+            _logger.LogDebug(
+                "Flushed {Primary} points to {Bucket}, {Longterm} to {LongtermBucket}",
+                primary.Count, _bucket, longterm.Count, _longtermBucket);
     }
 
     private async Task RunFlushLoopAsync(CancellationToken ct)
@@ -5654,8 +7188,10 @@ from(bucket: ""{_longtermBucket}"")
         // them writes artificial 100% loss to InfluxDB.
         await DisposeClientAsync();
         _timerCts.Dispose();
+        _backfillCancellation.Dispose();
         _flushSemaphore.Dispose();
         _configLock.Dispose();
+        _speedTestMutationLock.Dispose();
         GC.SuppressFinalize(this);
     }
 
@@ -5670,6 +7206,7 @@ from(bucket: ""{_longtermBucket}"")
         }
         _client?.Dispose();
         _client = null;
+        _initialized = false;
         _writeApi = null;
         _rawQueryHttp?.Dispose();
         _rawQueryHttp = null;

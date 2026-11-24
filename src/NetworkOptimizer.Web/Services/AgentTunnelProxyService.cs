@@ -8,12 +8,12 @@ namespace NetworkOptimizer.Web.Services;
 
 /// <summary>
 /// Reaches TCP services inside an agent's site through the tunnel (SSH, the
-/// UniFi Console API). For each requested site-local host:port this service
-/// binds a loopback listener on the central server; every connection accepted
-/// there is multiplexed over the site's agent tunnel, where the agent dials
-/// the real host:port and pumps bytes both ways. Existing code paths (HTTP
-/// clients, SSH.NET) then just talk to 127.0.0.1:{proxyPort} - the proxying
-/// is invisible to them.
+/// UniFi Console API, device status pages). Every connection is multiplexed over
+/// the site's agent tunnel, where the agent dials the real host:port and pumps
+/// bytes both ways. Two ways in: a loopback listener per site-local host:port,
+/// for code that dials an address itself (SSH.NET, the console client), and
+/// <see cref="OpenStreamAsync"/>, a stream for any address, for device clients, which
+/// dial whatever address a device names, redirects included.
 /// </summary>
 public class AgentTunnelProxyService : IDisposable
 {
@@ -29,11 +29,15 @@ public class AgentTunnelProxyService : IDisposable
     // was guaranteed: a monitored device with a bogus address took its site's console offline.
     private static readonly TimeSpan OpenTimeout = TimeSpan.FromSeconds(8);
 
+    // How long after a site's tunnel drops a dial waits for it to re-register. Kept under the UniFi
+    // client's 15s request timeout, so a waited dial still has time to complete.
+    private static readonly TimeSpan ReconnectWait = TimeSpan.FromSeconds(8);
+
     // Past AgentTunnelConnection.StaleThreshold of silence the tunnel is treated
     // as black-holed and proxy opens are refused immediately instead of blocking
     // - well before the 90s server watchdog drops the dead tunnel.
 
-    // After an open to a site times out, fast-fail further opens instead of each
+    // After an open through an agent times out, fast-fail further opens instead of each
     // eating the full OpenTimeout. A page render (a site switch) fires a burst of
     // console + SSH opens; in the first ~45s of an outage - before the liveness
     // gate above can trip without false-failing a healthy tunnel - that burst
@@ -45,7 +49,8 @@ public class AgentTunnelProxyService : IDisposable
     // below - so a healthy tunnel is never held this long: its next heartbeat
     // (<=30s) advances LastMessageAt and lets the open through.
     private static readonly TimeSpan OpenBreakerHold = TimeSpan.FromSeconds(60);
-    private readonly ConcurrentDictionary<string, (DateTime Until, DateTime OpenedAtLastMsg)> _openBreaker = new();
+    // Keyed by agent: a timeout through one agent says nothing about another agent of the same site.
+    private readonly ConcurrentDictionary<int, (DateTime Until, DateTime OpenedAtLastMsg)> _openBreaker = new();
 
     private readonly AgentTunnelRegistry _registry;
     private readonly SiteConnectionRegistry _siteConnections;
@@ -104,15 +109,80 @@ public class AgentTunnelProxyService : IDisposable
         }
     }
 
+    /// <summary>
+    /// A connection to {host}:{port} inside the given site, as a stream, with no loopback listener.
+    /// The agent dials whatever address it is given, so a caller that follows a device's redirect
+    /// with this stays inside that site. Throws when the agent refuses or cannot open the target.
+    /// </summary>
+    public async Task<Stream> OpenStreamAsync(string siteSlug, string host, int port, CancellationToken ct)
+    {
+        var (callerSide, proxySide) = DuplexPipeStream.CreatePair();
+        (ProxyConnection? Connection, string? Error) opened;
+        try
+        {
+            opened = await OpenAsync(new ProxyTarget(siteSlug, host, port, IsConsole: false, LocalPort: null), proxySide, ct);
+        }
+        catch
+        {
+            await callerSide.DisposeAsync();
+            throw;
+        }
+
+        var (connection, error) = opened;
+        if (connection == null)
+        {
+            await callerSide.DisposeAsync();
+            throw new IOException($"{host}:{port} via the site's agent - {error}");
+        }
+
+        _ = PumpToAgentAsync(connection, _shutdown.Token);
+        return callerSide;
+    }
+
     private async Task HandleLocalConnectionAsync(ProxyListener listener, TcpClient client, CancellationToken ct)
     {
-        var agent = _registry.GetForSite(listener.SiteSlug).FirstOrDefault();
+        try
+        {
+            var target = new ProxyTarget(listener.SiteSlug, listener.TargetHost, listener.TargetPort, listener.IsConsole, listener.LocalPort);
+            var (connection, _) = await OpenAsync(target, client.GetStream(), ct);
+            if (connection != null)
+                await PumpToAgentAsync(connection, ct);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    /// <summary>
+    /// Asks the site's agent to open the target and waits for its answer. On success the connection
+    /// is registered and <paramref name="local"/> carries its bytes; otherwise <paramref name="local"/>
+    /// is disposed and the reason returned.
+    /// </summary>
+    private async Task<(ProxyConnection? Connection, string? Error)> OpenAsync(
+        ProxyTarget target, Stream local, CancellationToken ct)
+    {
+        var agent = PickAgent(target.SiteSlug);
+        // A tunnel that just dropped usually re-registers in 1-3s. Wait for it, so a request caught in
+        // the gap goes through instead of failing.
+        if (agent == null)
+        {
+            try
+            {
+                if (await _registry.WaitForReconnectAsync(target.SiteSlug, ReconnectWait, ct))
+                    agent = PickAgent(target.SiteSlug);
+            }
+            catch (OperationCanceledException)
+            {
+                local.Dispose();
+                throw;
+            }
+        }
         if (agent == null)
         {
             _logger.LogDebug("Proxy connect to {Host}:{Port} refused - no agent online for site {Slug}",
-                listener.TargetHost, listener.TargetPort, listener.SiteSlug);
-            client.Dispose();
-            return;
+                target.Host, target.Port, target.SiteSlug);
+            local.Dispose();
+            return (null, "no agent online for the site");
         }
 
         // A black-holed tunnel stays registered (IsAgentOnline() true) until the
@@ -126,13 +196,13 @@ public class AgentTunnelProxyService : IDisposable
         if (silent > AgentTunnelConnection.StaleThreshold)
         {
             _logger.LogDebug("Proxy connect to {Host}:{Port} refused - agent {AgentId} silent for {Silent:n0}s (site {Slug})",
-                listener.TargetHost, listener.TargetPort, agent.AgentId, silent.TotalSeconds, listener.SiteSlug);
-            client.Dispose();
+                target.Host, target.Port, agent.AgentId, silent.TotalSeconds, target.SiteSlug);
+            local.Dispose();
             // Belt-and-braces with the watchdog's proactive flip: if a dial reaches
             // a stale tunnel before the watchdog's next 15s tick has flipped the
             // console, flip it now so this page's remaining calls short-circuit.
-            FlipConsoleAwaitingAgent(listener.SiteSlug);
-            return;
+            FlipConsoleAwaitingAgent(target.SiteSlug);
+            return (null, "the site's agent has gone silent");
         }
 
         // Circuit breaker: a recent open to this site timed out and no inbound has
@@ -140,98 +210,138 @@ public class AgentTunnelProxyService : IDisposable
         // Fast-fail the render's remaining opens rather than eat OpenTimeout on
         // each. Fresh inbound (LastMessageAt past when the breaker tripped) means
         // the tunnel recovered, clearing this without needing a probe.
-        if (_openBreaker.TryGetValue(listener.SiteSlug, out var breaker)
-            && DateTime.UtcNow < breaker.Until
-            && agent.LastMessageAt <= breaker.OpenedAtLastMsg)
+        if (IsHeldBack(agent))
         {
             _logger.LogDebug("Proxy connect to {Host}:{Port} fast-refused - open breaker tripped for agent {AgentId} (site {Slug})",
-                listener.TargetHost, listener.TargetPort, agent.AgentId, listener.SiteSlug);
-            client.Dispose();
-            return;
+                target.Host, target.Port, agent.AgentId, target.SiteSlug);
+            local.Dispose();
+            return (null, "the site's agent is not answering");
         }
 
         var id = Interlocked.Increment(ref _nextConnectionId);
-        var connection = new ProxyConnection(id, client, agent);
+        var connection = new ProxyConnection(id, local, agent);
         _connections[id] = connection;
         try
         {
             var sent = await agent.SendAsync(new ServerMessage
             {
-                ProxyOpen = new ProxyOpen { ConnectionId = id, Host = listener.TargetHost, Port = listener.TargetPort }
+                ProxyOpen = new ProxyOpen { ConnectionId = id, Host = target.Host, Port = target.Port }
             }, ct);
             if (!sent)
             {
                 CloseConnection(connection, notifyAgent: false);
-                return;
+                return (null, "the site's agent disconnected");
             }
 
             using var openTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
             openTimeout.CancelAfter(OpenTimeout);
             string? openError;
+            var timedOut = false;
             try
             {
                 openError = await connection.OpenResult.Task.WaitAsync(openTimeout.Token);
             }
-            catch (OperationCanceledException)
+            // Only our own timeout counts against the tunnel. A caller giving up (a disposed client,
+            // a cancelled poll) propagates instead, and the outer catch closes the connection.
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
                 openError = "open timed out";
+                timedOut = true;
                 // Trip the breaker so the opens queued behind this one fast-fail
                 // instead of each blocking the full OpenTimeout.
-                var wasTripped = _openBreaker.TryGetValue(listener.SiteSlug, out var prev)
+                var wasTripped = _openBreaker.TryGetValue(agent.AgentId, out var prev)
                                  && DateTime.UtcNow < prev.Until;
-                _openBreaker[listener.SiteSlug] = (DateTime.UtcNow + OpenBreakerHold, agent.LastMessageAt);
+                _openBreaker[agent.AgentId] = (DateTime.UtcNow + OpenBreakerHold, agent.LastMessageAt);
 
                 // On the FIRST timeout of an outage, flip the site's console to
                 // awaiting-agent now (not at the 90s watchdog), so its page renders
                 // short-circuit console calls instead of each dialing the dead proxy
                 // and paying the retry backoff.
                 //
-                // Only when the tunnel itself looks silent. An agent that has messaged
-                // recently is demonstrably alive, so a target that did not answer says
-                // nothing about the tunnel - and tearing the console down for it takes
-                // the site offline over one unreachable device.
+                // For any other target, only when the tunnel itself looks silent. An agent
+                // that has messaged recently is demonstrably alive, so a device that did not
+                // answer says nothing about the tunnel - and tearing the console down for it
+                // takes the site offline over one unreachable device.
+                //
+                // For the console target, always. The agent answers every open inside its own
+                // 5 s dial timeout, so 8 s of nothing is the tunnel not delivering, whatever
+                // LastMessageAt says: an agent whose socket engine is wedged still sends and
+                // never receives, so the tunnel reads live while every open goes unanswered.
+                // Counting those as console failures raised a Console alert on a healthy console.
+                //
+                // With another live agent the site keeps its console instead: dials skip this agent
+                // while it is held back (PickAgent), and closing its proxied sockets moves pooled
+                // console connections over at once.
                 var tunnelSilent = DateTime.UtcNow - agent.LastMessageAt > AgentTunnelConnection.StaleThreshold;
-                if (!wasTripped && tunnelSilent)
-                    FlipConsoleAwaitingAgent(listener.SiteSlug);
+                if (target.IsConsole || (!wasTripped && tunnelSilent))
+                {
+                    if (_registry.GetForSite(target.SiteSlug).Any(a => !ReferenceEquals(a, agent) && !a.IsStale && !IsHeldBack(a)))
+                    {
+                        _logger.LogInformation("Proxy open {Host}:{Port} via agent {AgentId} timed out; site {Slug}'s dials move to its other agent",
+                            target.Host, target.Port, agent.AgentId, target.SiteSlug);
+                        OnAgentDisconnected(agent);
+                    }
+                    else
+                    {
+                        FlipConsoleAwaitingAgent(target.SiteSlug);
+                    }
+                }
             }
             if (openError != null)
             {
                 _logger.LogDebug("Proxy open {Host}:{Port} via agent {AgentId} failed: {Error}",
-                    listener.TargetHost, listener.TargetPort, agent.AgentId, openError);
+                    target.Host, target.Port, agent.AgentId, openError);
 
-                // The console's own endpoint failing IS the console being down - the flip above only
-                // covers a silent tunnel. Two strikes so one blip can't mark a healthy console down.
-                if (listener.IsConsole
-                    && _consoleOpenFailures.AddOrUpdate(listener.SiteSlug, 1, (_, n) => n + 1) >= ConsoleFailuresBeforeUnreachable)
+                // The console's own endpoint failing IS the console being down, but only when the
+                // agent answered the open: a timeout is tunnel evidence and was handled above.
+                // Two strikes so one blip can't mark a healthy console down.
+                if (target.IsConsole && !timedOut
+                    && _consoleOpenFailures.AddOrUpdate(target.SiteSlug, 1, (_, n) => n + 1) >= ConsoleFailuresBeforeUnreachable)
                 {
-                    NoteConsoleUnreachable(listener.SiteSlug);
+                    NoteConsoleUnreachable(target.SiteSlug);
                 }
                 // The dialer only sees the socket close, so leave the agent's reason where they can
                 // find it - SSH.NET reports the hang-up as a missing banner and buries the cause.
-                _lastOpenFailure[listener.LocalPort] =
-                    ($"{listener.TargetHost}:{listener.TargetPort} via the site's agent - {openError}", DateTime.UtcNow);
+                if (target.LocalPort is { } localPort)
+                {
+                    _lastOpenFailure[localPort] =
+                        ($"{target.Host}:{target.Port} via the site's agent - {openError}", DateTime.UtcNow);
+                }
                 CloseConnection(connection, notifyAgent: false);
-                return;
+                return (null, openError);
             }
 
-            // The tunnel answered, so clear any open breaker for this site.
-            if (listener.IsConsole) _consoleOpenFailures.TryRemove(listener.SiteSlug, out _);
-            _openBreaker.TryRemove(listener.SiteSlug, out _);
-            _lastOpenFailure.TryRemove(listener.LocalPort, out _);
+            // The tunnel answered, so clear any open breaker for this agent.
+            if (target.IsConsole) _consoleOpenFailures.TryRemove(target.SiteSlug, out _);
+            _openBreaker.TryRemove(agent.AgentId, out _);
+            if (target.LocalPort is { } openedPort) _lastOpenFailure.TryRemove(openedPort, out _);
+            return (connection, null);
+        }
+        catch
+        {
+            CloseConnection(connection, notifyAgent: true);
+            throw;
+        }
+    }
 
-            // Local reads -> tunnel, with backpressure. The agent-to-local
-            // direction is written by the tunnel read loop via OnProxyDataAsync.
+    /// <summary>
+    /// Local reads -> tunnel, with backpressure, until either side closes. The agent-to-local
+    /// direction is written by the tunnel read loop via OnProxyDataAsync.
+    /// </summary>
+    private async Task PumpToAgentAsync(ProxyConnection connection, CancellationToken ct)
+    {
+        try
+        {
             var buffer = new byte[FrameBytes];
-            var stream = client.GetStream();
             while (!ct.IsCancellationRequested)
             {
                 int read;
-                try { read = await stream.ReadAsync(buffer, ct); }
+                try { read = await connection.Local.ReadAsync(buffer, ct); }
                 catch { break; }
                 if (read <= 0) break;
-                var ok = await agent.SendAsync(new ServerMessage
+                var ok = await connection.Agent.SendAsync(new ServerMessage
                 {
-                    ProxyData = new ProxyData { ConnectionId = id, Data = ByteString.CopyFrom(buffer, 0, read) }
+                    ProxyData = new ProxyData { ConnectionId = connection.Id, Data = ByteString.CopyFrom(buffer, 0, read) }
                 }, ct);
                 if (!ok) break;
             }
@@ -309,7 +419,7 @@ public class AgentTunnelProxyService : IDisposable
         if (!TryGetOwnedConnection(sender, data.ConnectionId, out var connection)) return;
         try
         {
-            await connection.Client.GetStream().WriteAsync(data.Data.Memory, ct);
+            await connection.Local.WriteAsync(data.Data.Memory, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -340,12 +450,25 @@ public class AgentTunnelProxyService : IDisposable
     /// </summary>
     public bool IsTunnelSuspect(string siteSlug)
     {
-        var agent = _registry.GetForSite(siteSlug).FirstOrDefault();
-        if (agent == null || agent.IsStale) return true;
-        return _openBreaker.TryGetValue(siteSlug, out var breaker)
-               && DateTime.UtcNow < breaker.Until
-               && agent.LastMessageAt <= breaker.OpenedAtLastMsg;
+        var agent = PickAgent(siteSlug);
+        return agent == null || agent.IsStale || IsHeldBack(agent);
     }
+
+    /// <summary>The agent the site's console and device dials go through now (see <see cref="PickAgent"/>).</summary>
+    public AgentTunnelConnection? DialAgent(string siteSlug) => PickAgent(siteSlug);
+
+    /// <summary>The agent a dial goes through: the site's first that is neither silent nor held back.</summary>
+    private AgentTunnelConnection? PickAgent(string siteSlug) =>
+        _registry.PickForSite(siteSlug, a => !IsHeldBack(a));
+
+    /// <summary>
+    /// An open through this agent timed out recently and nothing has arrived from it since. Fresh
+    /// inbound clears it at once, so a recovered tunnel is never held for the full hold.
+    /// </summary>
+    private bool IsHeldBack(AgentTunnelConnection agent) =>
+        _openBreaker.TryGetValue(agent.AgentId, out var breaker)
+        && DateTime.UtcNow < breaker.Until
+        && agent.LastMessageAt <= breaker.OpenedAtLastMsg;
 
     /// <summary>Consecutive failed opens on a site's console endpoint before it counts as down.</summary>
     private const int ConsoleFailuresBeforeUnreachable = 2;
@@ -385,7 +508,7 @@ public class AgentTunnelProxyService : IDisposable
         connection.OpenResult.TrySetResult("closed");
         if (notifyAgent)
             connection.Agent.TrySend(new ServerMessage { ProxyClose = new ProxyClose { ConnectionId = connection.Id } });
-        try { connection.Client.Dispose(); } catch { }
+        try { connection.Local.Dispose(); } catch { }
     }
 
     public void Dispose()
@@ -401,6 +524,8 @@ public class AgentTunnelProxyService : IDisposable
         GC.SuppressFinalize(this);
     }
 
+    private sealed record ProxyTarget(string SiteSlug, string Host, int Port, bool IsConsole, int? LocalPort);
+
     private sealed record ProxyListener(TcpListener Tcp, string SiteSlug, string TargetHost, int TargetPort, bool IsConsole = false)
     {
         public int LocalPort => ((IPEndPoint)Tcp.LocalEndpoint).Port;
@@ -408,15 +533,17 @@ public class AgentTunnelProxyService : IDisposable
 
     private sealed class ProxyConnection
     {
-        public ProxyConnection(long id, TcpClient client, AgentTunnelConnection agent)
+        public ProxyConnection(long id, Stream local, AgentTunnelConnection agent)
         {
             Id = id;
-            Client = client;
+            Local = local;
             Agent = agent;
         }
 
         public long Id { get; }
-        public TcpClient Client { get; }
+        /// <summary>This end of the connection, disposed when it closes: a loopback socket's stream, or the proxy side of a stream pair.</summary>
+        public Stream Local { get; }
+
         public AgentTunnelConnection Agent { get; }
 
         /// <summary>Null = opened; otherwise the failure reason.</summary>

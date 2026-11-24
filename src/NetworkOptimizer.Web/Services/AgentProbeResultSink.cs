@@ -32,12 +32,14 @@ public class AgentProbeResultSink
     private readonly MonitoringAlertRegistry _alertRegistry;
     private readonly ICredentialProtectionService _credentialProtection;
     private readonly Monitoring.IspHealth.IspHealthRegistry _ispHealthRegistry;
+    private readonly Monitoring.PathLocalization.PathEpisodeRegistry _pathEpisodeRegistry;
     private readonly ClientUsageRollupRegistry _usageRollupRegistry;
     private readonly ILogger<AgentProbeResultSink> _logger;
 
     // Counter delta cache for agent-relayed interface samples. Key =
     // "slug/deviceMac/ifName" - same rate computation as the local fast tier.
     private readonly ConcurrentDictionary<string, InterfaceRateCalculator.State> _counterCache = new();
+    private readonly FanSpeedGuard _fanGuard = new();
 
     // Device display names per site (slug -> normalized MAC -> name), captured from
     // the device list each SNMP config push assembles. Health samples relayed by the
@@ -69,7 +71,13 @@ public class AgentProbeResultSink
     // a second consecutive one is adopted as a real disable. Keyed per agent so
     // one agent's transient empty can't fast-track a disable to a sibling agent
     // on the same site. See PushSnmpConfigAsync.
-    private readonly ConcurrentDictionary<string, bool> _snmpEmptyEnumerations = new();
+    private readonly ConcurrentDictionary<string, DateTime> _snmpEmptyEnumerations = new();
+
+    /// <summary>How long after a first empty SNMP enumeration a second one has to come to confirm it.</summary>
+    internal static readonly TimeSpan EmptyStrikeGap = TimeSpan.FromSeconds(30);
+
+    /// <summary>True when an empty enumeration at <paramref name="now"/> confirms the first, seen at <paramref name="firstEmpty"/>.</summary>
+    internal static bool EmptyEnumerationConfirmed(DateTime firstEmpty, DateTime now) => now - firstEmpty >= EmptyStrikeGap;
 
     // Samples older than this skip the alert state machines. Agents replay
     // their store-and-forward backlog after a tunnel outage; feeding an
@@ -118,8 +126,20 @@ public class AgentProbeResultSink
         AgentTunnelRegistry tunnelRegistry,
         Monitoring.IspHealth.IspHealthRegistry ispHealthRegistry,
         ClientUsageRollupRegistry usageRollupRegistry,
+        CableModemProviders.Uci.UciInformService uciInforms,
+        IDbContextFactory<NetworkOptimizerDbContext> mainDbFactory,
+        Auditing.IAuditLogger audit,
+        Monitoring.PathLocalization.PathEpisodeRegistry pathEpisodeRegistry,
+        Monitoring.LiveTraffic.LiveTrafficRegistry liveTraffic,
+        ISystemSettingsService settings,
         ILogger<AgentProbeResultSink> logger)
     {
+        _liveTraffic = liveTraffic;
+        _settings = settings;
+        _pathEpisodeRegistry = pathEpisodeRegistry;
+        _mainDbFactory = mainDbFactory;
+        _audit = audit;
+        _uciInforms = uciInforms;
         _usageRollupRegistry = usageRollupRegistry;
         _ispHealthRegistry = ispHealthRegistry;
         _tunnelRegistry = tunnelRegistry;
@@ -141,6 +161,11 @@ public class AgentProbeResultSink
     private readonly SiteAgentCoverage _agentCoverage;
     private readonly AgentOnGatewayDetector _onGatewayDetector;
     private readonly AgentTunnelRegistry _tunnelRegistry;
+    private readonly CableModemProviders.Uci.UciInformService _uciInforms;
+    private readonly IDbContextFactory<NetworkOptimizerDbContext> _mainDbFactory;
+    private readonly Auditing.IAuditLogger _audit;
+    private readonly Monitoring.LiveTraffic.LiveTrafficRegistry _liveTraffic;
+    private readonly ISystemSettingsService _settings;
 
     /// <summary>
     /// Called once per connection after the hello exchange, and again by the periodic refresh.
@@ -156,6 +181,14 @@ public class AgentProbeResultSink
         await PushSnmpConfigAsync(connection, ct);
         await PushWanSpeedTestConfigAsync(connection, ct);
         await PushConntrackConfigAsync(connection, ct);
+        await _uciInforms.PushCaptureConfigAsync(connection, ct);
+
+        // The collector is chosen from the connected set, so an agent that connected first (after a
+        // server restart, every agent redials at once) can take the site's probes and SNMP. It is told
+        // to hand them back once this one has had time to start, rather than collecting alongside it
+        // until the 60 s refresh. The grace keeps the handover an overlap, never a gap.
+        if (initialConnect)
+            _ = RePushOthersAsync(connection.SiteSlug, connection.AgentId, CollectorHandoverGrace + TimeSpan.FromSeconds(1), passes: 3);
 
         // This site's console reaches the UniFi console THROUGH this agent tunnel.
         // On startup / after an agent restart the console auto-connect can run
@@ -183,6 +216,8 @@ public class AgentProbeResultSink
         // two-strike guard exists for - so a held-over strike would fast-track
         // the disable on the first sighting. Start clean.
         _snmpEmptyEnumerations.TryRemove($"{connection.SiteSlug}:{connection.AgentId}", out _);
+        // If it was the collector, the next one takes over now rather than at its 60 s refresh.
+        _ = RePushOthersAsync(connection.SiteSlug, connection.AgentId, TimeSpan.Zero);
         _ = Task.Run(async () =>
         {
             try
@@ -195,6 +230,43 @@ public class AgentProbeResultSink
             }
         });
     }
+
+    /// <summary>How long an agent that loses the collector role keeps collecting after another connects.</summary>
+    internal static readonly TimeSpan CollectorHandoverGrace = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// True once the collector has had its config for the whole grace, so the agent it replaces may stop.
+    /// Every push path asks this, not only the handover re-push, so a refresh cannot cut the grace short.
+    /// </summary>
+    internal static bool CollectorSettled(DateTime? collectorSince, DateTime now) =>
+        collectorSince is { } since && now - since >= CollectorHandoverGrace;
+
+    /// <summary>
+    /// Re-pushes probe and SNMP config to a site's agents other than <paramref name="exceptAgentId"/>, read
+    /// from the registry at that moment, <paramref name="passes"/> times <paramref name="delay"/> apart. More
+    /// than one pass because a collector whose SNMP waited for the console settles late, and the agent it
+    /// replaces is held until then. Off the tunnel's path: an SNMP push reads the console.
+    /// </summary>
+    private Task RePushOthersAsync(string siteSlug, int exceptAgentId, TimeSpan delay, int passes = 1) => Task.Run(async () =>
+    {
+        for (var pass = 0; pass < passes; pass++)
+        {
+            if (delay > TimeSpan.Zero) await Task.Delay(delay);
+            // Each agent on its own, so one failed push cannot leave the rest on their old role.
+            foreach (var other in _tunnelRegistry.GetForSite(siteSlug).Where(c => c.AgentId != exceptAgentId))
+            {
+                try
+                {
+                    await PushProbeConfigAsync(other, CancellationToken.None);
+                    await PushSnmpConfigAsync(other, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Collector handover re-push failed for agent {Id} (site {Slug})", other.AgentId, siteSlug);
+                }
+            }
+        }
+    });
 
     /// <summary>
     /// Called by the tunnel watchdog when a still-registered tunnel goes silent
@@ -260,12 +332,23 @@ public class AgentProbeResultSink
             // authenticated - so IsConnected is still false for a moment afterwards and an
             // immediate push defers for exactly the reason it was retried. Give it a short while to
             // finish coming up; if it takes longer than this, the periodic refresh has it.
-            for (var i = 0; i < 10 && !siteConnection.IsConnected; i++)
+            // The same condition PushSnmpConfigAsync defers on: IsConnected can flip before Client is set.
+            bool Ready() => siteConnection.IsConnected && siteConnection.Client != null;
+            for (var i = 0; i < 10 && !Ready(); i++)
                 await Task.Delay(TimeSpan.FromSeconds(1), CancellationToken.None);
 
-            if (siteConnection.IsConnected)
+            if (Ready())
             {
                 await PushSnmpConfigAsync(connection, CancellationToken.None);
+                // The console can still drop back for a moment after reading ready, and the push then
+                // defers again. A collector left without its config retries briefly instead of
+                // waiting out the 60 s refresh with no SNMP poller.
+                for (var attempt = 0; attempt < 5 && connection.CollectorSnmpSince == null
+                     && await GetCollectorAgentIdAsync(connection.SiteSlug, CancellationToken.None) == connection.AgentId; attempt++)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(2), CancellationToken.None);
+                    await PushSnmpConfigAsync(connection, CancellationToken.None);
+                }
 
                 // Both halves are up now, so anything computed before this point saw a partial
                 // site. A report produced between server start and this moment is missing whatever
@@ -292,6 +375,9 @@ public class AgentProbeResultSink
     /// </summary>
     public async Task PushProbeConfigAsync(AgentTunnelConnection connection, CancellationToken ct)
     {
+        // Several paths push to one agent at once (connect, disconnect, the refresh); numbered so one that
+        // read the registry earlier cannot land after, and undo, one that read it later.
+        var seq = connection.BeginProbePush();
         try
         {
             var isDefault = connection.SiteSlug == SiteManagementService.DefaultSiteSlug;
@@ -306,6 +392,9 @@ public class AgentProbeResultSink
             var monitoringSettings = await db.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync(ct);
             if (monitoringSettings is not { Enabled: true })
             {
+                if (!connection.CommitProbePush(seq)) return;
+                connection.CollectorProbesSince = null;
+                connection.HoldsSiteTargets = false;
                 connection.TrySend(new ServerMessage { ProbeConfig = new ProbeConfig() });
                 _logger.LogDebug("Monitoring disabled for site {Slug}; pushed empty probe config to agent {Id}",
                     connection.SiteSlug, connection.AgentId);
@@ -318,6 +407,10 @@ public class AgentProbeResultSink
                 .AsNoTracking()
                 .Where(t => t.Enabled && t.RetiredAt == null)
                 .ToListAsync(ct);
+            // Vantages change hands before the push reads them: back to this agent if it is the one
+            // that went offline, or onto it if it is the gateway agent and another stays gone.
+            var formerHolders = await RestoreReassignedVantagesAsync(db, connection, ct);
+            await ReassignStrandedVantagesAsync(db, connection, ct);
             // Before anything reads a context's binding, give one back to any context that lost the
             // chance to have one. Runs here because this is the push that follows an agent's hello,
             // which is exactly when an upgraded agent first reports it can bind.
@@ -363,8 +456,22 @@ public class AgentProbeResultSink
             var unassignedOwnerId = agentCoversPrimary
                 ? SelectCollectorAgentId(
                     _tunnelRegistry.GetForSite(connection.SiteSlug).Select(c => c.AgentId),
-                    contextsById.Values, primaryWanKey, connection.AgentId)
+                    contextsById.Values, primaryWanKey, connection.AgentId,
+                    OnGatewayAgentIds(connection.SiteSlug))
                 : NoCollectorAgentId;
+            // An agent that has the site's targets keeps them until the owner has had its own for the whole
+            // grace: a handover overlaps rather than leaving the site unprobed. It only keeps, never gains,
+            // and never for a steered agent, whose probes take the wrong WAN.
+            var effectiveOwnerId = unassignedOwnerId;
+            if (unassignedOwnerId != connection.AgentId && unassignedOwnerId != NoCollectorAgentId && !agentIsSteeredToWan
+                && connection.HoldsSiteTargets
+                && _tunnelRegistry.GetForSite(connection.SiteSlug).FirstOrDefault(c => c.AgentId == unassignedOwnerId) is { } owner
+                && !CollectorSettled(owner.CollectorProbesSince, DateTime.UtcNow))
+            {
+                effectiveOwnerId = connection.AgentId;
+                _logger.LogDebug("Agent {Id} (site {Slug}) keeps the site's targets until collector agent {Collector} has its own",
+                    connection.AgentId, connection.SiteSlug, unassignedOwnerId);
+            }
 
             // An agent running ON the gateway cannot usefully probe it: the target is the box the
             // probe runs on, so every reply is loopback - 0 ms and no loss - which reads as a
@@ -409,7 +516,7 @@ public class AgentProbeResultSink
                 var context = target.WanContextId is int contextId
                     && contextsById.TryGetValue(contextId, out var found) ? found : null;
                 if (!ShouldPushTargetToAgent(target.WanContextId != null, context?.AgentId, connection.AgentId,
-                        agentIsSteeredToWan, unassignedOwnerId, IsFabricTarget(target.TargetType)))
+                        agentIsSteeredToWan, effectiveOwnerId, IsFabricTarget(target.TargetType)))
                     continue;
                 config.Targets.Add(new ProbeTargetSpec
                 {
@@ -428,10 +535,31 @@ public class AgentProbeResultSink
                 });
             }
 
-            connection.TrySend(new ServerMessage { ProbeConfig = config });
-            _logger.LogDebug("Pushed {Count} probe target(s) to agent {Id} (site {Slug}){Skipped}",
-                config.Targets.Count, connection.AgentId, connection.SiteSlug,
-                skippedSelf > 0 ? $" - {skippedSelf} skipped: the agent runs on that target" : "");
+            if (connection.CommitProbePush(seq))
+            {
+                if (connection.TrySend(new ServerMessage { ProbeConfig = config }))
+                {
+                    connection.HoldsSiteTargets = effectiveOwnerId == connection.AgentId;
+                    if (unassignedOwnerId == connection.AgentId) connection.CollectorProbesSince ??= DateTime.UtcNow;
+                    else connection.CollectorProbesSince = null;
+                }
+                _logger.LogDebug("Pushed {Count} probe target(s) to agent {Id} (site {Slug}){Skipped}",
+                    config.Targets.Count, connection.AgentId, connection.SiteSlug,
+                    skippedSelf > 0 ? $" - {skippedSelf} skipped: the agent runs on that target" : "");
+            }
+            else
+            {
+                _logger.LogDebug("Dropped a stale probe push to agent {Id} (site {Slug}): a newer one was sent first",
+                    connection.AgentId, connection.SiteSlug);
+            }
+
+            // The agent that covered a returned vantage keeps probing its targets until told.
+            foreach (var holderId in formerHolders)
+            {
+                if (_tunnelRegistry.GetForSite(connection.SiteSlug).FirstOrDefault(c => c.AgentId == holderId)
+                    is { } holder)
+                    await PushProbeConfigAsync(holder, ct);
+            }
         }
         catch (Exception ex)
         {
@@ -441,8 +569,15 @@ public class AgentProbeResultSink
     }
 
     /// <summary>
+    /// Stands in for "no agent collects here", where the server does it. Never a real agent id, so
+    /// every ownership comparison simply fails.
+    /// </summary>
+    internal const int NoCollectorAgentId = -1;
+
+    /// <summary>
     /// The one agent that collects for a site: its SNMP, its fabric targets, and the primary WAN's
-    /// targets. The lowest-id CONNECTED agent that is not steered behind a secondary WAN.
+    /// targets. The lowest-id CONNECTED agent that is not steered behind a secondary WAN, preferring
+    /// one that is not on the gateway.
     /// <para>
     /// Lowest-id makes it deterministic, so a refresh does not move the workload around; taking it
     /// from the connected set makes it self-healing, because the next agent picks the work up on
@@ -450,28 +585,40 @@ public class AgentProbeResultSink
     /// send leaves by the wrong WAN. <paramref name="fallbackAgentId"/> is returned when nothing is
     /// eligible, which keeps a lone steered agent collecting rather than leaving a site dark.
     /// </para>
+    /// <para>
+    /// A gateway agent still collects when it is the only eligible one, but never ahead of an eligible
+    /// agent on another box: the gateway is the host with the least headroom on the site.
+    /// </para>
     /// </summary>
-    /// <summary>
-    /// Stands in for "no agent collects here", where the server does it. Never a real agent id, so
-    /// every ownership comparison simply fails.
-    /// </summary>
-    internal const int NoCollectorAgentId = -1;
-
+    /// <param name="onGatewayAgentIds">Connected agents that reported running on the gateway.</param>
     internal static int SelectCollectorAgentId(
         IEnumerable<int> connectedAgentIds,
         IEnumerable<WanContext> contexts,
         string? primaryWanKey,
-        int fallbackAgentId)
+        int fallbackAgentId,
+        IReadOnlyCollection<int>? onGatewayAgentIds = null)
     {
         var contextList = contexts as IReadOnlyCollection<WanContext> ?? contexts.ToList();
-        return connectedAgentIds
+        var eligible = connectedAgentIds
             .Where(id => !contextList.Any(c =>
                 c.AgentId == id
                 && string.IsNullOrEmpty(c.InterfaceName)
                 && !IsPrimaryWanContext(c, primaryWanKey)))
-            .DefaultIfEmpty(fallbackAgentId)
-            .Min();
+            .ToList();
+        if (eligible.Count == 0) return fallbackAgentId;
+        var offGateway = onGatewayAgentIds is { Count: > 0 }
+            ? eligible.Where(id => !onGatewayAgentIds.Contains(id)).ToList()
+            : eligible;
+        return (offGateway.Count > 0 ? offGateway : eligible).Min();
     }
+
+    /// <summary>
+    /// The site's connected agents that reported running on the gateway. The hello flag only: it is
+    /// in hand without asking the console, which this push path must never wait on. An agent that
+    /// predates the flag is left out, so it is ranked as it was before the preference existed.
+    /// </summary>
+    private IReadOnlyCollection<int> OnGatewayAgentIds(string siteSlug) =>
+        _tunnelRegistry.GetForSite(siteSlug).Where(c => c.OnGateway == true).Select(c => c.AgentId).ToList();
 
     /// <summary>
     /// Which agent currently collects for a site, for display. Same answer the push path acts on,
@@ -495,7 +642,8 @@ public class AgentProbeResultSink
             await using var db = _siteDbFactory.CreateForSite(siteSlug, isDefault);
             var contexts = await db.WanContexts.AsNoTracking().ToListAsync(ct);
             var primaryWanKey = await ResolvePersistedPrimaryWanKeyAsync(db, ct);
-            return SelectCollectorAgentId(connected, contexts, primaryWanKey, connected.Min());
+            return SelectCollectorAgentId(connected, contexts, primaryWanKey, connected.Min(),
+                OnGatewayAgentIds(siteSlug));
         }
         catch (Exception ex)
         {
@@ -562,6 +710,152 @@ public class AgentProbeResultSink
                 context.Name, dataPath, connection.AgentId, connection.SiteSlug);
         }
         return healed;
+    }
+
+    /// <summary>When this process started, the earliest point an agent's absence can be counted from.</summary>
+    private static readonly DateTime ServerStartedAt =
+        System.Diagnostics.Process.GetCurrentProcess().StartTime.ToUniversalTime();
+
+    /// <summary>A vantage that changed hands on this push: who it came from, who it went to, and why.</summary>
+    private sealed record VantageHandover(WanContext Context, int? FromAgentId, int ToAgentId, string Reason);
+
+    /// <summary>
+    /// Every agent registered on a site, enabled or not: a disabled agent is offline and waits out
+    /// the grace period like any other. Only a missing row reads as removed. Null when the site has
+    /// no registry row.
+    /// </summary>
+    private async Task<List<StrandedVantageReassignment.EnrolledAgent>?> LoadEnrolledAgentsAsync(
+        string siteSlug, CancellationToken ct)
+    {
+        await using var mainDb = await _mainDbFactory.CreateDbContextAsync(ct);
+        var siteId = await mainDb.Sites.AsNoTracking()
+            .Where(s => s.Slug == siteSlug)
+            .Select(s => (int?)s.Id)
+            .FirstOrDefaultAsync(ct);
+        if (siteId == null) return null;
+        return await mainDb.SiteAgents.AsNoTracking()
+            .Where(a => a.SiteId == siteId)
+            .Select(a => new StrandedVantageReassignment.EnrolledAgent(a.Id, a.LastSeenAt))
+            .ToListAsync(ct);
+    }
+
+    /// <summary>
+    /// Hands this agent back the vantages the gateway agent covered while it was offline, and makes
+    /// the move permanent for any whose original agent has since been removed. Costs one query on a
+    /// site with nothing moved.
+    /// </summary>
+    /// <returns>The agents that held the returned vantages, which need a fresh push.</returns>
+    private async Task<List<int>> RestoreReassignedVantagesAsync(
+        NetworkOptimizerDbContext db, AgentTunnelConnection connection, CancellationToken ct)
+    {
+        var holders = new List<int>();
+        var moved = await db.WanContexts.Where(c => c.ReassignedFromAgentId != null).ToListAsync(ct);
+        if (moved.Count == 0) return holders;
+
+        var enrolled = await LoadEnrolledAgentsAsync(connection.SiteSlug, ct);
+        if (enrolled == null) return holders;
+        var forgot = StrandedVantageReassignment.ForgetRemovedOrigins(moved, enrolled);
+
+        var returned = new List<VantageHandover>();
+        foreach (var context in moved.Where(c => c.ReassignedFromAgentId == connection.AgentId))
+        {
+            var holder = StrandedVantageReassignment.Restore(context);
+            if (holder is int h && h != connection.AgentId) holders.Add(h);
+            returned.Add(new VantageHandover(context, holder, connection.AgentId, "agent back online"));
+        }
+
+        if (forgot || returned.Count > 0)
+            _ = await db.SaveChangesAsync(ct);
+        LogVantageHandovers(connection.SiteSlug, returned);
+        return holders.Distinct().ToList();
+    }
+
+    /// <summary>
+    /// Moves this site's stranded vantages onto this agent when it runs on the gateway and can
+    /// bind (see <see cref="StrandedVantageReassignment"/>). Runs on every push, so a removal is
+    /// picked up on the next refresh and an outage once it outlasts the grace period.
+    /// <para>
+    /// Only the lowest-id gateway agent acts, so two of them never trade a vantage back and forth.
+    /// A vantage whose WAN has no recorded data path stays where it is.
+    /// </para>
+    /// </summary>
+    private async Task ReassignStrandedVantagesAsync(
+        NetworkOptimizerDbContext db, AgentTunnelConnection connection, CancellationToken ct)
+    {
+        if (connection.SupportsSourceBind != true) return;
+
+        var connected = _tunnelRegistry.GetForSite(connection.SiteSlug);
+        if (connected.Any(c => c.AgentId < connection.AgentId && c.OnGateway == true && c.SupportsSourceBind == true))
+            return;
+
+        var contexts = await db.WanContexts
+            .Where(c => c.AgentId != null && c.AgentId != connection.AgentId)
+            .ToListAsync(ct);
+        if (contexts.Count == 0) return;
+
+        var enrolled = await LoadEnrolledAgentsAsync(connection.SiteSlug, ct);
+        if (enrolled == null) return;
+
+        var stranded = StrandedVantageReassignment.SelectStranded(
+            contexts, enrolled, connected.Select(c => c.AgentId).ToList(), connection.AgentId,
+            DateTime.UtcNow, ServerStartedAt);
+        if (stranded.Count == 0) return;
+
+        // Asked only when there is something to move: it can await a console round trip.
+        if (!await _onGatewayDetector.IsAgentOnGatewayAsync(
+                connection.SiteSlug, connection.AgentId, connection.HostAddresses, ct))
+            return;
+
+        var profiles = await db.WanProfiles.AsNoTracking().ToListAsync(ct);
+        var moved = new List<VantageHandover>();
+        foreach (var context in stranded)
+        {
+            var dataPath = StrandedVantageReassignment.DataPathFor(profiles, context.WanInterface);
+            if (dataPath == null)
+            {
+                _logger.LogDebug(
+                    "WAN vantage '{Name}' is stranded but {Wan} has no recorded data path; leaving it (site {Slug})",
+                    context.Name, context.WanInterface ?? "(no WAN)", connection.SiteSlug);
+                continue;
+            }
+
+            var fromAgentId = context.AgentId!.Value;
+            var removed = !enrolled.Any(a => a.AgentId == fromAgentId);
+            StrandedVantageReassignment.MoveToGateway(context, connection.AgentId, dataPath, removed);
+            moved.Add(new VantageHandover(context, fromAgentId, connection.AgentId,
+                removed ? "agent removed" : "agent offline"));
+        }
+
+        if (moved.Count == 0) return;
+        _ = await db.SaveChangesAsync(ct);
+        LogVantageHandovers(connection.SiteSlug, moved);
+    }
+
+    /// <summary>Logs and audits vantages that changed hands, after the save.</summary>
+    private void LogVantageHandovers(string siteSlug, List<VantageHandover> handovers)
+    {
+        foreach (var (context, fromAgentId, toAgentId, reason) in handovers)
+        {
+            _logger.LogInformation(
+                "WAN vantage '{Name}' moved from agent {From} to agent {To} on {Binding} ({Reason}, site {Slug})",
+                context.Name, fromAgentId, toAgentId,
+                context.InterfaceName ?? context.ProbeSourceIp ?? "its own route", reason, siteSlug);
+            _audit.Log(Auditing.AuditEventBuilder.FromSystem(
+                NetworkOptimizer.Storage.Models.Identity.AuditCategories.Settings,
+                NetworkOptimizer.Storage.Models.Identity.AuditActions.MonitoringSetupChanged,
+                targetType: "wan_vantage",
+                targetId: context.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                targetName: context.Name,
+                siteSlug: siteSlug,
+                details: new
+                {
+                    fromAgentId,
+                    toAgentId,
+                    @interface = context.InterfaceName,
+                    sourceIp = context.ProbeSourceIp,
+                    reason,
+                }));
+        }
     }
 
     private static async Task<string?> ResolvePersistedPrimaryWanKeyAsync(
@@ -655,6 +949,26 @@ public class AgentProbeResultSink
         => agentCoversPrimary || contextAgentId == agentId;
 
     /// <summary>
+    /// Clears round-trip figures no probe could have measured (<see cref="Monitoring.LatencySanity"/>)
+    /// from an agent's result, in place, so storage, scoring, and the live caches all read the same
+    /// cleaned result. The agent's parser has no bound of its own. True when anything was cleared.
+    /// </summary>
+    internal static bool ScrubImplausibleRtt(ProbeResult result)
+    {
+        var (min, avg, max, jitter) = Monitoring.LatencySanity.Clean(
+            result.HasRttMinMs ? result.RttMinMs : null,
+            result.HasRttAvgMs ? result.RttAvgMs : null,
+            result.HasRttMaxMs ? result.RttMaxMs : null,
+            result.HasJitterMs ? result.JitterMs : null);
+        var changed = false;
+        if (min == null && result.HasRttMinMs) { result.ClearRttMinMs(); changed = true; }
+        if (avg == null && result.HasRttAvgMs) { result.ClearRttAvgMs(); changed = true; }
+        if (max == null && result.HasRttMaxMs) { result.ClearRttMaxMs(); changed = true; }
+        if (jitter == null && result.HasJitterMs) { result.ClearJitterMs(); changed = true; }
+        return changed;
+    }
+
+    /// <summary>
     /// Whether an agent should be sent the site's SNMP config and speed-test server list.
     ///
     /// A STEERED agent is a probe vantage behind one WAN, not a second collector: polling SNMP
@@ -666,14 +980,14 @@ public class AgentProbeResultSink
     internal static bool ShouldPushSiteCollectionConfig(bool agentIsSteeredToWan) => !agentIsSteeredToWan;
 
     /// <summary>
-    /// Whether this agent should poll SNMP. Steered agents stand down so the site's collector does
-    /// it once, but only when there IS another one to do it: on a site where every agent sits
-    /// behind its own WAN, the collector is necessarily a steered agent, and standing it down too
-    /// leaves the site with no poller at all. <see cref="SelectCollectorAgentId"/> already falls
-    /// back to one for that reason; this is what lets its answer reach the agent.
+    /// Whether this agent should poll SNMP: only the site's collector, so each device is polled once
+    /// however many agents the site runs. Never gate this on steering alone - two ordinary agents on
+    /// one site both passed that gate and polled every device twice.
+    /// <paramref name="collectorAgentId"/> is null only when the registry lists no agent at all, which
+    /// the connect path never sees (it registers first); polling then beats leaving the site dark.
     /// </summary>
-    internal static bool ShouldPushSnmpConfig(bool agentIsSteeredToWan, bool agentIsCollector) =>
-        !agentIsSteeredToWan || agentIsCollector;
+    internal static bool ShouldPushSnmpConfig(int agentId, int? collectorAgentId) =>
+        collectorAgentId is null || collectorAgentId == agentId;
 
     /// <summary>
     /// Whether this agent sits ENTIRELY behind one WAN: a context names it and gives no interface
@@ -783,29 +1097,44 @@ public class AgentProbeResultSink
     /// connection, filtered and addressed by the same SnmpDeviceRules the
     /// local collection agent uses. A default-site agent gets SNMP config only when the site is
     /// configured for its agent to cover it - otherwise the server's own collection agent is still
-    /// polling those devices and pushing a second poller would double every sample. A
-    /// context-assigned agent gets an explicitly disabled config for the same reason: it is a probe
-    /// vantage behind one WAN, and the site already has a collector.
+    /// polling those devices and pushing a second poller would double every sample. Of the agents
+    /// that do collect, only the site's collector (<see cref="GetCollectorAgentIdAsync"/>) polls;
+    /// every other agent gets an explicitly disabled config for the same reason.
     /// </summary>
     public async Task PushSnmpConfigAsync(AgentTunnelConnection connection, CancellationToken ct)
     {
+        // Numbered as probe pushes are: one that read the registry earlier cannot undo a later one.
+        var seq = connection.BeginSnmpPush();
         var isDefault = connection.SiteSlug == SiteManagementService.DefaultSiteSlug;
         if (isDefault && !await _agentCoverage.CoversAsync(connection.SiteSlug))
         {
             // Disabled rather than absent, as below: coverage switched off leaves the agent on
             // the full device list it was pushed while coverage was on, polling alongside the server.
-            connection.TrySend(new ServerMessage { SnmpConfig = new SnmpConfig { Enabled = false } });
+            connection.CollectorSnmpSince = null;
+            if (connection.CommitSnmpPush(seq))
+                connection.TrySend(new ServerMessage { SnmpConfig = new SnmpConfig { Enabled = false } });
             return;
         }
-        var steered = await IsSteeredToWanAgentAsync(connection, ct);
-        var isCollector = steered && await GetCollectorAgentIdAsync(connection.SiteSlug, ct) == connection.AgentId;
-        if (!ShouldPushSnmpConfig(steered, isCollector))
+        var collectorId = await GetCollectorAgentIdAsync(connection.SiteSlug, ct);
+        if (!ShouldPushSnmpConfig(connection.AgentId, collectorId))
         {
-            // Disabled rather than absent: an agent that polled before being assigned a context
-            // keeps polling on its last config until a new one tells it to stop.
+            connection.CollectorSnmpSince = null;
+            // Held until the collector has had its own config for the whole grace: a gap loses samples, an
+            // overlap only doubles a few, so this agent keeps polling until then. The periodic push retries.
+            if (_tunnelRegistry.GetForSite(connection.SiteSlug).FirstOrDefault(c => c.AgentId == collectorId) is { } collector
+                && !CollectorSettled(collector.CollectorSnmpSince, DateTime.UtcNow))
+            {
+                _logger.LogDebug("Agent {Id} (site {Slug}) keeps polling SNMP until collector agent {Collector} has its config",
+                    connection.AgentId, connection.SiteSlug, collectorId);
+                return;
+            }
+            if (!connection.CommitSnmpPush(seq)) return;
+            // Disabled rather than absent: an agent that was the collector keeps polling on its last
+            // config until a new one tells it to stop. The periodic push hands the work back if the
+            // collector drops.
             connection.TrySend(new ServerMessage { SnmpConfig = new SnmpConfig { Enabled = false } });
-            _logger.LogDebug("Agent {Id} (site {Slug}) probes a WAN context; SNMP polling left to the site's collector",
-                connection.AgentId, connection.SiteSlug);
+            _logger.LogDebug("Agent {Id} (site {Slug}) is not the collector; SNMP polling left to agent {Collector}",
+                connection.AgentId, connection.SiteSlug, collectorId);
             return;
         }
         try
@@ -835,7 +1164,8 @@ public class AgentProbeResultSink
                     config.AuthPassword = string.IsNullOrEmpty(settings.SnmpV3AuthPassword)
                         ? ""
                         : _credentialProtection.Decrypt(settings.SnmpV3AuthPassword);
-                    config.Enabled = true;
+                    // A withheld v3 password (View accounts) leaves nothing to authenticate with.
+                    config.Enabled = !string.IsNullOrEmpty(config.AuthPassword);
                 }
                 config.FastIntervalSeconds = Math.Max(2, settings.FastPollIntervalSeconds);
                 config.MediumIntervalSeconds = Math.Max(10, settings.MediumPollIntervalSeconds);
@@ -852,6 +1182,9 @@ public class AgentProbeResultSink
                     // this push rather than sending Enabled=false, which would stop the
                     // agent's SNMP polling. ReconnectConsoleIfViaAgentAsync re-pushes the
                     // full config once the console is up.
+                    // A strike from before the outage is dropped: the first read after a reconnect is the
+                    // transient empty the guard exists for, and must not confirm a strike from long ago.
+                    _snmpEmptyEnumerations.TryRemove($"{connection.SiteSlug}:{connection.AgentId}", out _);
                     _logger.LogDebug(
                         "SNMP enabled for site {Slug} but its console isn't connected yet; deferring SNMP config push",
                         connection.SiteSlug);
@@ -877,7 +1210,7 @@ public class AgentProbeResultSink
                         if (string.IsNullOrEmpty(device.Mac)) continue;
                         profiles[NormalizeMac(device.Mac)] = new DeviceProbeProfile(
                             device.Name,
-                            Monitoring.SnmpDeviceRules.ResolvePollAddress(device, gatewayLanIp),
+                            Monitoring.SnmpDeviceRules.ResolvePollAddress(device, devices, gatewayLanIp),
                             device.Version,
                             device.DeviceType);
                     }
@@ -894,7 +1227,7 @@ public class AgentProbeResultSink
                     config.Devices.Add(new SnmpDeviceSpec
                     {
                         Mac = device.Mac,
-                        Ip = Monitoring.SnmpDeviceRules.ResolvePollAddress(device, gatewayLanIp),
+                        Ip = Monitoring.SnmpDeviceRules.ResolvePollAddress(device, devices, gatewayLanIp),
                         Name = device.Name ?? "",
                         // The agent echoes this string straight back into the device_health tag, so
                         // it has to be the same label the server's own writes use. ToString() is not:
@@ -949,11 +1282,16 @@ public class AgentProbeResultSink
                     // per server restart, seen live on an agent site 2026-07-30.
                     // Skip the push (the agent keeps its last-known-good config)
                     // and adopt the disable only when a second consecutive
-                    // enumeration agrees.
-                    if (_snmpEmptyEnumerations.TryAdd($"{connection.SiteSlug}:{connection.AgentId}", true))
+                    // enumeration agrees, at least EmptyStrikeGap after the first:
+                    // handover re-pushes can enumerate twice within a second, and
+                    // two reads of the same empty moment are not confirmation.
+                    var strikeKey = $"{connection.SiteSlug}:{connection.AgentId}";
+                    var now = DateTime.UtcNow;
+                    var firstEmpty = _snmpEmptyEnumerations.GetOrAdd(strikeKey, now);
+                    if (!EmptyEnumerationConfirmed(firstEmpty, now))
                     {
                         _logger.LogDebug(
-                            "SNMP push for site {Slug}: console enumerated no SNMP-enabled devices; keeping agent {Id}'s last config until a second enumeration confirms",
+                            "SNMP push for site {Slug}: console enumerated no SNMP-enabled devices; keeping agent {Id}'s last config until a later enumeration confirms",
                             connection.SiteSlug, connection.AgentId);
                         return;
                     }
@@ -965,7 +1303,14 @@ public class AgentProbeResultSink
                 }
             }
 
-            connection.TrySend(new ServerMessage { SnmpConfig = config });
+            if (!connection.CommitSnmpPush(seq))
+            {
+                _logger.LogDebug("Dropped a stale SNMP push to agent {Id} (site {Slug}): a newer one was sent first",
+                    connection.AgentId, connection.SiteSlug);
+                return;
+            }
+            if (connection.TrySend(new ServerMessage { SnmpConfig = config }))
+                connection.CollectorSnmpSince ??= DateTime.UtcNow;
             if (config.Enabled)
                 _logger.LogDebug("Pushed SNMP config with {Count} device(s) to agent {Id} (site {Slug})",
                     config.Devices.Count, connection.AgentId, connection.SiteSlug);
@@ -1040,7 +1385,7 @@ public class AgentProbeResultSink
             var row = await db.MonitoringSettings.FirstOrDefaultAsync(ct);
             if (row == null) return settings;
             var before = row.SnmpDetectionState;
-            SnmpDetectionService.ApplyToSettings(row, detected, _credentialProtection);
+            SnmpDetectionService.ApplyToSettings(row, detected, _credentialProtection, siteSlug);
             row.LastSnmpDetection = DateTime.UtcNow;
             row.UpdatedAt = DateTime.UtcNow;
             await db.SaveChangesAsync(ct);
@@ -1186,12 +1531,15 @@ public class AgentProbeResultSink
         var stateObservedAt = DateTime.UtcNow;
         try
         {
+            var deviceState = _alertRegistry.GetFor(connection.SiteSlug).DeviceState;
             foreach (var device in deviceByMac.Values)
             {
                 _deviceTransitions.Record(connection.SiteSlug, device.Mac, device.State, stateObservedAt);
-                await _alertRegistry.GetFor(connection.SiteSlug).DeviceState.EvaluateAsync(
+                await deviceState.EvaluateAsync(
                     device.Mac, device.Name, device.Ip, device.DeviceType, device.State, stateObservedAt, ct);
             }
+            if (deviceByMac.Count > 0)
+                await deviceState.CompletePassAsync(stateObservedAt, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -1224,6 +1572,27 @@ public class AgentProbeResultSink
             var calc = InterfaceRateCalculator.Compute(
                 prevState, sample.InOctets, sample.OutOctets, timestamp, sample.HcCounters, sample.SpeedBps);
             _counterCache[key] = calc.NewState;
+
+            switch (calc.Outcome)
+            {
+                case InterfaceRateCalculator.Outcome.ResetConfirmed:
+                    _logger.LogInformation(
+                        "SNMP counter reset confirmed for {Slug} {Mac}/{IfName}; reseeding baseline.",
+                        connection.SiteSlug, sample.DeviceMac, sample.IfName);
+                    break;
+                case InterfaceRateCalculator.Outcome.ImplausibleRate:
+                    _logger.LogWarning(
+                        "Discarding implausible SNMP rate for {Slug} {Mac}/{IfName}: in={RateIn:F0} out={RateOut:F0} bps exceed link speed {LinkBps} bps (x{Margin}). Likely a corrupt counter read.",
+                        connection.SiteSlug, sample.DeviceMac, sample.IfName, calc.RejectedRateInBps ?? 0, calc.RejectedRateOutBps ?? 0,
+                        sample.SpeedBps, InterfaceRateCalculator.LinkSpeedToleranceFactor);
+                    break;
+                case InterfaceRateCalculator.Outcome.CeilingHeld:
+                    _logger.LogDebug(
+                        "Holding SNMP baseline for {Slug} {Mac}/{IfName}: in={RateIn:F0} out={RateOut:F0} bps is marginally over link speed {LinkBps} bps; the next window absorbs it.",
+                        connection.SiteSlug, sample.DeviceMac, sample.IfName, calc.RejectedRateInBps ?? 0, calc.RejectedRateOutBps ?? 0,
+                        sample.SpeedBps);
+                    break;
+            }
 
             // Mirror into the site's live caches the same way the local fast
             // tier does, so the site's Live View port table and map refresh
@@ -1310,7 +1679,7 @@ public class AgentProbeResultSink
 
             // A read the calculator does not trust is not stored: differenced, one bad sample
             // reads as the whole counter's worth of traffic.
-            if (calc.Outcome is InterfaceRateCalculator.Outcome.ResetPending or InterfaceRateCalculator.Outcome.ImplausibleRate)
+            if (calc.IsUntrusted)
                 continue;
 
             await influx.WriteInterfaceCountersAsync(
@@ -1484,7 +1853,7 @@ public class AgentProbeResultSink
             double? mem = health.HasMemoryUsedPercent ? health.MemoryUsedPercent : null;
             double? temp = health.HasTemperatureC ? health.TemperatureC : null;
             long? uptime = health.HasUptimeSeconds ? health.UptimeSeconds : null;
-            int? fanRpm = health.HasFanSpeedRpm ? health.FanSpeedRpm : null;
+            int? fanRpm = _fanGuard.Accept($"{connection.SiteSlug}/{health.DeviceMac}", health.HasFanSpeedRpm ? health.FanSpeedRpm : null);
 
             // Fill health fields SNMP didn't return from the console's cached UniFi device
             // data, mirroring the directly-monitored medium tier's CollectApiHealthFallbackAsync:
@@ -1771,10 +2140,13 @@ public class AgentProbeResultSink
                     .Select(p => p.DataPathInterface!)
                     .ToListAsync(ct);
                 config.WanIfnames.AddRange(wanIfnames.Distinct(StringComparer.OrdinalIgnoreCase));
+                // Round trips are Live Traffic detail: off with it for a site that turned it off.
+                config.FlowLatency = connection.HasCapability(AgentTunnelConnection.FlowLatencyCapability)
+                    && !await _liveTraffic.IsTurnedOffAsync(_settings, connection.SiteSlug);
             }
             connection.TrySend(new ServerMessage { ConntrackConfig = config });
-            _logger.LogDebug("Pushed conntrack config (enabled={Enabled}) to agent {Id} (site {Slug})",
-                config.Enabled, connection.AgentId, connection.SiteSlug);
+            _logger.LogDebug("Pushed conntrack config (enabled={Enabled}, flowLatency={FlowLatency}) to agent {Id} (site {Slug})",
+                config.Enabled, config.FlowLatency, connection.AgentId, connection.SiteSlug);
         }
         catch (Exception ex)
         {
@@ -1960,6 +2332,7 @@ public class AgentProbeResultSink
                 "{Count} result(s) from agent {Id} (site {Slug}) will not be stored: the site's InfluxDB client is not configured",
                 batch.Results.Count, connection.AgentId, connection.SiteSlug);
         var liveStats = _liveStatsRegistry.GetFor(connection.SiteSlug);
+        var pathEpisodes = _pathEpisodeRegistry.GetFor(connection.SiteSlug);
         var discarded = 0;
 
         foreach (var result in batch.Results)
@@ -1981,6 +2354,11 @@ public class AgentProbeResultSink
             var timestamp = DateTimeOffset.FromUnixTimeMilliseconds(result.TimestampUnixMs).UtcDateTime;
             var wanContext = context?.InfluxWanTag;
 
+            if (ScrubImplausibleRtt(result))
+                _logger.LogWarning(
+                    "Dropped an impossible round trip from agent {Id} for target {Target}",
+                    connection.AgentId, target.TargetId);
+
             await influx.WriteLatencyAsync(
                 targetId: target.TargetId,
                 vantagePoint: vantage,
@@ -1996,6 +2374,13 @@ public class AgentProbeResultSink
                 received: result.Received,
                 timestamp: timestamp,
                 wanContext: wanContext);
+
+            // Path Localization traces from this agent, bound the way the target's probes are.
+            var bind = ResolveSpecSourceIp(context, connection.AgentId);
+            pathEpisodes.Observe(target, context,
+                new Monitoring.PathLocalization.PathVantage(connection.AgentId, string.IsNullOrEmpty(bind) ? null : bind),
+                timestamp, result.HasRttAvgMs ? result.RttAvgMs : null, result.Sent, result.Received,
+                result.HasJitterMs ? result.JitterMs : null);
 
             // The site's live caches mirror what the local latency tier
             // records: fabric probes surface on that device's card, and every

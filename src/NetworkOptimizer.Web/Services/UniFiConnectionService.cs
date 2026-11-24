@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 using NetworkOptimizer.Alerts.Events;
 using NetworkOptimizer.Core.Enums;
 using NetworkOptimizer.Core.Helpers;
@@ -18,11 +19,13 @@ namespace NetworkOptimizer.Web.Services;
 /// <param name="PhysicalIfName">Physical port ifname, e.g. "eth6".</param>
 /// <param name="UplinkIfName">Data-path ifname, e.g. "eth6.100"/"ppp0" (where SQM deploys).</param>
 /// <param name="CounterIfName">SNMP counter ifname, e.g. "eth6" (where InfluxDB rates are stored).</param>
+/// <param name="PortDisabled">The gateway's port_table reports the physical port disabled and down.</param>
 public record PrimaryWanInterfaces(
     string NetworkGroup,
     string? PhysicalIfName,
     string? UplinkIfName,
-    string? CounterIfName);
+    string? CounterIfName,
+    bool PortDisabled = false);
 
 /// <summary>
 /// Manages the UniFi controller connection and configuration persistence.
@@ -60,6 +63,12 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
     private DateTime _firstAuthFailureAt;
     private readonly object _consoleAlertLock = new();
     private static readonly TimeSpan ConsoleFailureMinWindow = TimeSpan.FromSeconds(50);
+    private const string ConsoleFailedEventType = "console.connection_failed";
+    private const string ConsoleRestoredEventType = "console.connection_restored";
+    // A failure still open before a restart, read on the first probe and applied once it is in, so
+    // the restore is published. Probes are synchronous callbacks, so the read is never awaited.
+    private Task<Monitoring.OpenAlerts>? _consoleSeed;
+    private bool _consoleSeedApplied;
 
     // Cache to avoid repeated DB queries
     private DateTime _cacheTime = DateTime.MinValue;
@@ -103,6 +112,51 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
 
         // Start initialization in background (non-blocking)
         StartInitializationAsync();
+
+        _autoReconnectTimer = new Timer(_ => _ = AutoReconnectTickAsync(), null, AutoReconnectInterval, AutoReconnectInterval);
+    }
+
+    // The background reconnect lives here, not in a feature's loop: in the Monitoring collector it
+    // stopped with Monitoring, and a site with Monitoring off stayed down until a restart.
+    // 10 s: how long the banner outlives a console that is back. One sign-in per try, and
+    // ConnectWithSettingsAsync holds a rejected password and the login attempt limit across tries.
+    private static readonly TimeSpan AutoReconnectInterval = TimeSpan.FromSeconds(10);
+    private readonly Timer _autoReconnectTimer;
+    private int _autoReconnectRunning;
+    private volatile bool _disposed;
+
+    /// <summary>Set by a Disconnect in Settings, which the background reconnect must not undo.</summary>
+    private volatile bool _disconnectedByUser;
+
+    /// <summary>
+    /// One background reconnect try: only for a configured console that is down, not waiting on its
+    /// agent (the agent-connected hook reconnects that), and not disconnected on purpose.
+    /// </summary>
+    internal async Task AutoReconnectTickAsync()
+    {
+        if (Interlocked.Exchange(ref _autoReconnectRunning, 1) == 1) return;
+        try
+        {
+            if (_disposed || !IsInitialized || IsConnected || IsAwaitingAgent || _hasNoConsole || _disconnectedByUser)
+                return;
+            // The cached row, so an unconfigured site never touches the database from here.
+            if (_settings is not { IsConfigured: true, HasCredentials: true })
+                return;
+
+            var settings = await GetSettingsAsync();
+            if (!settings.IsConfigured || !settings.HasCredentials)
+                return;
+
+            await ConnectWithSettingsAsync(settings, onlyIfDisconnected: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Background console reconnect failed for site {Slug}", SiteSlug);
+        }
+        finally
+        {
+            Volatile.Write(ref _autoReconnectRunning, 0);
+        }
     }
 
     /// <summary>
@@ -129,9 +183,17 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
         // alert is published and standing". Latching a suppressed failure left it true with no
         // alert out, so a console that never recovered was never alerted on at all.
         var suppressed = IsInRolloutConsoleCycle();
-        bool publishFailed = false, publishRestored = false;
+        var seed = _consoleSeed ??= StartConsoleSeed();
+        bool publishFailed = false, publishRestored = false, markDown = false;
         lock (_consoleAlertLock)
         {
+            if (!_consoleSeedApplied && seed.IsCompleted)
+            {
+                _consoleSeedApplied = true;
+                if (seed.Result.Take(ConsoleFailedEventType, SiteSlug) != null)
+                    _consoleAlertActive = _consoleAlertArmed = true;
+            }
+
             if (success)
             {
                 if (_consoleAlertActive && !suppressed)
@@ -151,26 +213,32 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
                     _firstAuthFailureAt = DateTime.UtcNow;
                 _consecutiveAuthFailures++;
 
-                if (!_consoleAlertActive
-                    && !suppressed
-                    && _consecutiveAuthFailures >= 2
-                    && DateTime.UtcNow - _firstAuthFailureAt >= ConsoleFailureMinWindow)
+                var persistent = _consecutiveAuthFailures >= 2
+                    && DateTime.UtcNow - _firstAuthFailureAt >= ConsoleFailureMinWindow;
+                if (persistent && !_consoleAlertActive && !suppressed)
                 {
                     _consoleAlertActive = true;
                     publishFailed = true;
                 }
+                // The 50 s window keeps blips out of notifications only. A sign-in that never reached
+                // the console marks it down at once: a reverse proxy answers 502 instantly, so the
+                // timeout breaker never trips, and pages read IsConnected.
+                markDown = _isConnected && (persistent || _client?.LastLoginUnreachable == true);
             }
         }
 
+        if (markDown)
+            MarkConsoleUnresponsive(error);
+
         if (publishFailed)
         {
-            PublishConsoleAlert("console.connection_failed", AlertSeverity.Warning,
+            PublishConsoleAlert(ConsoleFailedEventType, AlertSeverity.Warning,
                 "UniFi Console connection failed",
                 $"Repeated attempts to authenticate with the UniFi Console have failed. Features that read the console API (Wi-Fi Optimizer, Config Optimizer, Security Audit, Threat Intelligence) are unavailable until it recovers. Last error: {error ?? "unknown"}");
         }
         if (publishRestored)
         {
-            PublishConsoleAlert("console.connection_restored", AlertSeverity.Info,
+            PublishConsoleAlert(ConsoleRestoredEventType, AlertSeverity.Info,
                 "UniFi Console connection restored",
                 "The connection to the UniFi Console has recovered.");
         }
@@ -187,6 +255,21 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
         lock (_consoleAlertLock)
         {
             _consecutiveAuthFailures = 0;
+        }
+    }
+
+    private Task<Monitoring.OpenAlerts> StartConsoleSeed()
+    {
+        try
+        {
+            // Every console alert in a site's database is this instance's, so the site is the subject.
+            return new Monitoring.OpenAlertSeed(_serviceProvider.GetService<IServiceScopeFactory>(), SiteSlug,
+                [ConsoleFailedEventType], _ => SiteSlug, _logger).OpenAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Console alert seed could not start for site {Site}", SiteSlug);
+            return Task.FromResult(Monitoring.OpenAlerts.None);
         }
     }
 
@@ -244,6 +327,10 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
     /// <summary>Shown while a site's agent-tunneled console waits for the agent to come online.</summary>
     private const string AwaitingAgentMessage =
         "This site's console connects through its on-site agent, which isn't online yet. It'll connect automatically as soon as the agent comes online.";
+
+    /// <summary>Returned to a console Save while the site is marked as having no UniFi Console.</summary>
+    private const string NoConsoleConnectMessage =
+        "This site is set up without a Console. Change that in Settings - Multi-Site to connect one.";
 
     /// <summary>Per-site setting key: the UniFi Console's display name (system.name).</summary>
     public const string ConsoleNameKey = "console.name";
@@ -373,6 +460,24 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
         OnConnectionChanged?.Invoke();
         return Task.CompletedTask;
     }
+
+    /// <summary>
+    /// Sign-in failed against a console that is not there, or has kept failing past the alert window:
+    /// mark it down so pages show the banner and stop signing in per call. The background reconnect clears it.
+    /// </summary>
+    private void MarkConsoleUnresponsive(string? error)
+    {
+        if (!_isConnected) return;
+        _isConnected = false;
+        _consoleUnresponsive = true;
+        _lastError = error ?? ConsoleUnresponsiveMessage;
+        _logger.LogWarning("Console for site {Slug} failed sign-in ({Error}); marking it unresponsive", SiteSlug, _lastError);
+        OnConnectionChanged?.Invoke();
+    }
+
+    /// <summary>Hands every config write to Change Control's write journal for this site.</summary>
+    private void HandleWriteSent(NetworkOptimizer.UniFi.UniFiWriteRecord record) =>
+        _serviceProvider.GetService<ChangeControl.ChangeControlRegistry>()?.Journal(SiteSlug, record);
 
     /// <summary>
     /// The client proved the console stopped answering mid-session. Marks it down so pages render
@@ -552,6 +657,13 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
     {
         try
         {
+            _hasNoConsole = await ReadHasNoConsoleAsync();
+            if (_hasNoConsole)
+            {
+                _logger.LogInformation("Site {Slug} has no UniFi Console; not connecting", SiteSlug);
+                return;
+            }
+
             using var scope = CreateSiteScope();
             var repository = scope.ServiceProvider.GetRequiredService<IUniFiRepository>();
 
@@ -564,8 +676,8 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
 
                 _logger.LogInformation("Loaded saved UniFi configuration for {Url}", settings.ControllerUrl);
 
-                // Auto-connect if we have credentials and RememberCredentials is true
-                if (settings.RememberCredentials && settings.HasCredentials)
+                // Auto-connect whenever credentials are saved
+                if (settings.HasCredentials)
                 {
                     // Only the default site connects at process startup and benefits from a brief
                     // settle delay. A secondary site's connection service is created on demand when
@@ -621,11 +733,87 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
         }
     }
 
+    private volatile bool _hasNoConsole;
+
+    /// <summary>
+    /// True when Settings - Multi-Site marks this (default) site as having no UniFi Console. Nothing
+    /// connects or retries while set, and <see cref="IsConnected"/> stays false: callers that treat
+    /// "not connected" as a problem check this first.
+    /// </summary>
+    public bool HasNoConsole => _hasNoConsole;
+
+    /// <summary>
+    /// The flag off the default site's row, honored only while multi-site is on: the setting lives
+    /// in Settings - Multi-Site, so with multi-site off it could not be cleared.
+    /// </summary>
+    private async Task<bool> ReadHasNoConsoleAsync()
+    {
+        if (SiteSlug != SiteManagementService.DefaultSiteSlug)
+            return false;
+
+        try
+        {
+            var factory = _serviceProvider.GetService<IDbContextFactory<NetworkOptimizerDbContext>>();
+            if (factory == null)
+                return false;
+
+            await using var db = await factory.CreateDbContextAsync();
+            var multiSite = await db.SystemSettings.AsNoTracking()
+                .FirstOrDefaultAsync(s => s.Key == SystemSettingKeys.MultiSiteEnabled);
+            if (!bool.TryParse(multiSite?.Value, out var enabled) || !enabled)
+                return false;
+
+            return await db.Sites.AsNoTracking().AnyAsync(s => s.IsDefault && s.HasNoConsole);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Could not read the no-console flag for site {Slug}", SiteSlug);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Re-reads <see cref="HasNoConsole"/> after the site row or the multi-site toggle changed.
+    /// Setting it drops the connection; clearing it reconnects with the saved settings.
+    /// </summary>
+    public async Task RefreshNoConsoleAsync()
+    {
+        var hasNoConsole = await ReadHasNoConsoleAsync();
+        if (hasNoConsole == _hasNoConsole)
+            return;
+
+        _hasNoConsole = hasNoConsole;
+        _logger.LogInformation("Site {Slug} {State}", SiteSlug,
+            hasNoConsole ? "now has no UniFi Console; disconnecting" : "has a UniFi Console again; reconnecting");
+
+        if (hasNoConsole)
+        {
+            _awaitingAgent = false;
+            _consoleUnresponsive = false;
+            _lastError = null;
+            await DisconnectAsync();
+            return;
+        }
+
+        // The no-console disconnect above is not the user's, so the background reconnect may retry.
+        _disconnectedByUser = false;
+        if (!await ReconnectAsync())
+            OnConnectionChanged?.Invoke();
+    }
+
     public bool IsConnected => _isConnected && _client != null;
     public bool IsInitialized { get; private set; }
     public string? LastError => _lastError;
 
     private bool _awaitingAgent;
+
+    /// <summary>The saved username and password ciphertext the Console last rejected, or null.</summary>
+    private string? _rejectedSavedLogin;
+    private DateTime _rejectedSavedLoginAt;
+
+    /// <summary>The login attempt limit hold, carried across the clients the automatic reconnects build.</summary>
+    private DateTime _loginLimitedUntil = DateTime.MinValue;
+    private TimeSpan _loginLimitBackoff = TimeSpan.Zero;
 
     /// <summary>
     /// True when this site's console is reached through its agent tunnel and that tunnel
@@ -651,6 +839,9 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
     public DateTime? LastConnectedAt => _lastConnectedAt;
     public bool IsUniFiOs => _client?.IsUniFiOs ?? false;
 
+    /// <summary>The console is reached through the site's On-Site Agent tunnel.</summary>
+    public bool IsViaAgent => _clientViaAgent;
+
     /// <summary>
     /// Gets the current connection config (for UI display)
     /// </summary>
@@ -666,7 +857,6 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
                 Password = "", // Never expose password
                 ApiKey = _settings.HasApiKey ? "saved" : null, // Signal that key exists without exposing it
                 Site = _settings.Site,
-                RememberCredentials = _settings.RememberCredentials,
                 IgnoreControllerSSLErrors = _settings.IgnoreControllerSSLErrors
             };
         }
@@ -765,6 +955,12 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
             return false;
         }
 
+        if (_hasNoConsole)
+        {
+            _lastError = NoConsoleConnectMessage;
+            return false;
+        }
+
         _logger.LogInformation("Connecting to UniFi controller at {Url}", config.ControllerUrl);
 
         await _connectGate.WaitAsync();
@@ -807,9 +1003,12 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
             );
             _client.AuthProbeCompleted += HandleAuthProbe;
             _client.ConsoleWentSilent += HandleConsoleWentSilent;
+            _client.WriteSent += HandleWriteSent;
 
-            // Attempt to authenticate
+            // Attempt to authenticate. A Save is never held, but its 429 still holds the reconnects after it.
             var success = await _client.LoginAsync();
+            _loginLimitedUntil = _client.LoginLimitedUntil;
+            _loginLimitBackoff = _client.LoginLimitBackoff;
 
             if (success)
             {
@@ -827,7 +1026,9 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
                 _isConnected = true;
                 _lastError = null;
                 _consoleUnresponsive = false;
+                _disconnectedByUser = false;
                 _lastConnectedAt = DateTime.UtcNow;
+                _rejectedSavedLogin = null;
 
                 // Save configuration to database
                 await SaveSettingsAsync(config);
@@ -878,9 +1079,12 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
     /// <summary>
     /// Connect using existing settings from database
     /// </summary>
-    private async Task<bool> ConnectWithSettingsAsync(UniFiConnectionSettings settings)
+    /// <param name="settings">The saved connection settings.</param>
+    /// <param name="onlyIfDisconnected">Skip when connected once the gate is held: a background try
+    /// queued behind a Save or another reconnect must not replace the client that one just built.</param>
+    private async Task<bool> ConnectWithSettingsAsync(UniFiConnectionSettings settings, bool onlyIfDisconnected = false)
     {
-        if (!settings.HasCredentials) return false;
+        if (!settings.HasCredentials || _hasNoConsole) return false;
 
         await _connectGate.WaitAsync();
         var notify = false;
@@ -893,6 +1097,26 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
 
         try
         {
+            if (onlyIfDisconnected && (IsConnected || _disconnectedByUser || IsAwaitingAgent))
+                return IsConnected;
+
+            // Read again under the gate. A caller that fetched settings before queueing behind a
+            // Save's connect would otherwise reconnect with the credentials that Save just replaced.
+            // Re-checked under the gate: the flag can be set while this connect waited its turn.
+            settings = await GetSettingsAsync();
+            if (!settings.HasCredentials || _hasNoConsole) return false;
+
+            // The automatic reconnects build a new client each time, so the client's own hold on a
+            // rejected password does not carry over; the same saved password waits here instead.
+            // A Save goes through ConnectAsync and is never held.
+            var savedLogin = settings.HasApiKey ? null : $"{settings.Username}|{settings.Password}";
+            if (savedLogin != null && savedLogin == _rejectedSavedLogin
+                && DateTime.UtcNow - _rejectedSavedLoginAt < UniFiApiClient.RejectedPasswordRetryInterval)
+            {
+                _logger.LogDebug("Not reconnecting site {Slug}: its saved password was rejected at {RejectedAt:u}", SiteSlug, _rejectedSavedLoginAt);
+                return false;
+            }
+
             // Decrypt credentials
             string? decryptedPassword = null;
             string? decryptedApiKey = null;
@@ -914,11 +1138,15 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
                 Password = decryptedPassword ?? "",
                 ApiKey = decryptedApiKey,
                 Site = settings.Site,
-                RememberCredentials = settings.RememberCredentials,
                 IgnoreControllerSSLErrors = settings.IgnoreControllerSSLErrors
             };
 
-            // Dispose existing client
+            // Dispose existing client, keeping its login attempt limit hold for the replacement
+            if (_client != null)
+            {
+                _loginLimitedUntil = _client.LoginLimitedUntil;
+                _loginLimitBackoff = _client.LoginLimitBackoff;
+            }
             _client?.Dispose();
             _client = null;
             _isConnected = false;
@@ -954,11 +1182,23 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
             );
             _client.AuthProbeCompleted += HandleAuthProbe;
             _client.ConsoleWentSilent += HandleConsoleWentSilent;
+            _client.WriteSent += HandleWriteSent;
+            _client.CarryLoginLimit(_loginLimitedUntil, _loginLimitBackoff);
 
             var success = await _client.LoginAsync(cts.Token);
+            _loginLimitedUntil = _client.LoginLimitedUntil;
+            _loginLimitBackoff = _client.LoginLimitBackoff;
+
+            if (!success && _client.PasswordRejected)
+            {
+                _rejectedSavedLogin = savedLogin;
+                _rejectedSavedLoginAt = DateTime.UtcNow;
+            }
 
             if (success)
             {
+                _rejectedSavedLogin = null;
+
                 // Validate the site ID by making a site-specific call
                 var (siteValid, siteError) = await _client.ValidateSiteAsync(cts.Token);
                 if (!siteValid)
@@ -973,6 +1213,7 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
                 _isConnected = true;
                 _lastError = null;
                 _consoleUnresponsive = false;
+                _disconnectedByUser = false;
                 _lastConnectedAt = DateTime.UtcNow;
 
                 // Cache the console's display name on auto-reconnect too, so the
@@ -1065,7 +1306,8 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
             settings.ControllerUrl = config.ControllerUrl;
             settings.Username = config.Username;
             settings.Site = config.Site;
-            settings.RememberCredentials = config.RememberCredentials;
+            // Retired setting: written true so an older build reading the column auto-connects.
+            settings.RememberCredentials = true;
             settings.IgnoreControllerSSLErrors = config.IgnoreControllerSSLErrors;
             settings.IsConfigured = true;
             settings.LastConnectedAt = DateTime.UtcNow;
@@ -1078,7 +1320,7 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
                 // API key auth: save key, clear username/password
                 if (!string.IsNullOrEmpty(config.ApiKey))
                 {
-                    settings.ApiKey = _credentialProtection.Encrypt(config.ApiKey);
+                    settings.ApiKey = _credentialProtection.EncryptForSite(config.ApiKey, SiteSlug);
                 }
                 settings.Username = null;
                 settings.Password = null;
@@ -1088,7 +1330,7 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
                 // Username/password auth: save credentials, clear API key
                 if (!string.IsNullOrEmpty(config.Password))
                 {
-                    settings.Password = _credentialProtection.Encrypt(config.Password);
+                    settings.Password = _credentialProtection.EncryptForSite(config.Password, SiteSlug);
                 }
                 settings.ApiKey = null;
             }
@@ -1121,13 +1363,15 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
     }
 
     /// <summary>
-    /// Disconnect from the controller
+    /// Disconnect from the controller. The background reconnect stays off until the next connect.
     /// </summary>
     public async Task DisconnectAsync()
     {
         await _connectGate.WaitAsync();
         try
         {
+            // Under the gate: a background connect finishing ahead of this would clear it again.
+            _disconnectedByUser = true;
             if (_client != null)
             {
                 try
@@ -1310,10 +1554,23 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
     }
 
     /// <summary>
+    /// Re-reads the saved settings, skipping the cache, and reconnects: for a settings change made outside
+    /// this service (a re-address moving the console URL).
+    /// </summary>
+    public Task<bool> ReloadAndReconnectAsync()
+    {
+        _settings = null;
+        _cacheTime = DateTime.MinValue;
+        return ReconnectAsync();
+    }
+
+    /// <summary>
     /// Attempt to reconnect using saved configuration
     /// </summary>
     public async Task<bool> ReconnectAsync()
     {
+        if (_hasNoConsole) return false;
+
         var settings = await GetSettingsAsync();
 
         if (!settings.IsConfigured || !settings.HasCredentials)
@@ -1347,6 +1604,9 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
         // If already connected, return immediately
         if (IsConnected) return true;
 
+        // No console to wait for.
+        if (_hasNoConsole) return false;
+
         // Already flipped to awaiting-agent (tunnel down or proven black-holed):
         // no poll can succeed until the agent reconnects, and pages reload via
         // OnConnectionChanged when it does. Waiting here would stall every page
@@ -1359,7 +1619,7 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
 
         // Check if we have saved credentials to connect with
         var settings = await GetSettingsAsync();
-        if (!settings.IsConfigured || !settings.HasCredentials || !settings.RememberCredentials)
+        if (!settings.IsConfigured || !settings.HasCredentials)
         {
             // No auto-connect will happen, don't wait
             return false;
@@ -1378,6 +1638,7 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
         while (DateTime.UtcNow - startTime < timeout)
         {
             if (IsConnected) return true;
+            if (_hasNoConsole) return false;
             await Task.Delay(pollInterval.Value);
         }
 
@@ -1445,6 +1706,12 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
 
         return devices;
     }
+
+    /// <summary>
+    /// The last fetched device list, without fetching or checking freshness. For watchers that must
+    /// not add Console load of their own; null until something has fetched devices.
+    /// </summary>
+    public IReadOnlyList<DiscoveredDevice>? CachedDevices => _cachedDevices;
 
     /// <summary>
     /// Invalidates the device cache, forcing a fresh fetch on next request.
@@ -1599,7 +1866,7 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
     {
         if (string.IsNullOrEmpty(networkGroup) || _client == null) return null;
         var rawDevices = await _client.GetDevicesAsync(ct);
-        var gw = rawDevices.FirstOrDefault(d => d.Type is "ugw" or "udm" or "uxg");
+        var gw = rawDevices.FirstOrDefault(d => d.Type is "ugw" or "udm" or "uxg" && d.DeviceType == DeviceType.Gateway);
         if (gw == null) return null;
 
         var wanInterfaces = gw.GetWanInterfaces();
@@ -1642,7 +1909,7 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
         var results = new List<PrimaryWanInterfaces>();
         if (_client == null) return results;
         var rawDevices = await _client.GetDevicesAsync(ct);
-        var gw = rawDevices.FirstOrDefault(d => d.Type is "ugw" or "udm" or "uxg");
+        var gw = rawDevices.FirstOrDefault(d => d.Type is "ugw" or "udm" or "uxg" && d.DeviceType == DeviceType.Gateway);
         if (gw == null) return results;
 
         var wanInterfaces = gw.GetWanInterfaces();
@@ -1657,7 +1924,10 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
                 ifnameToNg.TryGetValue(wan.IfName, out ng);
             ng ??= GatewayWanHelper.WanNetworkGroupFromKey(wan.Key);
             var counter = NetworkUtilities.PreferredWanCounterInterface(wan.IfName, wan.UplinkIfName);
-            results.Add(new PrimaryWanInterfaces(ng, wan.IfName, wan.UplinkIfName, counter));
+            // Both flags: a console that omits them leaves the port counted as live.
+            var portDisabled = !string.IsNullOrEmpty(wan.IfName) && gw.PortTable?.FirstOrDefault(p =>
+                string.Equals(p.IfName ?? p.Name, wan.IfName, StringComparison.OrdinalIgnoreCase)) is { Enable: false, Up: false };
+            results.Add(new PrimaryWanInterfaces(ng, wan.IfName, wan.UplinkIfName, counter, portDisabled));
         }
         return results;
     }
@@ -1706,7 +1976,7 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
 
             // Set device name from UniFi
             if (setDeviceName)
-                result.DeviceName = !string.IsNullOrEmpty(client.Name) ? client.Name : client.Hostname;
+                result.DeviceName = ClientNames.For(client);
 
             // Capture Wi-Fi signal for wireless clients
             if (!client.IsWired)
@@ -1811,6 +2081,8 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
 
     internal void DisposeOwned()
     {
+        _disposed = true;
+        _autoReconnectTimer.Dispose();
         _client?.Dispose();
         _connectGate.Dispose();
     }
@@ -1823,7 +2095,6 @@ public class UniFiConnectionConfig
     public string Password { get; set; } = "";
     public string? ApiKey { get; set; }
     public string Site { get; set; } = "default";
-    public bool RememberCredentials { get; set; } = true;
     /// <summary>
     /// Whether to ignore SSL certificate errors when connecting to the controller.
     /// Default is true because UniFi controllers use self-signed certificates.

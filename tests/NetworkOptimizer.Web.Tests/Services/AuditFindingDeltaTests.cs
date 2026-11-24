@@ -90,6 +90,92 @@ public class AuditFindingDeltaTests
     }
 
     [Fact]
+    public void GetIssueKey_PortlessFindingsWithSameTitle_DifferByMessage()
+    {
+        var plex = new AuditIssue { Title = "Firewall: Rule Order Issue", Description = "Allow rule 'Plex' may subvert deny rule 'Block IoT'" };
+        var other = new AuditIssue { Title = "Firewall: Rule Order Issue", Description = "Allow rule 'Any' may subvert deny rule 'Block Guest'" };
+
+        AuditService.GetIssueKey(plex).Should().NotBe(AuditService.GetIssueKey(other));
+        AuditService.GetIssueKey(plex).Should().Be(AuditService.GetIssueKey(
+            new AuditIssue { Title = plex.Title, Description = plex.Description }));
+    }
+
+    [Fact]
+    public void GetIssueKey_DismissalScope_IgnoresLiveCountsInMessage()
+    {
+        var before = new AuditIssue { Title = "UPnP: Ports Exposed", DeviceName = "Gateway", DismissalScope = "", Description = "UPnP has 3 active port mapping(s)" };
+        var after = new AuditIssue { Title = "UPnP: Ports Exposed", DeviceName = "Gateway", DismissalScope = "", Description = "UPnP has 5 active port mapping(s)" };
+
+        AuditService.GetIssueKey(before).Should().Be(AuditService.GetIssueKey(after));
+    }
+
+    [Fact]
+    public void GetIssueKey_RuleOrderIssue_AcknowledgedUnderTheOldTextStaysAcknowledged()
+    {
+        // An Acknowledge stored before the slice text keyed on the old message
+        const string oldMessage = "Allow rule 'allow-dns' may subvert deny rule 'block-trackers'";
+        var acknowledged = new AuditIssue { Title = "Firewall: Rule Order Issue", Description = oldMessage };
+
+        var engineIssue = new NetworkOptimizer.Audit.Models.AuditIssue
+        {
+            Type = NetworkOptimizer.Audit.IssueTypes.AllowSubvertsDeny,
+            Severity = AuditSeverity.Recommended,
+            Message = "Allow rule 'allow-dns' takes TCP/UDP port 53 traffic out of deny rule 'block-trackers'",
+            Metadata = new Dictionary<string, object> { { "dismissal_scope", oldMessage } }
+        };
+        var current = new AuditIssue
+        {
+            Title = "Firewall: Rule Order Issue",
+            Description = engineIssue.Message,
+            DismissalScope = AuditService.GetDismissalScope(engineIssue)
+        };
+
+        AuditService.GetIssueKey(current).Should().Be(AuditService.GetIssueKey(acknowledged));
+    }
+
+    [Fact]
+    public void GetIssueKey_ThreatExposedPortForward_IgnoresThreatCount_ButNotRestrictionOrPort()
+    {
+        AuditIssue Threat(int port, int count, string restriction)
+        {
+            var engineIssue = new NetworkOptimizer.Audit.Models.AuditIssue
+            {
+                Type = NetworkOptimizer.Audit.IssueTypes.ThreatExposedPortForward,
+                Severity = AuditSeverity.Recommended,
+                Message = $"Port forward for port {port} (Media) has been targeted by {count} threat events in the last 30 days.",
+                Metadata = new Dictionary<string, object>
+                {
+                    ["port"] = port, ["threat_count"] = count, ["source_restriction"] = restriction
+                }
+            };
+            return new AuditIssue
+            {
+                Title = "Threat: Actively Targeted Port Forward",
+                DeviceName = "Gateway",
+                Description = engineIssue.Message,
+                DismissalScope = AuditService.GetDismissalScope(engineIssue)
+            };
+        }
+
+        var key = AuditService.GetIssueKey(Threat(32400, 268, "OtherRestriction"));
+
+        AuditService.GetIssueKey(Threat(32400, 301, "OtherRestriction")).Should().Be(key);
+        AuditService.GetIssueKey(Threat(32400, 268, "None")).Should().NotBe(key);
+        AuditService.GetIssueKey(Threat(8443, 268, "OtherRestriction")).Should().NotBe(key);
+    }
+
+    [Fact]
+    public void GetIssueKey_PortAndClientFindings_IgnoreMessage()
+    {
+        var port = Issue("Port Lock Available");
+        port.Description = "changed";
+        var client = new AuditIssue { Title = "IoT Device on Wrong VLAN", DeviceName = "Plug", ClientMac = "aa:bb:cc:dd:ee:ff", Description = "x" };
+
+        AuditService.GetIssueKey(port).Should().Be("Port Lock Available|Port 3 on Switch|3");
+        AuditService.GetIssueKey(client).Should().Be("IoT Device on Wrong VLAN|Plug|");
+    }
+
+    [Fact]
     public void Compare_SystemFindings_Ignored()
     {
         var current = new[] { Issue("Fingerprint database unavailable", category: "System") };

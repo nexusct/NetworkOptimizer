@@ -20,6 +20,7 @@
 @inject SiteContextService SiteContext
 @inject SiteSwitchService SiteSwitch
 @inject SiteSpeedTestTargetResolver SiteTarget
+@inject ISystemSettingsService Settings
 @inject NavigationManager NavigationManager
 @inject IJSRuntime JS
 @inject Microsoft.AspNetCore.Mvc.ViewFeatures.IFileVersionProvider FileVersionProvider
@@ -30,6 +31,14 @@
 @inject NetworkOptimizer.Web.Services.ApAgent.IApAgentRoamService ApAgentRoam
 @inject MonitoringReadinessService Readiness
 @inject MonitoringLiveStatsRegistry LiveStatsRegistry
+@inject CircuitReconnectNotifier CircuitReconnect
+@inject IDisplayTimeZone DisplayTime
+@using NetworkOptimizer.Web.Services.Monitoring.LiveTraffic
+@using NetworkOptimizer.Web.Components.Shared.Monitoring.LiveTraffic
+@inject ILiveTrafficService LiveTraffic
+@inject ITailscaleDirectory Tailscale
+@inject IClientIcons ClientIcons
+@inject IAuthorizationService Authz
 
 <PageTitle>Client Performance - Network Optimizer</PageTitle>
 
@@ -44,6 +53,7 @@
     @* Page Header *@
     <div class="page-header client-dashboard-header">
         <div>
+            <PageBackButton />
             <h1>Client Performance</h1>
             <p class="page-description">Live signal strength, speed test history, connection path tracing, and walk-test signal mapping for @(_isOwnDevice ? "your device" : "a specific Wi-Fi client").@(_isOwnDevice ? _isInsecureContext ? " Leave this page open to collect signal data." : " Leave this page open while walking around to collect signal and location data." : "")</p>
         </div>
@@ -70,7 +80,7 @@
     {
         <div class="connection-banner">
             <div class="banner-content">
-                <span class="banner-icon">!</span>
+                <span class="banner-icon"><GatewayIcon /></span>
                 <div class="banner-text">
                     <strong>Not Connected</strong>
                     <span>Unable to reach the UniFi Console. Signal polling is paused.</span>
@@ -83,7 +93,7 @@
     {
         <div class="connection-banner">
             <div class="banner-content">
-                <span class="banner-icon">!</span>
+                <span class="banner-icon"><AppIcon Name="warning" /></span>
                 <div class="banner-text">
                     <strong>Polling Interrupted</strong>
                     <span>@_consecutiveFailures consecutive polls failed. Retrying...</span>
@@ -96,7 +106,7 @@
     {
         <div class="connection-banner">
             <div class="banner-content">
-                <span class="banner-icon">!</span>
+                <span class="banner-icon"><AppIcon Name="location" /></span>
                 <div class="banner-text">
                     <strong>GPS Unavailable</strong>
                     <span>Location data for signal mapping requires HTTPS. Connect via HTTPS to enable walk-test mapping.</span>
@@ -109,7 +119,7 @@
     {
         <div class="connection-banner">
             <div class="banner-content">
-                <span class="banner-icon">!</span>
+                <span class="banner-icon"><AppIcon Name="location" /></span>
                 <div class="banner-text">
                     <strong>Location Permission Denied</strong>
                     <span>Enable location access in your browser or device settings to collect GPS data for walk-test signal mapping.</span>
@@ -122,7 +132,7 @@
     {
         <div class="connection-banner">
             <div class="banner-content">
-                <span class="banner-icon">!</span>
+                <span class="banner-icon"><AppIcon Name="warning" /></span>
                 <div class="banner-text">
                     <strong>Device Offline</strong>
                     <span>This device is currently offline. Showing historical data. Live data will appear when it reconnects.</span>
@@ -201,7 +211,10 @@
         @* Identity Bar *@
         <div class="card identity-bar" data-tour="client-live">
             <div class="identity-row-1">
-                <div class="identity-info @(_client.IsVpn ? "identity-info-vpn" : null)">
+                @{
+                    var clientIconUrl = _client.IsVpn ? null : _clientIcons.UrlFor(_client.Mac);
+                }
+                <div class="identity-info @(_client.IsVpn ? "identity-info-vpn" : clientIconUrl != null ? "identity-info-icon" : null)">
                     @if (_client.IsVpn)
                     {
                         <span class="identity-vpn-icon @GetVpnTintClass(_client.VpnType)">
@@ -211,26 +224,56 @@
                             <h2 class="identity-name">@_client.DisplayName</h2>
                             <div class="identity-meta">
                                 <span>@_client.Ip</span>
+                                @if (_client.Tailnet is { } tailnetPeer)
+                                {
+                                    @if (!string.IsNullOrEmpty(tailnetPeer.Os))
+                                    {
+                                        <span class="identity-detail"><span class="meta-sep">·</span> <span data-tooltip="OS">@tailnetPeer.Os</span></span>
+                                    }
+                                    @if (TailnetDisplay.Owner(tailnetPeer) is { } owner)
+                                    {
+                                        <span class="identity-detail"><span class="meta-sep">·</span> <span data-tooltip="@(string.IsNullOrWhiteSpace(tailnetPeer.User) ? $"Tags: {owner}" : $"Owner: {owner}")">@TailnetDisplay.ShortOwner(owner)</span></span>
+                                    }
+                                }
                             </div>
                         </div>
                     }
                     else
                     {
-                        <h2 class="identity-name">@_client.DisplayName</h2>
+                        <ClientIcon Url="@clientIconUrl" Size="40" Class="identity-client-icon" />
+                        <div class="identity-text">
+                        <ClientNameEditor @key="_client.Mac" Mac="@_client.Mac" Name="@_client.Name" Hostname="@_client.Hostname" Class="identity-name-cell" TourId="client-rename"
+                                          ReadOnly="@_client.IsProtectDevice" OnRenamed="OnClientRenamed">
+                            <h2 class="identity-name">@_client.DisplayName</h2>
+                        </ClientNameEditor>
                         <div class="identity-meta">
                             <span>@_client.Mac</span>
                             <span class="meta-sep">·</span>
-                            <span>@_client.Ip</span>
+                            <ClientFixedIpEditor @key="_client.Mac" Mac="@_client.Mac" CurrentIp="@_client.Ip" TourId="client-fixed-ip"
+                                                 OnChanged="@(ip => _client.FixedIp = ip)">
+                                <span data-tooltip="@ClientFixedIpEditor.PendingTooltip(_client.Ip, _client.FixedIp)">@_client.Ip</span>
+                            </ClientFixedIpEditor>
                             @if (!string.IsNullOrEmpty(_client.Essid))
                             {
                                 <span class="meta-sep">·</span>
                                 <span data-tooltip="SSID">@_client.Essid</span>
                             }
+                            @if (!string.IsNullOrEmpty(_client.TailnetRouterBadge))
+                            {
+                                <span class="meta-sep">·</span>
+                                <span data-tooltip="Peers that route through this host appear as its own traffic, unless Network Optimizer reads its conntrack table">@_client.TailnetRouterBadge</span>
+                            }
+                        </div>
                         </div>
                     }
                 </div>
                 <div class="identity-signal">
-                    @if (_canSteer && _client is { IsWired: false, IsOffline: false, IsVpn: false })
+                    @if (_client.IsVpn && _client.Tailnet is { } tailnetDevice)
+                    {
+                        <MonitoringJumpButton Icon="MonitoringJumpButton.JumpIcon.Analyze" Tooltip="Open in Live Traffic"
+                                              OnClick="@(() => NavigationManager.NavigateTo($"/monitoring/live-traffic?dest={Uri.EscapeDataString(tailnetDevice.Name)}"))" />
+                    }
+                    @if (_canSteer && !OnApWithoutSteering && _client is { IsWired: false, IsOffline: false, IsVpn: false })
                     {
                         @* The gate is the service; this is the UX half, so a Viewer is never shown a
                            control that would refuse them. *@
@@ -318,7 +361,33 @@
             <div class="identity-row-2">
                 @if (_client.IsVpn)
                 {
-                    <span class="identity-detail detail-dim">Remote client - limited data available</span>
+                    @if (_client.Tailnet != null && (_client.Tailnet.Path ?? _tailnetPath) is { } tailnetPath)
+                    {
+                        <span class="identity-detail" data-tooltip="@TailnetDisplay.PathDetail(tailnetPath)">@TailnetDisplay.PathLabel(tailnetPath)</span>
+                        @if (TailnetDisplay.Traffic(_client.Tailnet) is { } tailnetTraffic)
+                        {
+                            <span class="identity-detail detail-dim">@tailnetTraffic</span>
+                        }
+                    }
+                    else if (_client.Tailnet != null)
+                    {
+                        <span class="identity-detail detail-dim">Connected over Tailscale</span>
+                    }
+                    else if (_client.VpnType == HopType.Tailscale && !_pickerTailnet.Connected)
+                    {
+                        @if (_canSetUpTailscale)
+                        {
+                            <span class="identity-detail identity-note detail-dim"><a href="/settings?tab=connection#tailscale">Set Up Tailscale</a> to see this device's name, owner, and how it connects</span>
+                        }
+                        else
+                        {
+                            <span class="identity-detail identity-note detail-dim">A Site Admin can set up Tailscale to show this device's name, owner, and how it connects</span>
+                        }
+                    }
+                    else
+                    {
+                        <span class="identity-detail detail-dim">Remote client - limited data available</span>
+                    }
                 }
                 else if (!_client.IsWired)
                 {
@@ -352,7 +421,7 @@
                         <span>@FormatProtocol(_client.Protocol)</span>
                         @if (_client.FixedApEnabled)
                         {
-                            <span class="badge-ap-lock" data-tooltip="Locked to @(_client.FixedApName ?? _client.FixedApMac ?? "AP")">&#128274; AP Locked</span>
+                            <span class="badge-ap-lock" data-tooltip="Locked to @(_client.FixedApName ?? _client.FixedApMac ?? "AP")"><ApLockIcon /> AP Locked</span>
                         }
                     </span>
                     <span class="identity-figures">
@@ -443,10 +512,13 @@
                         <button class="tab-btn @(_activeTab == "connection" ? "active" : "")"
                                 @onclick='() => SetActiveTab("connection")'>Connection</button>
                         <button class="tab-btn @(_activeTab == "data" ? "active" : "")"
-                                @onclick='() => SetActiveTab("data")'>Data</button>
+                                @onclick='() => SetActiveTab("data")'>Data / Apps</button>
                     </div>
                 }
-                <div class="time-range-selector">
+                @* On a desktop the Speed tab carries this filter on its Speed Tests heading instead: up
+                   here it read as driving the Throughput card, which has its own range. On a phone it
+                   stays in the bottom bar on every tab. *@
+                <div class="time-range-selector @(_activeTab == "speed" ? "speed-tab-filter" : "")">
                     @foreach (var tf in _timeFilters)
                     {
                         <button class="time-btn @(_selectedTimeFilter == tf.hours ? "active" : "")"
@@ -472,18 +544,116 @@
                     @if (ShowLiveChart)
                     {
                         <div class="card chart-card live-chart-card" data-tour="client-live-throughput">
-                            <h3>Live Throughput</h3>
-                            @if (_liveViewLinkEnabled)
-                            {
-                                <MonitoringJumpButton Icon="MonitoringJumpButton.JumpIcon.Watch"
-                                                      Tooltip="Watch the WAN and whole network in Live View"
-                                                      OnClick="OpenLiveViewAsync" />
-                            }
+                            <div class="chart-card-header throughput-header">
+                                <h3>@(_throughputHours == 0 ? "Live Throughput" : "Throughput")</h3>
+                                <div class="time-range-selector throughput-view">
+                                    <button class="time-btn @(_throughputView == "wan" ? "active" : "")" @onclick='() => SetThroughputViewAsync("wan")'>WAN</button>
+                                    <button class="time-btn @(_throughputView == "lan" ? "active" : "")" @onclick='() => SetThroughputViewAsync("lan")'>LAN + WAN</button>
+                                </div>
+                                <div class="card-header-right">
+                                    <div class="time-range-selector">
+                                        @foreach (var tr in _throughputRanges)
+                                        {
+                                            <button class="time-btn @(_throughputHours == tr.hours ? "active" : "")"
+                                                    @onclick="() => SetThroughputRange(tr.hours)">@tr.label</button>
+                                        }
+                                    </div>
+                                    @if (_liveViewLinkEnabled)
+                                    {
+                                        <MonitoringJumpButton Icon="MonitoringJumpButton.JumpIcon.Watch"
+                                                              Tooltip="Watch the WAN and whole network in Live View"
+                                                              OnClick="OpenLiveViewAsync" />
+                                    }
+                                </div>
+                            </div>
                             <div class="chart-container">
                                 <div id="client-live-chart"></div>
+                                @if (_throughputLoading)
+                                {
+                                    <div class="usage-card-spinner"><span class="spinner"></span></div>
+                                }
                             </div>
+                            @if (_throughputHours == 0 && LiveFeed is { } noteFeed)
+                            {
+                                <ClientLiveTrafficNote Feed="noteFeed" OnOpen='() => SetActiveTab("data")' />
+                            }
+                            @if (_throughputHours != 0 && _throughputSummary is { } ts)
+                            {
+                                var wanView = _throughputView == "wan";
+                                <div class="speed-hero-results throughput-summary">
+                                    @if (!wanView && ts.PeakDownBps is { } peakDown)
+                                    {
+                                        <div class="speed-metric">
+                                            <span class="speed-label">Peak Download</span>
+                                            <span class="speed-value speed-down">@DisplayFormatters.FormatRate(peakDown)</span>
+                                        </div>
+                                    }
+                                    @if (!wanView && ts.PeakUpBps is { } peakUp)
+                                    {
+                                        <div class="speed-metric">
+                                            <span class="speed-label">Peak Upload</span>
+                                            <span class="speed-value speed-up">@DisplayFormatters.FormatRate(peakUp)</span>
+                                        </div>
+                                    }
+                                    <div class="speed-metric">
+                                        <span class="speed-label">@(wanView ? "Average WAN Download" : "Average Download")</span>
+                                        <span class="speed-value speed-down">@DisplayFormatters.FormatRate(wanView ? ts.AvgWanDownBps : ts.AvgDownBps)</span>
+                                    </div>
+                                    <div class="speed-metric">
+                                        <span class="speed-label">@(wanView ? "Average WAN Upload" : "Average Upload")</span>
+                                        <span class="speed-value speed-up">@DisplayFormatters.FormatRate(wanView ? ts.AvgWanUpBps : ts.AvgUpBps)</span>
+                                    </div>
+                                </div>
+                            }
                         </div>
                     }
+
+                    <div class="section-header speed-tests-header">
+                        <div class="speed-tests-title">
+                            <h4>Speed Tests</h4>
+                            <span class="section-subtitle">@TimeFormatHelper.Pluralize(_resultRows.Count, "test")</span>
+                        </div>
+                        @if (_isOwnDevice && (!string.IsNullOrEmpty(_openSpeedTestUrl) || _wanTestUrl != null))
+                        {
+                            <div class="speed-actions">
+                                @if (!string.IsNullOrEmpty(_openSpeedTestUrl))
+                                {
+                                    <a href="@(_openSpeedTestUrl)?Run" target="_blank" rel="opener" class="btn btn-primary btn-lg">
+                                        Run Speed Test
+                                    </a>
+                                    <a href="@(_openSpeedTestUrl)?S=5&Run" target="_blank" rel="opener" class="btn btn-secondary btn-lg"
+                                       data-tooltip="5-second quick test (~15s total)" data-tooltip-hover-only>
+                                        Quick Test
+                                    </a>
+                                }
+                                @if (_wanTestUrl != null)
+                                {
+                                    @* Results land in Client WAN Test's history: this list is the client's LAN throughput. *@
+                                    <a href="@_wanTestUrl" target="_blank" rel="opener" class="btn btn-secondary btn-lg">
+                                        WAN Test
+                                    </a>
+                                }
+                            </div>
+                        }
+                        @* A phone keeps this filter in its bottom bar, so the heading carries none there. *@
+                        <div class="time-range-selector hide-mobile">
+                            @foreach (var tf in _timeFilters)
+                            {
+                                <button class="time-btn @(_selectedTimeFilter == tf.hours ? "active" : "")"
+                                        @onclick="() => SetTimeFilter(tf.hours)">@tf.label</button>
+                            }
+                        </div>
+                    </div>
+
+                    @if (_isOwnDevice && string.IsNullOrEmpty(_openSpeedTestUrl) && _agentOnGateway)
+                    {
+                        <p class="form-hint">
+                            No speed test server at this site yet: its Agent runs on the UniFi Gateway without the
+                            LAN speed test. Re-run the gateway installer with <code>--lan-speed-test</code>, or add an
+                            Agent on another box at the site.
+                        </p>
+                    }
+
                     @if (_latestSpeedResult != null)
                     {
                         <div class="card speed-hero">
@@ -526,7 +696,8 @@
                                 }
                             </div>
                             <div class="speed-hero-meta">
-                                <span>@_latestSpeedResult.TestTime.ToLocalTime().ToString("g")</span>
+                                <span>Latest in range</span>
+                                <span>@_latestSpeedResult.TestTime.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DateTime, DisplayFormat.Culture)</span>
                                 <span>@_latestSpeedResult.DurationSeconds s test</span>
                             </div>
                         </div>
@@ -538,86 +709,70 @@
                         </div>
                     }
 
-                    @* Speed Test Buttons *@
-                    @if (_isOwnDevice && !string.IsNullOrEmpty(_openSpeedTestUrl))
+                    @* Speed and Latency History, side by side on a desktop. One result draws no line, so
+                       the charts wait for a second; the latest result above already shows it. *@
+                    @if (_speedResults.Count > 1 && (_speedDownloadData.Count > 0 || _latencyPingData.Count > 0))
                     {
-                        <div class="speed-actions">
-                            <a href="@(_openSpeedTestUrl)?Run" target="_blank" rel="opener" class="btn btn-primary btn-lg">
-                                Run Speed Test
-                            </a>
-                            <a href="@(_openSpeedTestUrl)?S=5&Run" target="_blank" rel="opener" class="btn btn-secondary btn-lg"
-                               data-tooltip="5-second quick test (~15s total)" data-tooltip-hover-only>
-                                Quick Test
-                            </a>
-                        </div>
-                    }
-                    else if (_isOwnDevice && _agentOnGateway)
-                    {
-                        <p class="form-hint">
-                            Speed tests aren't available at this site - its agent runs on the UniFi gateway,
-                            which doesn't host the LAN speed test. Deploy a Docker or bare-metal agent on a
-                            separate box at the site to enable them.
-                        </p>
-                    }
-
-                    @* Speed History Chart *@
+                    <div class="speed-history-grid">
                     @if (_speedDownloadData.Count > 0)
                     {
                         <div class="card chart-card">
                             <h3>Speed History</h3>
-                            <div class="chart-container">
+                            <div class="chart-container chart-opens-results">
                                 <ApexChart @ref="_speedChart" TItem="SpeedChartPoint"
                                            Options="_speedChartOptions"
-                                           Height="@("250px")">
+                                           Height="@("220px")"
+                                           OnClick="OnSpeedChartClicked">
                                     <ApexPointSeries TItem="SpeedChartPoint"
                                                      Items="_speedDownloadData"
                                                      Name="Download"
                                                      SeriesType="SeriesType.Area"
-                                                     XValue="e => e.Timestamp"
+                                                     XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                      YValue="e => e.Value"
                                                      OrderBy="e => e.X" />
                                     <ApexPointSeries TItem="SpeedChartPoint"
                                                      Items="_speedUploadData"
                                                      Name="Upload"
                                                      SeriesType="SeriesType.Area"
-                                                     XValue="e => e.Timestamp"
+                                                     XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                      YValue="e => e.Value"
                                                      OrderBy="e => e.X" />
                                 </ApexChart>
                             </div>
                         </div>
                     }
-
-                    @* Latency History Chart *@
                     @if (_latencyPingData.Count > 0)
                     {
                         <div class="card chart-card">
                             <h3>Latency History</h3>
-                            <div class="chart-container">
+                            <div class="chart-container chart-opens-results">
                                 <ApexChart @ref="_latencyChart" TItem="SpeedChartPoint"
                                            Options="_latencyChartOptions"
-                                           Height="@("200px")">
+                                           Height="@("220px")"
+                                           OnClick="OnSpeedChartClicked">
                                     <ApexPointSeries TItem="SpeedChartPoint"
                                                      Items="_latencyPingData"
                                                      Name="Ping"
                                                      SeriesType="SeriesType.Line"
-                                                     XValue="e => e.Timestamp"
+                                                     XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                      YValue="e => e.Value"
                                                      OrderBy="e => e.X" />
                                     <ApexPointSeries TItem="SpeedChartPoint"
                                                      Items="_latencyJitterData"
                                                      Name="Jitter"
                                                      SeriesType="SeriesType.Line"
-                                                     XValue="e => e.Timestamp"
+                                                     XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                      YValue="e => e.Value"
                                                      OrderBy="e => e.X" />
                                 </ApexChart>
                             </div>
                         </div>
                     }
+                    </div>
+                    }
 
                     @* Speed Results Table *@
-                    @if (_speedResults.Count > 0)
+                    @if (_resultRows.Count > 0)
                     {
                         <div class="card results-card">
                             <h3>Test Results</h3>
@@ -644,12 +799,17 @@
                                     <tbody>
                                         @foreach (var r in GetPagedSpeedResults())
                                         {
+                                            // A LAN result is stored from the server's side, so the device's download is
+                                            // UploadMbps; a WAN result is already the site's (and the client's) download.
+                                            var wan = IsWanResult(r);
+                                            var down = wan ? r.DownloadMbps : r.UploadMbps;
+                                            var up = wan ? r.UploadMbps : r.DownloadMbps;
                                             <tr id="result-@r.Id" class="result-row @(_expandedResultId == r.Id ? "expanded" : "")"
                                                 @onclick="() => ToggleResultExpand(r.Id)">
                                                 <td>@FormatTimeShort(r.TestTime)</td>
-                                                <td class="hide-mobile"><span class="speed-down">@FormatSpeed(r.UploadMbps, "F1")</span> Mbps</td>
-                                                <td class="hide-mobile"><span class="speed-up">@FormatSpeed(r.DownloadMbps, "F1")</span> Mbps</td>
-                                                <td class="show-mobile"><span class="speed-down">@FormatSpeed(r.UploadMbps, "F0")</span> / <span class="speed-up">@FormatSpeed(r.DownloadMbps, "F0")</span></td>
+                                                <td class="hide-mobile"><span class="speed-down">@FormatSpeed(down, "F1")</span> Mbps</td>
+                                                <td class="hide-mobile"><span class="speed-up">@FormatSpeed(up, "F1")</span> Mbps</td>
+                                                <td class="show-mobile"><span class="speed-down">@FormatSpeed(down, "F0")</span> / <span class="speed-up">@FormatSpeed(up, "F0")</span></td>
                                                 @if (!HidesApRates)
                                                 {
                                                     <td class="hide-mobile">@RenderRate(r.WifiTxRateKbps, "speed-down")</td>
@@ -657,22 +817,24 @@
                                                     <td class="show-mobile">@RenderRateShort(r.WifiTxRateKbps, "speed-down") / @RenderRateShort(r.WifiRxRateKbps, "speed-up")</td>
                                                 }
                                                 <td class="hide-mobile">@(r.PingMs.HasValue ? $"{r.PingMs.Value:F1} ms" : "-")</td>
-                                                <td class="hide-mobile">@(r.Direction == SpeedTestDirection.BrowserToServer ? "Browser" : "iperf3")</td>
+                                                <td class="hide-mobile">@(wan ? "WAN" : r.Direction == SpeedTestDirection.BrowserToServer ? "Browser" : "iperf3")</td>
                                                 <td class="expand-chevron"><span>@(_expandedResultId == r.Id ? "▲" : "▼")</span></td>
                                             </tr>
-                                            @if (_expandedResultId == r.Id)
-                                            {
-                                                <tr class="result-details-row">
-                                                    <td colspan="@(HidesApRates ? 6 : 8)">
-                                                        <div class="result-details">
-                                                            <SpeedTestDetails Result="r" HideDeviceName="true" HideClientDashboardLink="true"
-                                                                              Perspective="SpeedPerspective.Device"
-                                                                              ShowLiveViewLink="_liveViewLinkEnabled"
-                                                                              OnDelete="HandleDeleteResult" OnNotesChanged="HandleNotesChanged" />
+                                            @* Always rendered, so the standard expand-wrapper can animate it open and shut. *@
+                                            <tr class="result-details-row">
+                                                <td colspan="@(HidesApRates ? 6 : 8)">
+                                                    <div class="expand-wrapper @(_expandedResultId == r.Id ? "expanded" : "")">
+                                                        <div class="expand-content">
+                                                            <div class="result-details">
+                                                                <SpeedTestDetails Result="r" HideDeviceName="true" HideClientDashboardLink="true"
+                                                                                  Perspective="@(wan ? SpeedPerspective.Wan : SpeedPerspective.Device)"
+                                                                                  ShowLiveViewLink="_liveViewLinkEnabled"
+                                                                                  OnDelete="HandleDeleteResult" OnNotesChanged="HandleNotesChanged" />
+                                                            </div>
                                                         </div>
-                                                    </td>
-                                                </tr>
-                                            }
+                                                    </div>
+                                                </td>
+                                            </tr>
                                         }
                                     </tbody>
                                 </table>
@@ -680,9 +842,9 @@
                             @if (SpeedTotalPages > 1)
                             {
                                 <div class="pagination">
-                                    <button class="btn btn-sm btn-secondary" disabled="@(_speedPage <= 1)" @onclick="() => ChangeSpeedPage(-1)">Prev</button>
-                                    <span class="pagination-info">Page @_speedPage of @SpeedTotalPages (@_speedResults.Count results)</span>
-                                    <button class="btn btn-sm btn-secondary" disabled="@(_speedPage >= SpeedTotalPages)" @onclick="() => ChangeSpeedPage(1)">Next</button>
+                                    <button class="btn btn-sm btn-secondary" disabled="@(_speedPage <= 1)" @onclick="() => ChangeSpeedPage(-1)"><AppIcon Name="chevron-left" /> Prev</button>
+                                    <span class="pagination-info">Page @_speedPage of @SpeedTotalPages (@_resultRows.Count results)</span>
+                                    <button class="btn btn-sm btn-secondary" disabled="@(_speedPage >= SpeedTotalPages)" @onclick="() => ChangeSpeedPage(1)">Next <AppIcon Name="chevron-right" /></button>
                                 </div>
                             }
                         </div>
@@ -735,6 +897,13 @@
                                     <span class="summary-value">@_client.ApClientCount</span>
                                 </div>
                             }
+                            @if (!string.IsNullOrEmpty(_client.Mac))
+                            {
+                                <a href="/wifi-optimizer?tab=client&client=@Uri.EscapeDataString(_client.Mac)" class="summary-wifi-link"
+                                   data-tooltip="View in Wi-Fi Optimizer" aria-label="View in Wi-Fi Optimizer">
+                                    <AppIcon Name="wifi" />
+                                </a>
+                            }
                         </div>
                     }
                     else if (_client.IsWired)
@@ -781,28 +950,28 @@
                                                      Items="_signalChartData"
                                                      Name="Signal"
                                                      SeriesType="SeriesType.Area"
-                                                     XValue="e => e.Timestamp"
+                                                     XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                      YValue="e => e.Value"
                                                      OrderBy="e => e.X" />
                                     <ApexPointSeries TItem="SignalChartPoint"
                                                      Items="_signalChannelData"
                                                      Name="Channel"
                                                      SeriesType="SeriesType.Line"
-                                                     XValue="e => e.Timestamp"
+                                                     XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                      YValue="e => e.Value"
                                                      OrderBy="e => e.X" />
                                     <ApexPointSeries TItem="SignalChartPoint"
                                                      Items="_signalApData"
                                                      Name="AP"
                                                      SeriesType="SeriesType.Line"
-                                                     XValue="e => e.Timestamp"
+                                                     XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                      YValue="e => e.Value"
                                                      OrderBy="e => e.X" />
                                     <ApexPointSeries TItem="SignalChartPoint"
                                                      Items="_signalBandData"
                                                      Name="Band"
                                                      SeriesType="SeriesType.Line"
-                                                     XValue="e => e.Timestamp"
+                                                     XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                      YValue="e => e.Value"
                                                      OrderBy="e => e.X" />
                                 </ApexChart>
@@ -838,7 +1007,7 @@
                                                     @if (row.IsRange)
                                                     {
                                                         @FormatSignalTime(entry.Timestamp)
-                                                        <span class="time-range-indicator">- @(entry.Timestamp.ToLocalTime().Date == row.EndTime.ToLocalTime().Date ? row.EndTime.ToLocalTime().ToString("HH:mm:ss") : FormatSignalTime(row.EndTime))</span>
+                                                        <span class="time-range-indicator">- @(entry.Timestamp.ToLocalTime(DisplayTime).Date == row.EndTime.ToLocalTime(DisplayTime).Date ? row.EndTime.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.TimeSeconds, DisplayFormat.Culture) : FormatSignalTime(row.EndTime))</span>
                                                         <span class="row-count">(@row.Count)</span>
                                                     }
                                                     else
@@ -864,9 +1033,9 @@
                             @if (SignalTotalPages > 1)
                             {
                                 <div class="pagination">
-                                    <button class="btn btn-sm btn-secondary" disabled="@(_signalPage <= 1)" @onclick="() => ChangeSignalPage(-1)">Prev</button>
+                                    <button class="btn btn-sm btn-secondary" disabled="@(_signalPage <= 1)" @onclick="() => ChangeSignalPage(-1)"><AppIcon Name="chevron-left" /> Prev</button>
                                     <span class="pagination-info">Page @_signalPage of @SignalTotalPages (@_cachedCollapsed.Count rows)</span>
-                                    <button class="btn btn-sm btn-secondary" disabled="@(_signalPage >= SignalTotalPages)" @onclick="() => ChangeSignalPage(1)">Next</button>
+                                    <button class="btn btn-sm btn-secondary" disabled="@(_signalPage >= SignalTotalPages)" @onclick="() => ChangeSignalPage(1)">Next <AppIcon Name="chevron-right" /></button>
                                 </div>
                             }
                         </div>
@@ -883,26 +1052,38 @@
                         <div class="card trace-card">
                             <h3>Network Path</h3>
                             <SpeedTestDetails PathAnalysis="_latestPoll.PathAnalysis" PathOnly="true"
+                                              Perspective="SpeedPerspective.Device"
+                                              LiveWifi="@ClientWifiLink.FromClient(_client)"
                                               ClientSignalDbm="@(_client?.SignalDbm)" ClientRadio="@(_client?.Band)" />
                         </div>
                     }
 
                     @* Connection History Graph *@
-                    @if (_connectionEvents.Count > 1)
+                    @if (_connectionChartData.Count > 0)
                     {
                         <div class="card chart-card">
-                            <h3>Connection History</h3>
-                            <div class="chart-container">
-                                <ApexChart @ref="_connectionChart" TItem="ConnectionChartPoint"
+                            <div class="conn-history-header">
+                                <h3>Connection History</h3>
+                                <span class="section-subtitle">@ConnectionSummary()</span>
+                            </div>
+                            <div class="conn-history-legend">
+                                @foreach (var band in _connectionTimeline!.Segments.Select(s => s.Band).Distinct().OrderBy(b => b))
+                                {
+                                    <span class="conn-legend-item"><span class="conn-legend-swatch" style="background: @BandColor(band)"></span>@(BandLabel(band) is { Length: > 0 } l ? l : (_client?.IsWired == true ? "Wired" : "Unknown band"))</span>
+                                }
+                            </div>
+                            @* The height is held, so a remount never collapses the card while the new chart draws. *@
+                            <div class="chart-container conn-history-chart" @key="_connectionChartKey" style="min-height: @(_connectionChartHeight)px">
+                                <ApexChart @ref="_connectionChart" TItem="ConnectionBar"
                                            Options="_connectionChartOptions"
-                                           Height="@("200px")">
-                                    <ApexPointSeries TItem="ConnectionChartPoint"
+                                           Height="@($"{_connectionChartHeight}px")">
+                                    <ApexRangeSeries TItem="ConnectionBar"
                                                      Items="_connectionChartData"
-                                                     Name="AP"
-                                                     SeriesType="SeriesType.Scatter"
-                                                     XValue="e => e.Timestamp"
-                                                     YValue="e => e.ApIndex"
-                                                     OrderBy="e => e.X" />
+                                                     Name="Connected"
+                                                     XValue="b => b.Lane"
+                                                     YMinValue="b => b.Start"
+                                                     YMaxValue="b => b.End"
+                                                     PointColor="b => b.Color" />
                                 </ApexChart>
                             </div>
                         </div>
@@ -932,7 +1113,7 @@
                                         @foreach (var evt in GetPagedConnectionEvents())
                                         {
                                             <tr class="@GetEventRowClass(evt.Type)">
-                                                <td>@evt.Timestamp.ToLocalTime().ToString("g")</td>
+                                                <td>@evt.Timestamp.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DateTimeSeconds, DisplayFormat.Culture)</td>
                                                 <td>
                                                     <span class="event-badge @GetEventBadgeClass(evt.Type)">
                                                         @FormatEventType(evt.Type)
@@ -971,9 +1152,9 @@
                             @if (ConnectionTotalPages > 1)
                             {
                                 <div class="pagination">
-                                    <button class="btn btn-sm btn-secondary" disabled="@(_connectionPage <= 1)" @onclick="() => ChangeConnectionPage(-1)">Prev</button>
+                                    <button class="btn btn-sm btn-secondary" disabled="@(_connectionPage <= 1)" @onclick="() => ChangeConnectionPage(-1)"><AppIcon Name="chevron-left" /> Prev</button>
                                     <span class="pagination-info">Page @_connectionPage of @ConnectionTotalPages (@_connectionEvents.Count events)</span>
-                                    <button class="btn btn-sm btn-secondary" disabled="@(_connectionPage >= ConnectionTotalPages)" @onclick="() => ChangeConnectionPage(1)">Next</button>
+                                    <button class="btn btn-sm btn-secondary" disabled="@(_connectionPage >= ConnectionTotalPages)" @onclick="() => ChangeConnectionPage(1)">Next <AppIcon Name="chevron-right" /></button>
                                 </div>
                             }
                         </div>
@@ -1043,6 +1224,10 @@
             {
                 @* ===== DATA TAB ===== *@
                 <div class="tab-pane" data-tour="client-data">
+                    @if (LiveFeed is { } liveFeed)
+                    {
+                        <ClientLiveTrafficCard Feed="liveFeed" ShowThroughputLink="_client?.IsOffline == false" OnOpenThroughput="OpenLiveThroughput" />
+                    }
                     @if (!_tabLoading && !_dataUsageLoading && (_dataUsage == null || (_dataUsage.Wan.Count == 0 && _dataUsage.Lan.Count == 0)))
                     {
                         <div class="empty-state">
@@ -1111,8 +1296,18 @@
                         @if (_dataUsage != null)
                         {
                         <div class="card chart-card">
-                            <div class="usage-chart-header">
+                            <div class="chart-card-header usage-chart-header">
                                 <h3>Usage</h3>
+                                <div class="usage-legend">
+                                    <button type="button" class="usage-legend-item @(_usageHiddenSeries.Contains("Download") ? "is-hidden" : "")"
+                                            @onclick='() => ToggleUsageSeriesAsync("Download")'>
+                                        <span class="usage-legend-marker usage-legend-download"></span>Download
+                                    </button>
+                                    <button type="button" class="usage-legend-item @(_usageHiddenSeries.Contains("Upload") ? "is-hidden" : "")"
+                                            @onclick='() => ToggleUsageSeriesAsync("Upload")'>
+                                        <span class="usage-legend-marker usage-legend-upload"></span>Upload
+                                    </button>
+                                </div>
                                 <div class="time-range-selector">
                                     <button class="time-btn @(_usageView == "wan" ? "active" : "")" @onclick="@(() => SetUsageViewAsync("wan"))">WAN</button>
                                     <button class="time-btn @(_usageView == "lan" ? "active" : "")" @onclick="@(() => SetUsageViewAsync("lan"))">LAN + WAN</button>
@@ -1123,21 +1318,29 @@
                                            Options="_usageChartOptions"
                                            Height="@("220px")">
                                     <ApexPointSeries TItem="SpeedChartPoint" Items="@(_usageView == "lan" ? _lanDownData : _wanDownData)" Name="Download"
-                                                     SeriesType="SeriesType.Bar" XValue="e => e.Timestamp" YValue="e => e.Value" OrderBy="e => e.X" />
+                                                     SeriesType="SeriesType.Bar" XValue="e => DisplayTime.ToChart(e.Timestamp)" YValue="e => e.Value" OrderBy="e => e.X" />
                                     <ApexPointSeries TItem="SpeedChartPoint" Items="@(_usageView == "lan" ? _lanUpData : _wanUpData)" Name="Upload"
-                                                     SeriesType="SeriesType.Bar" XValue="e => e.Timestamp" YValue="e => e.Value" OrderBy="e => e.X" />
+                                                     SeriesType="SeriesType.Bar" XValue="e => DisplayTime.ToChart(e.Timestamp)" YValue="e => e.Value" OrderBy="e => e.X" />
                                 </ApexChart>
                             </div>
                         </div>
                         }
-                        @if (_appUsage.Count > 0 || _appLoading)
+                        @if (_appUsage.Count > 0 || _appLoading || LiveFeed?.View?.State is LiveTrafficState.Live or LiveTrafficState.Starting)
                         {
                             <div class="card results-card">
                                 <h3>Applications</h3>
+                                @if (LiveFeed is { } appsFeed)
+                                {
+                                    <ClientLiveAppsStrip Feed="appsFeed" />
+                                }
                                 <p class="form-hint app-table-hint">WAN traffic by application, as UniFi Network identifies it.</p>
-                                @if (_appUsage.Count == 0)
+                                @if (_appUsage.Count == 0 && _appLoading)
                                 {
                                     <div class="loading-container"><div class="spinner"></div></div>
+                                }
+                                else if (_appUsage.Count == 0)
+                                {
+                                    <p class="lt-muted">No application traffic recorded for this time range.</p>
                                 }
                                 else
                                 {
@@ -1193,6 +1396,10 @@
                             </div>
                         }
                     }
+                    @if (LiveFeed is { } dnsFeed)
+                    {
+                        <ClientLiveDnsCard Feed="dnsFeed" />
+                    }
                 </div>
             }
         </div>
@@ -1217,6 +1424,41 @@
     private bool _pendingChartUpdate;
     private bool _tabLoading;
     private ClientIdentity? _client;
+
+    // Live Traffic on Data / Apps: one feed per open tab and client, holding the agent's lease.
+    private ClientLiveFeed? _liveFeed;
+
+    /// <summary>Data / Apps is open, or Live Throughput is live on the Speed tab: the two share one feed.</summary>
+    private bool LiveFeedWanted => !_disposed && _client is { IsVpn: false } c && !string.IsNullOrEmpty(c.Mac)
+        && (_activeTab == "data" || (ShowLiveChart && _throughputHours == 0));
+
+    /// <summary>The client's feed while <see cref="LiveFeedWanted"/>, started on first ask.</summary>
+    private ClientLiveFeed? LiveFeed
+    {
+        get
+        {
+            if (!LiveFeedWanted || _client is not { } c) return null;
+            if (_liveFeed?.ClientMac == c.Mac) return _liveFeed;
+            _liveFeed?.Dispose();
+            var ips = new[] { c.Ip, c.FixedIp }.Where(ip => !string.IsNullOrEmpty(ip)).Select(ip => ip!).Distinct().ToList();
+            _liveFeed = new ClientLiveFeed(LiveTraffic, InvokeAsync, c.Mac, c.Name ?? c.Hostname ?? "", ips, Logger);
+            _ = _liveFeed.SetHiddenAsync(_pageHidden);
+            _liveFeed.Start();
+            return _liveFeed;
+        }
+    }
+
+    /// <summary>From Data / Apps' Live Traffic card: the Speed tab with Throughput on Live.</summary>
+    private void OpenLiveThroughput()
+    {
+        SetThroughputRange(0);
+        SetActiveTab("speed");
+    }
+
+    private void OnClientRenamed((string Alias, string Shown) renamed)
+    {
+        if (_client != null) _client.Name = renamed.Shown;
+    }
     private WiredPortStats? _portStats;
     private bool _liveViewLinkEnabled;
     private bool _seenOnline;
@@ -1240,6 +1482,20 @@
     private double _liveChartAccWanDown, _liveChartAccWanUp;
     private int _liveChartAccWanN;
     private bool ShowLiveChart => _activeTab == "speed" && _client is { IsVpn: false, IsOffline: false };
+    // The Throughput card's own range, apart from the page filter that scopes speed test results.
+    // 0 is Live; any other value mounts the chart in history mode over that many hours.
+    private int _throughputHours;
+    private int _liveChartHours;
+    private int _throughputGeneration;
+    private bool _throughputLoading;
+    private DateTime _throughputHistoryAt;
+    // WAN | LAN + WAN under the Throughput chart, as on the Data tab's Usage card.
+    private string _throughputView = "lan";
+    private static readonly TimeSpan ThroughputHistoryRefresh = TimeSpan.FromSeconds(30);
+    private static readonly (int hours, string label)[] _throughputRanges =
+    {
+        (0, "Live"), (1, "1h"), (6, "6h"), (24, "24h"), (168, "7d"), (720, "30d")
+    };
     private SignalPollResult? _latestPoll;
     private string _activeTab = "speed";
     private int _selectedTimeFilter = 24; // hours, default 24h
@@ -1248,6 +1504,15 @@
 
     // Speed tab
     private List<Iperf3Result> _speedResults = new();
+    // The Test Results table: _speedResults (LAN, which the charts and map draw) plus the client's
+    // WAN tests, newest first. WAN tests measure the internet, so only the table lists them.
+    private List<Iperf3Result> _resultRows = new();
+    private List<Iperf3Result> _wanSpeedResults = new();
+
+    private void RebuildResultRows() =>
+        _resultRows = _speedResults.Concat(_wanSpeedResults).OrderByDescending(r => r.TestTime).ToList();
+
+    private static bool IsWanResult(Iperf3Result r) => r.Direction == SpeedTestDirection.OpenSpeedTestWan;
     private List<ApMapMarker> _apMapMarkers = new();
     private Iperf3Result? _latestSpeedResult;
     private List<SpeedChartPoint> _speedDownloadData = new();
@@ -1323,7 +1588,7 @@
     // The image request carries no fetch wrapper to stamp the tab's site, so it is stamped here.
     private string AppIconUrl(string domain)
     {
-        var path = $"/api/client-dashboard/app-icon/{Uri.EscapeDataString(domain)}";
+        var path = $"/api/client-dashboard/apps/{Uri.EscapeDataString(domain)}/icon";
         return SiteContext.IsDefault ? path : $"{path}?site={Uri.EscapeDataString(SiteContext.Slug)}";
     }
     private List<SpeedChartPoint> _wanDownData = new();
@@ -1333,10 +1598,14 @@
     private ApexChart<SpeedChartPoint>? _usageChart;
     private ApexChartOptions<SpeedChartPoint> _usageChartOptions = new();
     private string _usageView = "wan"; // "wan" or "lan": which totals the Usage chart plots
+    private readonly HashSet<string> _usageHiddenSeries = new();
     private int? _expandedResultId;
     private string? _openSpeedTestUrl;
     // The site's agent runs on the UniFi gateway (no speed-test listener at the site).
     private bool _agentOnGateway;
+    // The Client WAN Test page's run link for the default WAN server; null when the site has no
+    // server or could not attribute a result (ClientWanTestLink.CanRun).
+    private string? _wanTestUrl;
 
     // Signal tab
     private List<SignalHistoryEntry> _signalHistory = new();
@@ -1365,9 +1634,9 @@
     private int _connectionPage = 1;
     private const int ConnectionPageSize = 20;
     private DateTime? _expandedTraceTimestamp;
-    private List<ConnectionChartPoint> _connectionChartData = new();
-    private ApexChart<ConnectionChartPoint>? _connectionChart;
-    private ApexChartOptions<ConnectionChartPoint> _connectionChartOptions = new();
+    private List<ConnectionBar> _connectionChartData = new();
+    private ApexChart<ConnectionBar>? _connectionChart;
+    private ApexChartOptions<ConnectionBar> _connectionChartOptions = new();
 
     // Polling
     private System.Threading.Timer? _pollTimer;
@@ -1377,8 +1646,19 @@
     /// <summary>Whether the last poll found the client offline, which sets the tick rate.</summary>
     private bool _wasOffline;
 
-    /// <summary>Whether this site can steer: the AP Agent is on and at least two access points run it.</summary>
+    /// <summary>Whether this client can be steered from where it is now: the AP Agent runs on at least two access points and the holding one can send a request.</summary>
     private bool _canSteer;
+
+    /// <summary>The client state <see cref="_canSteer"/> was last resolved for, and when.</summary>
+    private string? _steeringIdentity;
+    private DateTime _steeringCheckedAt;
+
+    /// <summary>Access points whose agent cannot send a steer, read with <see cref="_canSteer"/>.</summary>
+    private HashSet<string> _apsWithoutSteering = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The client is on one of those, which it can roam onto or off at any poll.</summary>
+    private bool OnApWithoutSteering =>
+        !string.IsNullOrEmpty(_client?.ApMac) && _apsWithoutSteering.Contains(_client.ApMac.Trim());
 
     private bool _roamBusy;
     private bool _showRoamOptions;
@@ -1494,6 +1774,22 @@
                 SetActiveTab(newTab);
         }
         _lastTabParam = TabParam;
+
+        // A client switch is a full load (FullLoadAsync), and so must its Back. Chromium keeps the
+        // earlier entries on the reloaded document, so Back arrives here as a same-page ?ip= change.
+        if (_ipParamSeen && !string.Equals(IpParam, _lastIpParam, StringComparison.Ordinal))
+            _ = ReloadForClientChangeAsync();
+        _lastIpParam = IpParam;
+        _ipParamSeen = true;
+    }
+
+    private string? _lastIpParam;
+    private bool _ipParamSeen;
+
+    private async Task ReloadForClientChangeAsync()
+    {
+        try { await JS.InvokeVoidAsync("location.reload"); }
+        catch (JSDisconnectedException) { }
     }
 
     protected override async Task OnInitializedAsync()
@@ -1501,6 +1797,7 @@
         PtrState.RefreshCallback = () => LoadTabDataAsync();
         PtrState.NotifyStateChanged = StateHasChanged;
         ConnectionService.OnConnectionChanged += OnConsoleConnectionChanged;
+        CircuitReconnect.Reconnected += OnCircuitReconnected;
 
         _liveViewLinkEnabled = await Readiness.IsHistoricPlaybackAvailableAsync();
 
@@ -1540,6 +1837,10 @@
         ConfigureLatencyChart();
         ConfigureSignalChart();
         _usageChartOptions = CreateUsageChartOptions();
+        ChartTimeFormat.ApplyTimeAxis(_speedChartOptions.Xaxis.Labels, DisplayTime);
+        ChartTimeFormat.ApplyTimeAxis(_latencyChartOptions.Xaxis.Labels, DisplayTime);
+        ChartTimeFormat.ApplyTimeAxis(_signalChartOptions.Xaxis.Labels, DisplayTime);
+        ChartTimeFormat.ApplyTimeAxis(_usageChartOptions.Xaxis.Labels, DisplayTime);
 
         // Wait for UniFi controller connection (needed for client identity + AP data on signal map)
         await ConnectionService.WaitForConnectionAsync();
@@ -1547,9 +1848,9 @@
         // Identify client
         await IdentifyAndLoadAsync();
 
-        // _canSteer is resolved in IdentifyAndLoadAsync, which is the only place that knows when the
-        // client is actually in hand. On your own device the first attempt always returns null: the
-        // browser has to report its own address after first render before identity can run.
+        // Steering availability is resolved after identity and refreshed by later client polls. On
+        // your own device the first attempt always returns null: the browser has to report its own
+        // address after first render before identity can run.
 
         // Load AP markers for speed map (non-critical)
         try { _apMapMarkers = await ApMapService.GetApMapMarkersAsync(); }
@@ -1573,6 +1874,7 @@
                     await InvokeAsync(async () =>
                     {
                         await RefreshVpnSpeedAsync();
+                        await RefreshVpnTailnetAsync();
                         StateHasChanged();
                     });
                 }
@@ -1596,6 +1898,7 @@
                     await InvokeAsync(async () =>
                     {
                         await RefreshVpnSpeedAsync();
+                        await RefreshVpnTailnetAsync();
                         StateHasChanged();
                     });
                     return;
@@ -1662,9 +1965,18 @@
         }, null, TimeSpan.Zero, TimeSpan.FromSeconds(5));
     }
 
+    /// <summary>The site's client icons, for the identity bar. Empty until loaded.</summary>
+    private ClientIconMap _clientIcons = ClientIconMap.Empty;
+
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         await EnsureLiveChartAsync();
+        // Nothing shows it any more, or the client changed: the feed releases the agent's lease.
+        if (_liveFeed != null && (!LiveFeedWanted || _client?.Mac != _liveFeed.ClientMac))
+        {
+            _liveFeed.Dispose();
+            _liveFeed = null;
+        }
 
         // Apply deferred chart updates after render cycle completes (chart is now mounted)
         if (_pendingChartUpdate)
@@ -1674,6 +1986,8 @@
         }
 
         if (!firstRender) return;
+
+        _ = ClientIcons.LoadIntoAsync(map => InvokeAsync(() => { _clientIcons = map; StateHasChanged(); }), Logger);
 
         // Check if browser is in a secure context (HTTPS or localhost) - GPS requires it
         // Must be in OnAfterRenderAsync because JS interop isn't available during prerender
@@ -1691,7 +2005,8 @@
             if (_activeTab != "speed") target += "?tab=" + _activeTab;
             if (!string.IsNullOrEmpty(RangeParam))
                 target += (target.Contains('?') ? "&" : "?") + "range=" + Uri.EscapeDataString(RangeParam);
-            NavigationManager.NavigateTo(await SiteSwitch.StampSiteAsync(target), forceLoad: true);
+            // Replaces the ?ip= entry: kept, Back would land on it and it would redirect forward again.
+            await FullLoadAsync(target, replace: true);
             return;
         }
 
@@ -1742,6 +2057,26 @@
         // so we can skip it for wired devices
     }
 
+    private async Task RefreshSteeringAsync()
+    {
+        // Recheck after an AP move and periodically: native support depends on this client's
+        // current link, the destination's reports and the agent's latest capability probe.
+        var identity = $"{_client?.Mac}/{_client?.ApMac}/{_client?.Band}/{_client?.IsMlo}/{_client?.IsOffline}/{_client?.IsWired}/{_client?.IsVpn}";
+        if (identity == _steeringIdentity && DateTime.UtcNow - _steeringCheckedAt < TimeSpan.FromMinutes(1)) return;
+        _steeringIdentity = identity;
+        _steeringCheckedAt = DateTime.UtcNow;
+        _canSteer = false;
+        _apsWithoutSteering.Clear();
+        if (string.IsNullOrEmpty(_client?.Mac) || _client.IsOffline || _client.IsWired || _client.IsVpn) return;
+        try
+        {
+            _canSteer = await ApAgentRoam.IsAvailableAsync(_client.Mac);
+            if (_canSteer)
+                _apsWithoutSteering = new(await ApAgentRoam.GetApsWithoutSteeringAsync(), StringComparer.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) { Logger.LogDebug(ex, "Could not determine AP Agent steering availability"); }
+    }
+
     private async Task IdentifyAndLoadAsync()
     {
         _loading = true;
@@ -1760,14 +2095,13 @@
             if (_client?.IsVpn == true && _activeTab != "speed")
                 _activeTab = "speed";
 
-            // Steering availability depends on which client this is, so it can only be answered
-            // once there is one. Deliberately not restricted to your own device: moving a client
-            // stuck on the wrong access point is the point, and that client is rarely in your hand.
-            if (!_canSteer && !string.IsNullOrEmpty(_client?.Mac))
+            if (_client?.VpnType == HopType.Tailscale)
             {
-                try { _canSteer = await ApAgentRoam.IsAvailableAsync(_client.Mac); }
-                catch (Exception ex) { Logger.LogDebug(ex, "Could not determine AP Agent steering availability"); }
+                await LoadTailnetForVpnViewAsync();
+                _ = ReadTailnetPathAsync(_client.Ip);
             }
+
+            await RefreshSteeringAsync();
 
             // Poll now rather than at the next tick. The timer starts before the address is known,
             // so its first tick returns at PollAsync's own guard without counting - and the label
@@ -1834,13 +2168,23 @@
         if (string.IsNullOrEmpty(_clientIp) || _clientIp == "unknown")
             return null;
 
-        var identity = await DashboardService.IdentifyClientAsync(_clientIp);
+        return await IdentifyAddressAsync(_clientIp);
+    }
+
+    /// <summary>The client at this address on the site, or null when nothing matches.</summary>
+    private async Task<ClientIdentity?> IdentifyAddressAsync(string ip)
+    {
+        var identity = await DashboardService.IdentifyClientAsync(ip);
 
         // A viewer reaching the dashboard over Tailscale/Teleport/remote-user VPN is never
         // in the UniFi client list, so identity is null. Fall back to the simplified VPN
         // view - default site only, so managed-site behavior (whoami/picker) is untouched.
-        if (identity == null && SiteContext.IsDefault)
-            identity = await DashboardService.IdentifyVpnClientAsync(_clientIp);
+        // A Tailscale device chosen from the selector opens the same view on any site. The pick reloads
+        // the page, so the tailnet is read here rather than taken from the selector.
+        if (identity == null && !SiteContext.IsDefault && _pickerTailnet == TailnetSnapshot.Empty)
+            await LoadPickerTailnetAsync();
+        if (identity == null && (SiteContext.IsDefault || _pickerTailnet.IsPeer(ip)))
+            identity = await DashboardService.IdentifyVpnClientAsync(ip);
 
         return identity;
     }
@@ -1987,6 +2331,7 @@
             Logger.LogDebug(ex, "Client selector list could not be loaded (site {Site})", SiteContext.Slug);
             return;
         }
+        await LoadPickerTailnetAsync();
         StateHasChanged();
         // The header's "This device" jump needs the viewer's own address to know whether to show.
         if (!_isOwnDevice && _ownIp == null && await ResolveOwnIpAsync() != null)
@@ -2010,6 +2355,7 @@
             {
                 if (_pickerClients.Count == 0) return;
                 var refreshed = await DashboardService.RefreshSelectableClientsAsync(_pickerClients);
+                await LoadPickerTailnetAsync();
                 await InvokeAsync(() =>
                 {
                     _pickerClients = refreshed;
@@ -2030,12 +2376,25 @@
     private async Task ViewOwnDeviceAsync()
     {
         var target = _activeTab == "speed" ? "/client-dashboard" : $"/client-dashboard?tab={_activeTab}";
-        NavigationManager.NavigateTo(await SiteSwitch.StampSiteAsync(target), forceLoad: true);
+        await FullLoadAsync(target, replace: false);
+    }
+
+    /// <summary>
+    /// A full page load that keeps this tab's place in Blazor's history, so the global Back button
+    /// stays: NavigateTo(forceLoad) restarts that history at the new page. <paramref name="replace"/>
+    /// swaps the current entry instead of adding one.
+    /// </summary>
+    private async Task FullLoadAsync(string target, bool replace)
+    {
+        var url = await SiteSwitch.StampSiteAsync(target);
+        try { await JS.InvokeVoidAsync("__fullLoad", url, replace); }
+        catch (JSDisconnectedException) { NavigationManager.NavigateTo(url, forceLoad: true); }
     }
 
     private async Task ShowClientPickerAsync()
     {
         _pickerClients = await DashboardService.GetSelectableClientsAsync();
+        await LoadPickerTailnetAsync();
         try
         {
             var remembered = await JS.InvokeAsync<string?>("eval",
@@ -2053,11 +2412,72 @@
         StateHasChanged();
     }
 
-    /// <summary>The picker's choices. Same shape Client Stats uses, so the two read alike.</summary>
+    /// <summary>
+    /// The picker's choices. Same shape Client Stats uses, so the two read alike. Tailscale devices
+    /// follow the site's clients, keyed by their tailnet address, which opens their Tailscale view.
+    /// Client Stats lists Wi-Fi clients only, so it does not take them.
+    /// </summary>
     private IReadOnlyList<ClientSelector.Item> PickerItems() =>
         _pickerClients
             .Select(c => new ClientSelector.Item(c.Ip, c.Name, c.Mac, c.IsOnline, c.Ip, c.IsWired))
+            .Concat(_pickerTailnet.Peers
+                .Select(p => (Peer: p, Ip: p.Addresses.FirstOrDefault(a => !a.Contains(':')) ?? p.Addresses.FirstOrDefault()))
+                .Where(x => x.Ip != null && !_pickerClients.Any(c => string.Equals(c.Ip, x.Ip, StringComparison.OrdinalIgnoreCase)))
+                .Select(x => new ClientSelector.Item(x.Ip!, x.Peer.Name, null, x.Peer.Online ?? false, x.Ip, Detail: $"Tailscale · {x.Ip}")))
             .ToList();
+
+    /// <summary>The site's tailnet, for the picker's Tailscale devices; empty when the site does not read one.</summary>
+    private TailnetSnapshot _pickerTailnet = TailnetSnapshot.Empty;
+
+    private async Task LoadPickerTailnetAsync()
+    {
+        try { _pickerTailnet = await Tailscale.GetPeersAsync(); }
+        catch (Exception ex) { Logger.LogDebug(ex, "Tailscale devices for the client selector not read (site {Site})", SiteContext.Slug); }
+    }
+
+    /// <summary>How the Tailscale client connects, read after the page is up: off the gateway's flows it takes seconds.</summary>
+    private TailnetPathInfo? _tailnetPath;
+
+    /// <summary>A Site Admin here: the Tailscale setup line links to its Settings card.</summary>
+    private bool _canSetUpTailscale;
+
+    [CascadingParameter] private Task<Microsoft.AspNetCore.Components.Authorization.AuthenticationState>? AuthState { get; set; }
+
+    /// <summary>The tailnet and the viewer's role, for the Tailscale view's details or its setup line.</summary>
+    private async Task LoadTailnetForVpnViewAsync()
+    {
+        if (_pickerTailnet == TailnetSnapshot.Empty) await LoadPickerTailnetAsync();
+        if (AuthState != null)
+        {
+            var user = (await AuthState).User;
+            _canSetUpTailscale = (await Authz.AuthorizeAsync(user, SiteContext.Slug, Policies.SiteAdmin)).Succeeded;
+        }
+    }
+
+    /// <summary>
+    /// The VPN view's poll skips the identity poll, so the Tailscale details are re-read here: a cached
+    /// read that picks up an agent that connected after the page opened, and the path and counters it adds.
+    /// </summary>
+    private async Task RefreshVpnTailnetAsync()
+    {
+        if (_client is not { VpnType: HopType.Tailscale } client || string.IsNullOrEmpty(client.Ip)) return;
+        await LoadPickerTailnetAsync();
+        if (_pickerTailnet.Peer(client.Ip) is { } peer) client.Tailnet = peer;
+    }
+
+    private async Task ReadTailnetPathAsync(string? ip)
+    {
+        if (string.IsNullOrEmpty(ip) || !_pickerTailnet.Connected) return;
+        try
+        {
+            _tailnetPath = await Tailscale.GetPathAsync(ip);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Tailscale path for {Ip} not read (site {Site})", ip, SiteContext.Slug);
+        }
+        if (!_disposed) await InvokeAsync(StateHasChanged);
+    }
 
     private async Task ViewClientByIpAsync(string ip)
     {
@@ -2089,7 +2509,7 @@
         // Stay on the tab being compared across clients.
         if (_activeTab != "speed")
             target += (target.Contains('?') ? "&" : "?") + "tab=" + _activeTab;
-        NavigationManager.NavigateTo(await SiteSwitch.StampSiteAsync(target), forceLoad: true);
+        await FullLoadAsync(target, replace: false);
     }
 
     /// <summary>
@@ -2137,11 +2557,52 @@
     }
 
     /// <summary>
+    /// Own device only: a reconnect over another network (VPN off, back on the LAN) can make this
+    /// browser a different client. Reloads when the new address matches a client on the site;
+    /// a pinned ?ip= never moves.
+    /// </summary>
+    private void OnCircuitReconnected()
+    {
+        if (!_isOwnDevice || _disposed) return;
+        _ = InvokeAsync(async () =>
+        {
+            if (_reconnectCheckRunning) return;
+            _reconnectCheckRunning = true;
+            try
+            {
+                var previous = _ownIp;
+                _ownIp = null;
+                var address = await ResolveOwnIpAsync();
+                if (address == null)
+                {
+                    _ownIp = previous;
+                    return;
+                }
+                if (string.Equals(address, _clientIp, StringComparison.OrdinalIgnoreCase)) return;
+                if (await IdentifyAddressAsync(address) == null) return;
+
+                Logger.LogDebug("Client identity (site {Site}): reconnected as {Ip}, was {Previous}; reloading",
+                    SiteContext.Slug, address, _clientIp);
+                await ReloadPageAsync();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug(ex, "Client identity: reconnect address check failed");
+            }
+            finally
+            {
+                _reconnectCheckRunning = false;
+            }
+        });
+    }
+
+    private bool _reconnectCheckRunning;
+
+    /// <summary>
     /// Full-page retry. The reload target is stamped with this tab's site so a tab
     /// pinned to a non-default site doesn't fall back to the browser default.
     /// </summary>
-    private async Task ReloadPageAsync() =>
-        NavigationManager.NavigateTo(await SiteSwitch.StampSiteAsync(NavigationManager.Uri), forceLoad: true);
+    private Task ReloadPageAsync() => FullLoadAsync(NavigationManager.Uri, replace: true);
 
     /// <summary>
     /// How fast the live tick runs. The AP Agent's own fast tier samples at 1 Hz and pushes
@@ -2168,6 +2629,33 @@
         else
             _wifiThroughput = await DashboardService.GetWifiThroughputAsync(_client);
         await PushLiveSampleAsync();
+        await RefreshThroughputHistoryAsync();
+    }
+
+    /// <summary>
+    /// Re-pulls the history the Throughput card shows every <see cref="ThroughputHistoryRefresh"/>
+    /// while the page is in view, so the range's right edge keeps up with now without a live feed.
+    /// Updated in place: a remount would blink the chart and close an open tooltip.
+    /// </summary>
+    private async Task RefreshThroughputHistoryAsync()
+    {
+        if (!_liveChartReady || _liveChartHours == 0 || _throughputLoading || _pageHidden || _client == null) return;
+        if (DateTime.UtcNow - _throughputHistoryAt < ThroughputHistoryRefresh) return;
+        _throughputHistoryAt = DateTime.UtcNow;
+        var hours = _liveChartHours;
+        var generation = _throughputGeneration;
+        try
+        {
+            var (history, summary) = await LoadThroughputHistoryAsync(hours);
+            if (generation != _throughputGeneration || hours != _liveChartHours || !_liveChartReady) return;
+            _throughputSummary = summary;
+            using var chartCts = new CancellationTokenSource(LiveChartCallTimeout);
+            await JS.InvokeVoidAsync("__clientLiveChart.updateHistory", chartCts.Token, history);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Throughput history refresh failed");
+        }
     }
 
     // ---- Live Throughput chart ----
@@ -2175,31 +2663,54 @@
     private string VersionedJs(string path) => FileVersionProvider.AddFileVersionToPath("", path);
 
     /// <summary>
-    /// Mounts the chart when its div is on the page and tears it down when it is not, or when the
-    /// page has moved to another client. Runs after every render, since the div appears on one.
+    /// Mounts the chart when its div is on the page and tears it down when it is not, when the
+    /// page has moved to another client, or when the card's range changed. Runs after every
+    /// render, since the div appears on one.
     /// </summary>
     private async Task EnsureLiveChartAsync()
     {
         var want = ShowLiveChart;
-        if (_liveChartMounted && (!want || _liveChartMac != _client!.Mac))
+        if (_liveChartMounted && (!want || _liveChartMac != _client!.Mac || _liveChartHours != _throughputHours))
             await DisposeLiveChartAsync();
         if (!want || _liveChartMounted) return;
 
         _liveChartMounted = true;
         _liveChartReady = false;
         _liveChartMac = _client!.Mac;
+        _liveChartHours = _throughputHours;
         _liveChartPushedAt = null;
         _liveChartAccN = 0;
         try
         {
-            var (points, wanPoints) = await LoadLiveHistoryWithWanAsync();
             await JS.InvokeVoidAsync("eval",
-                "window.__mountClientLiveChart = async function(elId, points, wanPoints) {" +
+                "window.__mountClientLiveChart = async function(elId, opts) {" +
                 $"  const m = await import('{VersionedJs("/js/client-live-chart.js")}');" +
-                "  window.__clientLiveChart = m; return await m.mount(elId, { points, wanPoints }); }");
+                "  window.__clientLiveChart = m; return await m.mount(elId, opts); }");
+            object opts;
+            if (_liveChartHours == 0)
+            {
+                var (points, wanPoints) = await LoadLiveHistoryWithWanAsync();
+                opts = new { points, wanPoints, view = _throughputView };
+            }
+            else
+            {
+                var generation = ++_throughputGeneration;
+                _throughputLoading = true;
+                StateHasChanged();
+                var (history, summary) = await LoadThroughputHistoryAsync(_liveChartHours);
+                if (generation != _throughputGeneration) return;
+                _throughputLoading = false;
+                _throughputSummary = summary;
+                _throughputHistoryAt = DateTime.UtcNow;
+                StateHasChanged();
+                // A newer range was picked while this loaded; the next render mounts that one.
+                if (_liveChartHours != _throughputHours) return;
+                _dotNetRef ??= DotNetObjectReference.Create(this);
+                opts = new { history, dotNet = _dotNetRef, view = _throughputView };
+            }
             // False when the div is not in the DOM yet (a render still on the skeleton); the next
             // render tries again.
-            if (await JS.InvokeAsync<bool>("__mountClientLiveChart", "client-live-chart", points, wanPoints))
+            if (await JS.InvokeAsync<bool>("__mountClientLiveChart", "client-live-chart", opts))
                 _liveChartReady = true;
             else
                 _liveChartMounted = false;
@@ -2207,8 +2718,79 @@
         catch (Exception ex)
         {
             _liveChartMounted = false;
+            _throughputLoading = false;
             Logger.LogDebug(ex, "Live throughput chart mount failed");
         }
+    }
+
+    /// <summary>The figures under the Throughput card's history: peaks (null without them), the
+    /// averages across the range, and the WAN share's averages over the windows it was measured
+    /// in (null where it never was), which the WAN view shows instead.</summary>
+    private sealed record ThroughputSummary(double? PeakDownBps, double? PeakUpBps, double AvgDownBps, double AvgUpBps,
+        double? AvgWanDownBps, double? AvgWanUpBps);
+    private ThroughputSummary? _throughputSummary;
+
+    /// <summary>The Throughput card's history over the last <paramref name="hours"/>, with the
+    /// client's speed tests in that range as chart marks.</summary>
+    private async Task<(object Opts, ThroughputSummary Summary)> LoadThroughputHistoryAsync(int hours)
+    {
+        var history = await DashboardService.GetThroughputWindowsAsync(_client!, TimeSpan.FromHours(hours));
+        var tests = await DashboardService.GetSpeedResultsAsync(_client!.Mac, history.From, history.To);
+        // The device's frame: its download is the stored UploadMbps (what the server sent it).
+        var marks = tests.OrderBy(r => r.TestTime).Select(r => new
+        {
+            key = "speedtest",
+            time = new DateTimeOffset(NetworkOptimizer.Core.Helpers.DateTimeUtilities.AsUtc(r.TestTime)).ToUnixTimeMilliseconds(),
+            kind = "speedtest",
+            severity = "info",
+            title = "Speed Test",
+            detail = $"Download {r.UploadMbps:F1} Mbps, Upload {r.DownloadMbps:F1} Mbps",
+            reading = $"{r.UploadMbps:F0} / {r.DownloadMbps:F0} Mbps",
+            actionId = r.Id,
+            actionLabel = "Show in Test Results",
+        }).ToList();
+        var pts = history.Points;
+        var summary = new ThroughputSummary(
+            history.HasPeaks && pts.Count > 0 ? pts.Max(p => p.PeakDownloadBps ?? 0) : null,
+            history.HasPeaks && pts.Count > 0 ? pts.Max(p => p.PeakUploadBps ?? 0) : null,
+            pts.Count > 0 ? pts.Average(p => p.DownloadBps) : 0,
+            pts.Count > 0 ? pts.Average(p => p.UploadBps) : 0,
+            pts.Any(p => p.WanDownloadBps != null) ? pts.Where(p => p.WanDownloadBps != null).Average(p => p.WanDownloadBps!.Value) : null,
+            pts.Any(p => p.WanUploadBps != null) ? pts.Where(p => p.WanUploadBps != null).Average(p => p.WanUploadBps!.Value) : null);
+        return (new { history.From, history.To, history.WindowMs, history.HasPeaks, history.Points, marks }, summary);
+    }
+
+    /// <summary>WAN | LAN + WAN under the Throughput chart: redraws the mounted chart in place.</summary>
+    private async Task SetThroughputViewAsync(string view)
+    {
+        if (_throughputView == view) return;
+        _throughputView = view;
+        if (!_liveChartReady) return;
+        try
+        {
+            using var chartCts = new CancellationTokenSource(LiveChartCallTimeout);
+            await JS.InvokeVoidAsync("__clientLiveChart.setView", chartCts.Token, view);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Throughput view switch failed");
+        }
+    }
+
+    /// <summary>The Throughput range a speed test range maps to: the same hours, and All (0) to
+    /// the card's widest, 30d. Shared by both directions of the link, so neither undoes the other.</summary>
+    private static int ThroughputRangeFor(int speedFilterHours) => speedFilterHours == 0 ? 720 : speedFilterHours;
+
+    private void SetThroughputRange(int hours)
+    {
+        if (_throughputHours == hours) return;
+        _throughputHours = hours;
+        // A load still running for the old range is superseded; its spinner and figures go with it.
+        _throughputGeneration++;
+        _throughputLoading = false;
+        _throughputSummary = null;
+        // A past range scopes the speed tests to the same window; going back to Live leaves them.
+        if (hours != 0 && ThroughputRangeFor(_selectedTimeFilter) != hours) SetTimeFilter(hours);
     }
 
     private async Task<(IReadOnlyList<ThroughputSample> Points, IReadOnlyList<ThroughputSample> WanPoints)> LoadLiveHistoryWithWanAsync()
@@ -2233,7 +2815,7 @@
     /// </summary>
     private async Task PushLiveSampleAsync()
     {
-        if (!_liveChartReady || _client == null || _pageHidden) return;
+        if (!_liveChartReady || _liveChartHours != 0 || _client == null || _pageHidden) return;
         var (at, down, up) = _client.IsWired
             ? (_portStats?.At, _portStats?.DownloadBps, _portStats?.UploadBps)
             : (_wifiThroughput?.At, _wifiThroughput?.DownloadBps, _wifiThroughput?.UploadBps);
@@ -2425,6 +3007,7 @@
             {
                 _client = _latestPoll.Client;
                 TrackPresence();
+                await RefreshSteeringAsync();
                 await RefreshThroughputAsync();
                 _pollCount++;
 
@@ -2611,7 +3194,9 @@
             _dataUsage = usage;
             _dataLoadedAt = DateTime.UtcNow;
             // A day bar is a date; a time on it only says which midnight the day began at.
-            _usageChartOptions.Tooltip!.X!.Format = usage.Bucket >= TimeSpan.FromDays(1) ? "MMM dd" : "MMM dd, HH:mm";
+            var dayBars = usage.Bucket >= TimeSpan.FromDays(1);
+            _usageChartOptions.Tooltip!.X!.Format = dayBars ? "MMM dd" : "MMM dd, HH:mm";
+            _usageChartOptions.Tooltip.X.Formatter = dayBars ? ChartTimeFormat.TooltipDay : ChartTimeFormat.TooltipMinutes;
             // Keep the user's pick unless that side has nothing to plot.
             if (_usageView == "wan" && _dataUsage.Wan.Count == 0 && _dataUsage.Lan.Count > 0) _usageView = "lan";
             else if (_usageView == "lan" && _dataUsage.Lan.Count == 0 && _dataUsage.Wan.Count > 0) _usageView = "wan";
@@ -2685,6 +3270,11 @@
         _speedResults = _client!.IsVpn
             ? await DashboardService.GetSpeedResultsByHostAsync(_client.Ip ?? "", from, to)
             : await DashboardService.GetSpeedResultsAsync(_client.Mac, from, to);
+        // WAN results are keyed by MAC; a VPN client has none.
+        _wanSpeedResults = _client.IsVpn
+            ? new()
+            : await DashboardService.GetWanSpeedResultsAsync(_client.Mac, from, to);
+        RebuildResultRows();
         _latestSpeedResult = _speedResults.FirstOrDefault();
 
         // Build chart data (UTC timestamps - JS formatter converts to browser local time)
@@ -2698,14 +3288,14 @@
             // A one-direction result stores 0 for the leg it never measured; that leg gets no
             // point rather than a real-looking zero sawing the line to the floor.
             if (r.UploadMbps > 0)
-                rawDownload.Add(new SpeedChartPoint(r.TestTime, (decimal)r.UploadMbps, "download"));
+                rawDownload.Add(new SpeedChartPoint(r.TestTime, (decimal)r.UploadMbps, "download", r.Id));
             if (r.DownloadMbps > 0)
-                rawUpload.Add(new SpeedChartPoint(r.TestTime, (decimal)r.DownloadMbps, "upload"));
+                rawUpload.Add(new SpeedChartPoint(r.TestTime, (decimal)r.DownloadMbps, "upload", r.Id));
 
             if (r.PingMs.HasValue)
-                rawPing.Add(new SpeedChartPoint(r.TestTime, (decimal)r.PingMs.Value, "ping"));
+                rawPing.Add(new SpeedChartPoint(r.TestTime, (decimal)r.PingMs.Value, "ping", r.Id));
             if (r.JitterMs.HasValue)
-                rawJitter.Add(new SpeedChartPoint(r.TestTime, (decimal)r.JitterMs.Value, "jitter"));
+                rawJitter.Add(new SpeedChartPoint(r.TestTime, (decimal)r.JitterMs.Value, "jitter", r.Id));
         }
 
         // LTTB downsample speed charts, sync upload to same timestamps as download
@@ -2790,6 +3380,7 @@
         await Task.WhenAll(signalTask, speedTask);
         _signalMapPoints = await signalTask;
         _speedResults = await speedTask;
+        RebuildResultRows();
 
         // Build chart annotations for band/AP changes
         BuildSignalAnnotations();
@@ -2803,7 +3394,7 @@
         _signalChartOptions.Tooltip = new Tooltip
         {
             Theme = Mode.Dark,
-            X = new TooltipX { Format = "MMM dd, HH:mm" },
+            X = new TooltipX { Format = "MMM dd, HH:mm", Formatter = ChartTimeFormat.TooltipMinutes },
             Y = new TooltipY
             {
                 Formatter = $@"function(val, opts) {{
@@ -2843,7 +3434,7 @@
 
         foreach (var entry in _signalHistory)
         {
-            var ts = new DateTimeOffset(entry.Timestamp, TimeSpan.Zero).ToUnixTimeMilliseconds();
+            var ts = new DateTimeOffset(DisplayTime.ToChart(entry.Timestamp)).ToUnixTimeMilliseconds();
             bool added = false;
 
             // Detect band change - use band-specific colors
@@ -2967,6 +3558,8 @@
         _signalPage = 1;
         _speedPage = 1;
         _connectionPage = 1;
+        // A Throughput card showing history follows the speed test range; a live card stays live.
+        if (_throughputHours != 0) SetThroughputRange(ThroughputRangeFor(hours));
 
         // Reload data for all tabs with new time range
         _ = InvokeAsync(async () =>
@@ -3032,9 +3625,19 @@
                     // Options first, so the tooltip format matches the bucket the series carries.
                     await WithChartRetry(() => _usageChart.UpdateOptionsAsync(true, true, false));
                     await WithChartRetry(() => _usageChart.UpdateSeriesAsync(true));
+                    // The redraw shows every series again, so the header legend follows.
+                    _usageHiddenSeries.Clear();
                 }
                 break;
         }
+    }
+
+    /// <summary>The Usage header's legend: shows or hides one series, as the chart's own legend does.</summary>
+    private async Task ToggleUsageSeriesAsync(string name)
+    {
+        if (_usageChart == null) return;
+        await _usageChart.ToggleSeriesAsync(name);
+        if (!_usageHiddenSeries.Remove(name)) _usageHiddenSeries.Add(name);
     }
 
     private async Task SetUsageViewAsync(string view)
@@ -3064,7 +3667,7 @@
     /// <summary>Takes the map's View link to its row, paging to it and opening it on the way.</summary>
     private async Task ScrollToResult(int resultId)
     {
-        var index = _speedResults.FindIndex(r => r.Id == resultId);
+        var index = _resultRows.FindIndex(r => r.Id == resultId);
         if (index >= 0) _speedPage = (index / SpeedPageSize) + 1;
 
         _expandedResultId = resultId;
@@ -3075,6 +3678,37 @@
         try { await JS.InvokeVoidAsync("noHighlightRow", $"result-{resultId}"); }
         catch (Exception ex) { Logger.LogDebug(ex, "Could not scroll to speed test result {Id}", resultId); }
     }
+
+    /// <summary>A point on Speed History or Latency History was clicked: opens its row in Test Results.</summary>
+    private async Task OnSpeedChartClicked(SelectedData<SpeedChartPoint> data)
+    {
+        if (data?.DataPoint?.Items?.FirstOrDefault() is { ResultId: > 0 } point)
+            await ScrollToResult(point.ResultId);
+    }
+
+    /// <summary>
+    /// A speed test on the Throughput chart was clicked: opens its row in Test Results. A result
+    /// older than the Speed Tests range widens it first, to the smallest range that holds it.
+    /// </summary>
+    [JSInvokable]
+    public Task OpenSpeedResultFromChart(int resultId, long testTimeMs) => InvokeAsync(async () =>
+    {
+        if (_client == null) return;
+        if (!_speedResults.Any(r => r.Id == resultId))
+        {
+            var age = DateTimeOffset.UtcNow - DateTimeOffset.FromUnixTimeMilliseconds(testTimeMs);
+            _selectedTimeFilter = _timeFilters
+                .Where(tf => tf.hours > 0 && TimeSpan.FromHours(tf.hours) >= age)
+                .Select(tf => tf.hours)
+                .DefaultIfEmpty(0)
+                .First();
+            _signalPage = _speedPage = _connectionPage = 1;
+            var (from, to) = GetTimeRange();
+            await LoadSpeedDataAsync(from, to);
+            _pendingChartUpdate = true;
+        }
+        await ScrollToResult(resultId);
+    });
 
     private async Task HandleDeleteResult(int resultId)
     {
@@ -3253,7 +3887,7 @@
     }
 
     // Speed results pagination
-    private int SpeedTotalPages => Math.Max(1, (int)Math.Ceiling(_speedResults.Count / (double)SpeedPageSize));
+    private int SpeedTotalPages => Math.Max(1, (int)Math.Ceiling(_resultRows.Count / (double)SpeedPageSize));
 
     // AP RX/TX rate columns only apply to Wi-Fi clients - hide for wired and VPN clients.
     private bool HidesApRates => _client?.IsWired == true || _client?.IsVpn == true;
@@ -3295,7 +3929,7 @@
 
     private IEnumerable<Iperf3Result> GetPagedSpeedResults()
     {
-        return _speedResults.Skip((_speedPage - 1) * SpeedPageSize).Take(SpeedPageSize);
+        return _resultRows.Skip((_speedPage - 1) * SpeedPageSize).Take(SpeedPageSize);
     }
 
     private void ChangeSpeedPage(int delta)
@@ -3450,13 +4084,15 @@
     {
         if (_pageHidden == hidden) return;
         _pageHidden = hidden;
-        if (!hidden) OnPageShown();
+        if (hidden) _ = _liveFeed?.SetHiddenAsync(true);
+        else OnPageShown();
     }
 
     // Back in view: paint what the ticks kept current, and let the next push refill the
     // chart from the store for the stretch it was not fed.
     private void OnPageShown()
     {
+        _ = _liveFeed?.SetHiddenAsync(false);
         _liveChartHistoryAt = DateTime.MinValue;
         StateHasChanged();
     }
@@ -3536,6 +4172,12 @@
         // when no agent is online.
         var siteTarget = await SiteTarget.ResolveAsync();
         _agentOnGateway = siteTarget.AgentOnGateway;
+
+        var wanServer = ClientWanTestLink.DefaultServer(await Settings.GetExternalSpeedTestServersAsync());
+        _wanTestUrl = ClientWanTestLink.CanRun(SiteContext.IsDefault, siteTarget, wanServer)
+            ? ClientWanTestLink.RunUrl(siteTarget, wanServer)
+            : null;
+
         if (siteTarget.UsesAgent)
         {
             _openSpeedTestUrl = siteTarget.BaseUrl;
@@ -3573,11 +4215,7 @@
             Xaxis = new XAxis
             {
                 Type = XAxisType.Datetime,
-                Labels = new XAxisLabels
-                {
-                    DatetimeUTC = false,
-                    DatetimeFormatter = new DatetimeFormatter { Hour = "HH:mm", Day = "MMM dd" }
-                }
+                Labels = new XAxisLabels()
             },
             Yaxis = new List<YAxis>
             {
@@ -3603,7 +4241,7 @@
                 Theme = Mode.Dark,
                 Shared = true,
                 Intersect = false,
-                X = new TooltipX { Format = "MMM dd, HH:mm" },
+                X = new TooltipX { Format = "MMM dd, HH:mm", Formatter = ChartTimeFormat.TooltipMinutes },
                 // The shared Monitoring tooltip, via its window hook (a serialized function
                 // string cannot import the module): after LTTB the two legs no longer share x
                 // values, and the stock shared tooltip then resolves only the hovered series.
@@ -3634,11 +4272,7 @@
             Xaxis = new XAxis
             {
                 Type = XAxisType.Datetime,
-                Labels = new XAxisLabels
-                {
-                    DatetimeUTC = false,
-                    DatetimeFormatter = new DatetimeFormatter { Hour = "HH:mm", Day = "MMM dd" }
-                },
+                Labels = new XAxisLabels(),
                 // On a datetime axis the hover band spans the gap between points, well past the
                 // bar pair; the shared tooltip already says which bucket is under the cursor.
                 Crosshairs = new AxisCrosshairs { Show = false }
@@ -3662,13 +4296,14 @@
                 Theme = Mode.Dark,
                 Shared = true,
                 Intersect = false,
-                X = new TooltipX { Format = "MMM dd, HH:mm" },
+                X = new TooltipX { Format = "MMM dd, HH:mm", Formatter = ChartTimeFormat.TooltipMinutes },
                 Y = new TooltipY
                 {
                     Formatter = @"function(v) { const k = 1024; if (v >= k*k*k) return (v/(k*k*k)).toFixed(2) + ' GB'; if (v >= k*k) return (v/(k*k)).toFixed(1) + ' MB'; if (v >= k) return (v/k).toFixed(0) + ' KB'; return v + ' B'; }"
                 }
             },
-            Legend = new Legend { Show = true, Position = LegendPosition.Top }
+            // Drawn in the card header instead, on the heading's line (ToggleUsageSeriesAsync).
+            Legend = new Legend { Show = false }
         };
     }
 
@@ -3686,11 +4321,7 @@
             Xaxis = new XAxis
             {
                 Type = XAxisType.Datetime,
-                Labels = new XAxisLabels
-                {
-                    DatetimeUTC = false,
-                    DatetimeFormatter = new DatetimeFormatter { Hour = "HH:mm", Day = "MMM dd" }
-                }
+                Labels = new XAxisLabels()
             },
             Yaxis = new List<YAxis>
             {
@@ -3702,7 +4333,7 @@
             Tooltip = new Tooltip
             {
                 Theme = Mode.Dark,
-                X = new TooltipX { Format = "MMM dd, HH:mm" }
+                X = new TooltipX { Format = "MMM dd, HH:mm", Formatter = ChartTimeFormat.TooltipMinutes }
             },
             Legend = new Legend { Show = true, Position = LegendPosition.Top }
         };
@@ -3722,11 +4353,7 @@
             Xaxis = new XAxis
             {
                 Type = XAxisType.Datetime,
-                Labels = new XAxisLabels
-                {
-                    DatetimeUTC = false,
-                    DatetimeFormatter = new DatetimeFormatter { Hour = "HH:mm", Day = "MMM dd" }
-                }
+                Labels = new XAxisLabels()
             },
             Yaxis = new List<YAxis>
             {
@@ -3761,7 +4388,7 @@
             Tooltip = new Tooltip
             {
                 Theme = Mode.Dark,
-                X = new TooltipX { Format = "MMM dd, HH:mm" }
+                X = new TooltipX { Format = "MMM dd, HH:mm", Formatter = ChartTimeFormat.TooltipMinutes }
             },
             Legend = new Legend { Show = false }
         };
@@ -3817,20 +4444,20 @@
         _ => proto ?? "—"
     };
 
-    private static string FormatSignalTime(DateTime utcTimestamp)
+    private string FormatSignalTime(DateTime utcTimestamp)
     {
-        var local = utcTimestamp.ToLocalTime();
-        return local.Date == DateTime.Now.Date
-            ? local.ToString("HH:mm:ss")
-            : local.ToString("MMM dd HH:mm:ss");
+        var local = utcTimestamp.ToLocalTime(DisplayTime);
+        return local.Date == DisplayTime.Now.Date
+            ? local.ToString(DisplayTime.Format.TimeSeconds, DisplayFormat.Culture)
+            : local.ToString(DisplayTime.Format.DayTimeSeconds, DisplayFormat.Culture);
     }
 
-    private static string FormatTimeShort(DateTime utcTimestamp)
+    private string FormatTimeShort(DateTime utcTimestamp)
     {
-        var local = utcTimestamp.ToLocalTime();
-        return local.Date == DateTime.Now.Date
-            ? local.ToString("HH:mm")
-            : local.ToString("MMM dd HH:mm");
+        var local = utcTimestamp.ToLocalTime(DisplayTime);
+        return local.Date == DisplayTime.Now.Date
+            ? local.ToString(DisplayTime.Format.Time, DisplayFormat.Culture)
+            : local.ToString(DisplayTime.Format.DayTime, DisplayFormat.Culture);
     }
 
     /// <summary>
@@ -3918,13 +4545,16 @@
         public DateTime Timestamp { get; set; }
         public decimal Value { get; set; }
         public string Series { get; set; } = "";
+        /// <summary>The speed test behind the point, for a click on it; 0 when the point is not one test.</summary>
+        public int ResultId { get; }
         public long X => new DateTimeOffset(Timestamp, TimeSpan.Zero).ToUnixTimeMilliseconds();
 
-        public SpeedChartPoint(DateTime timestamp, decimal value, string series)
+        public SpeedChartPoint(DateTime timestamp, decimal value, string series, int resultId = 0)
         {
             Timestamp = DateTime.SpecifyKind(timestamp, DateTimeKind.Utc);
             Value = value;
             Series = series;
+            ResultId = resultId;
         }
     }
 
@@ -3959,89 +4589,136 @@
 
     // --- Connection Chart ---
 
-    private class ConnectionChartPoint
+    /// <summary>One bar on Connection History: a stretch on one AP, in chart milliseconds.</summary>
+    private sealed record ConnectionBar(string Lane, decimal Start, decimal End, string Color);
+
+    // Band colors from the palette; wired or unknown takes the primary graph teal.
+    private static string BandColor(string? band) => band switch
     {
-        public DateTime Timestamp { get; set; }
-        public decimal ApIndex { get; set; }
-        public string ApName { get; set; } = "";
-        public long X => new DateTimeOffset(Timestamp, TimeSpan.Zero).ToUnixTimeMilliseconds();
+        "ng" => "#fbbf24",
+        "na" => "#3b82f6",
+        "6e" => "#a855f7",
+        _ => "#2ba89a",
+    };
 
-        public ConnectionChartPoint(DateTime ts, decimal apIndex, string apName)
-        {
-            Timestamp = DateTime.SpecifyKind(ts, DateTimeKind.Utc);
-            ApIndex = apIndex;
-            ApName = apName;
-        }
-    }
+    private static string BandLabel(string? band) => band switch
+    {
+        "ng" => "2.4 GHz",
+        "na" => "5 GHz",
+        "6e" => "6 GHz",
+        _ => "",
+    };
 
+    private ClientConnectionTimeline.Result? _connectionTimeline;
+
+    /// <summary>
+    /// Connection History as a presence timeline: a lane per AP, a bar per stretch on it colored by
+    /// band, and gaps where the client was offline. Built from the same events as the table.
+    /// </summary>
     private void BuildConnectionChartData()
     {
-        _connectionChartData.Clear();
-
-        // Build AP name → index mapping from all AP names in events
-        var apNames = _connectionEvents
-            .SelectMany(e => new[] { e.ApName, e.ToApName, e.FromApName })
-            .Where(n => !string.IsNullOrEmpty(n))
-            .Distinct()
-            .OrderBy(n => n)
-            .ToList();
-
-        if (apNames.Count == 0) return;
-
-        var apIndex = new Dictionary<string, int>();
-        for (int i = 0; i < apNames.Count; i++)
-            apIndex[apNames[i]!] = i;
-
-        foreach (var evt in _connectionEvents.OrderBy(e => e.Timestamp))
+        var (from, to) = GetTimeRange();
+        // "All" has no start of its own: the earliest event stands in.
+        if (from == DateTime.MinValue && _connectionEvents.Count > 0)
+            from = _connectionEvents.Min(e => e.Timestamp.UtcDateTime);
+        _connectionTimeline = ClientConnectionTimeline.Build(_connectionEvents, from, to, connectedNow: _client?.IsOffline != true);
+        var segments = _connectionTimeline.Segments;
+        if (segments.Count == 0)
         {
-            // Show where the client is after the event
-            var ap = evt.Type == ClientConnectionEventType.Roamed
-                ? (evt.ToApName ?? evt.ApName ?? "Unknown")
-                : (evt.ApName ?? "Unknown");
-            if (apIndex.TryGetValue(ap, out var idx))
-            {
-                _connectionChartData.Add(new ConnectionChartPoint(
-                    evt.Timestamp.UtcDateTime, idx, ap));
-            }
+            _connectionChartData = new List<ConnectionBar>();
+            _connectionChartKey = null;
+            return;
         }
 
-        // Configure chart with AP names as Y categories
-        _connectionChartOptions = new ApexChartOptions<ConnectionChartPoint>
+        // The chart is keyed on its range and the stretches it draws (an open stretch's moving end
+        // left out). A change remounts it with fresh options and height; ApexChart applies neither on
+        // a series update, which left a 7-day range on the 24-hour axis. A poll tick changes nothing.
+        // Both moving edges are left out: a stretch clipped at the range start begins at now - range,
+        // which moves every poll as surely as an open stretch's end does.
+        var key = $"{_selectedTimeFilter}|" + string.Join(";", segments.Select(s =>
+            $"{s.Ap}/{s.Band}/{(s.Start <= from ? 0 : s.Start.Ticks)}/{(s.EndedBy == null ? 0 : s.End.Ticks)}"));
+        if (key == _connectionChartKey) return;
+        _connectionChartKey = key;
+        _connectionChartData = new List<ConnectionBar>();
+
+        long Ms(DateTime utc) => new DateTimeOffset(DateTime.SpecifyKind(DisplayTime.ToChart(utc), DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+        var tips = new List<string>();
+        foreach (var seg in segments)
         {
-            Chart = new Chart { Background = "transparent", Toolbar = new Toolbar { Show = false }, Zoom = new Zoom { Enabled = false } },
-            Theme = new Theme { Mode = Mode.Dark },
-            Xaxis = new XAxis
+            _connectionChartData.Add(new ConnectionBar(seg.Ap, Ms(seg.Start), Ms(seg.End), BandColor(seg.Band)));
+            tips.Add(ConnectionTip(seg));
+        }
+        var lanes = segments.Select(s => s.Ap).Distinct().Count();
+        // The axis strip plus a lane per AP; a phone's lanes are shorter, to keep the card small.
+        _connectionChartHeight = _isMobile ? 34 + lanes * 26 : 40 + lanes * 34;
+
+        _connectionChartOptions = new ApexChartOptions<ConnectionBar>
+        {
+            Chart = new Chart
             {
-                Type = XAxisType.Datetime,
-                Labels = new XAxisLabels
-                {
-                    DatetimeUTC = false,
-                    DatetimeFormatter = new DatetimeFormatter { Hour = "HH:mm", Day = "MMM dd" }
-                }
+                Background = "transparent", Toolbar = new Toolbar { Show = false }, Zoom = new Zoom { Enabled = false },
+                Animations = new Animations { Enabled = false },
+                // No strip under the axis: ApexCharts reserves 15 px there by default.
+                ParentHeightOffset = 0,
             },
+            Theme = new Theme { Mode = Mode.Dark },
+            PlotOptions = new PlotOptions { Bar = new PlotOptionsBar { Horizontal = true, BarHeight = "55%", RangeBarGroupRows = true } },
+            Xaxis = new XAxis { Type = XAxisType.Datetime, Min = Ms(from), Max = Ms(to), Labels = new XAxisLabels() },
             Yaxis = new List<YAxis>
             {
-                new YAxis
-                {
-                    Min = -0.5m,
-                    Max = apNames.Count - 0.5m,
-                    TickAmount = apNames.Count > 1 ? apNames.Count - 1 : 1,
-                    Labels = new YAxisLabels
-                    {
-                        Formatter = @"function(val) {
-                            var names = [" + string.Join(",", apNames.Select(n => "'" + n!.Replace("'", "\\'") + "'")) + @"];
-                            var idx = Math.round(val);
-                            return idx >= 0 && idx < names.length ? names[idx] : '';
-                        }"
-                    }
-                }
+                // On a phone the AP names move toward the axis and the left padding takes back most of
+                // the slack ApexCharts reserves left of them: the longest name sits 2 px in from the
+                // card's content edge.
+                new YAxis { Labels = new YAxisLabels { MaxWidth = _isMobile ? 120 : 160, OffsetX = _isMobile ? 8 : 0, Style = new AxisLabelStyle { FontSize = _isMobile ? "10px" : "11px" } } },
             },
-            Colors = new List<string> { "#3b82f6" },
-            Markers = new Markers { Size = 8 },
-            Grid = new Grid { BorderColor = "rgba(255,255,255,0.08)" },
-            Tooltip = new Tooltip { Theme = Mode.Dark },
-            Legend = new Legend { Show = false }
+            // The default padding left a band above the first lane and below the axis.
+            Grid = new Grid { BorderColor = "rgba(255,255,255,0.08)", Padding = new Padding { Top = -18, Right = 24, Bottom = -6, Left = _isMobile ? -7 : 8 } },
+            Tooltip = new Tooltip
+            {
+                Theme = Mode.Dark,
+                Custom = "function(o) { var d = " + System.Text.Json.JsonSerializer.Serialize(tips)
+                    + "; return '<div class=\"conn-tip\">' + (d[o.dataPointIndex] || '') + '</div>'; }",
+            },
+            Legend = new Legend { Show = false },
         };
+        ChartTimeFormat.ApplyTimeAxis(_connectionChartOptions.Xaxis.Labels, DisplayTime);
+        // ApexCharts shortens a label that overruns its slot ("Nov 19" read "Nov 1" at the plot's
+        // end); the grid's right padding is the room it needs whole.
+        _connectionChartOptions.Xaxis.Labels.Trim = false;
+    }
+
+    private int _connectionChartHeight = 120;
+    private string? _connectionChartKey;
+
+    // A bar's tooltip, as HTML: the AP and band, when and how long, and the signal either end.
+    private string ConnectionTip(ClientConnectionTimeline.Segment seg)
+    {
+        string Enc(string v) => System.Net.WebUtility.HtmlEncode(v);
+        string When(DateTime utc) => utc.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DateTime, DisplayFormat.Culture);
+        var band = BandLabel(seg.Band);
+        var head = $"<strong>{Enc(seg.Ap)}</strong>{(band.Length > 0 ? $" &middot; {band}" : "")}";
+        var span = $"{When(seg.Start)} - {(seg.EndedBy == null ? "now" : When(seg.End))} ({TimeFormatHelper.FormatDuration(seg.End - seg.Start)})";
+        var end = seg.EndedBy switch
+        {
+            ClientConnectionEventType.Roamed => $"Roamed away{(seg.EndSignal is int r ? $" at {r} dBm" : "")}",
+            ClientConnectionEventType.Disconnected => "Disconnected",
+            _ => "Connected now",
+        };
+        var start = seg.Signal is int s ? $"{s} dBm at connect &middot; " : "";
+        return $"{head}<br><span class=\"conn-tip-sub\">{span}</span><br><span class=\"conn-tip-sub\">{start}{end}</span>";
+    }
+
+    /// <summary>The line under Connection History's title: disconnects, roams, and the longest gap.</summary>
+    private string ConnectionSummary()
+    {
+        if (_connectionTimeline is not { } t) return "";
+        var parts = new List<string>
+        {
+            TimeFormatHelper.Pluralize(t.Disconnects, "disconnect"),
+            TimeFormatHelper.Pluralize(t.Roams, "roam"),
+        };
+        if (t.LongestOffline is { } gap) parts.Add($"longest offline {TimeFormatHelper.FormatDuration(gap)}");
+        return string.Join(" · ", parts);
     }
 
     // The device list comes from the console; on an agent site it connects after the page has
@@ -4060,9 +4737,11 @@
     {
         _disposed = true;
         ConnectionService.OnConnectionChanged -= OnConsoleConnectionChanged;
+        CircuitReconnect.Reconnected -= OnCircuitReconnected;
         _pollTimer?.Dispose();
         _identityRetryTimer?.Dispose();
         _pickerRefreshTimer?.Dispose();
+        _liveFeed?.Dispose();
         if (_liveChartMounted) await DisposeLiveChartAsync();
 
         // Stop GPS watcher
@@ -4129,13 +4808,6 @@
         }
     }
 
-    /* Loading */
-    .loading-container {
-        text-align: center;
-        padding: 3rem 1rem;
-        color: var(--text-secondary);
-    }
-
     /* Identity Bar (.card provides bg/border/radius) */
     .identity-bar {
         padding: 12px 16px;
@@ -4158,6 +4830,9 @@
         gap: 12px;
         margin-bottom: 8px;
     }
+    .identity-row-1:has(.identity-info-vpn) {
+        align-items: flex-start;
+    }
     .empty-state-detail {
         font-size: 0.8125rem;
         color: var(--text-muted);
@@ -4166,7 +4841,8 @@
     .identity-info {
         min-width: 0;
     }
-    .identity-info-vpn {
+    .identity-info-vpn,
+    .identity-info-icon {
         display: flex;
         align-items: center;
         gap: 12px;
@@ -4204,7 +4880,7 @@
         gap: 6px;
         color: var(--text-secondary);
         font-size: 0.75rem;
-        font-family: monospace;
+        font-family: var(--font-mono);
         flex-wrap: wrap;
     }
     .meta-sep {
@@ -4231,7 +4907,7 @@
         gap: 10px;
         padding: 20px;
         border: 1px solid var(--border-color);
-        border-radius: 8px;
+        border-radius: var(--border-radius-lg);
         background: var(--bg-secondary);
     }
     /* One button, two places. Desktop takes DOM order and puts it left of the gauge; on a phone the
@@ -4272,8 +4948,9 @@
         align-items: baseline;
         gap: 2px;
         padding: 6px 10px;
-        border-radius: 6px;
-        background: var(--bg-tertiary);
+        border-radius: var(--border-radius-lg);
+        background: var(--bg-inset);
+        box-shadow: inset 0 0 0 1px var(--border-color);
     }
     .signal-value {
         font-size: 1.5rem;
@@ -4329,9 +5006,39 @@
         font-size: 0.8125rem;
         color: var(--text-secondary);
         margin-bottom: 1rem;
+        position: relative;
+    }
+    /* Rules between the header's three groups (identity and signal, link details, figures). They
+       are drawn in the gaps the layout already has, so no row moves. */
+    /* Stops at three quarters: the logging button is pulled up across this boundary on the right. */
+    .identity-row-2::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        right: 25%;
+        top: -4px;
+        height: 1px;
+        background: var(--border-color);
     }
     .identity-detail {
         white-space: nowrap;
+    }
+    .identity-row-2 .speed-down,
+    .identity-row-2 .speed-up,
+    .signal-summary .summary-value {
+        font-family: var(--font-display);
+        word-spacing: var(--display-word-spacing);
+    }
+    .identity-row-2 .identity-tx,
+    .identity-row-2 .identity-rx,
+    .identity-row-2 .identity-throughput {
+        font-family: var(--font-display);
+        word-spacing: var(--display-word-spacing);
+    }
+    /* A sentence in the detail row (the Tailscale setup line): it wraps, and on a phone spans the grid. */
+    .identity-row-2 .identity-note {
+        white-space: normal;
+        grid-column: 1 / -1;
     }
     .identity-figures {
         display: contents;
@@ -4387,7 +5094,7 @@
     /* MLO badge (not in app.css) */
     .badge-mlo {
         padding: 0.125rem 0.5rem;
-        border-radius: 3px;
+        border-radius: var(--border-radius);
         font-size: 0.7rem;
         font-weight: 500;
         background: rgba(251, 191, 36, 0.15);
@@ -4397,7 +5104,7 @@
     .badge-ap-lock {
         margin-left: 0.5rem;
         padding: 0.125rem 0.375rem 0.125rem 0.25rem;
-        border-radius: 3px;
+        border-radius: var(--border-radius);
         font-size: 0.7rem;
         font-weight: 500;
         background: rgba(71, 151, 255, 0.15);
@@ -4440,7 +5147,7 @@
         display: flex;
         gap: 0.25rem;
         background: var(--bg-primary);
-        border-radius: 6px;
+        border-radius: var(--border-radius-lg);
         padding: 0.25rem;
     }
     .tab-btn {
@@ -4448,7 +5155,7 @@
         border: none;
         background: transparent;
         color: var(--text-secondary);
-        border-radius: 6px;
+        border-radius: var(--border-radius-lg);
         cursor: pointer;
         font-size: 0.875rem;
         font-weight: 500;
@@ -4460,7 +5167,8 @@
         background: var(--bg-tertiary);
     }
     .tab-btn.active {
-        background: var(--primary-color);
+        background: var(--selected-bg);
+        box-shadow: var(--selected-edge);
         color: white;
     }
 
@@ -4491,7 +5199,7 @@
     .speed-hero-link {
         cursor: pointer;
         border: 1px solid var(--bg-tertiary);
-        border-radius: 8px;
+        border-radius: var(--border-radius-lg);
         padding: 12px 16px;
         width: fit-content;
         margin: 0 auto;
@@ -4576,20 +5284,153 @@
     .usage-card .speed-hero-results {
         margin-bottom: 12px;
     }
-    /* The eye sits in the card's top-right corner, as it does on Latency & Packet Loss. */
-    .live-chart-card {
-        position: relative;
-    }
-    .live-chart-card > .monitoring-jump-btn {
-        position: absolute;
-        top: 0.75rem;
-        right: 0.75rem;
-        margin: 0;
-    }
-    .usage-chart-header {
+    /* A card heading with controls beside it (Throughput's range and eye, Usage's switch). The
+       header owns the gap below, so the heading and the controls center on one line. */
+    .chart-card-header {
         display: flex;
+        flex-wrap: wrap;
         justify-content: space-between;
         align-items: center;
+        gap: 0.5rem 0.75rem;
+        margin-bottom: 12px;
+    }
+    .chart-card .chart-card-header h3 {
+        margin: 0;
+    }
+    /* Takes the button's own right padding back, as on ISP Health, so the eye sits at the edge. */
+    .chart-card-header .monitoring-jump-btn {
+        margin-right: -0.35rem;
+    }
+    /* Held at its drawn height while a range reloads (header 34 + 12, chart 175, padding 40), and
+       the chart area takes what is left, so the loading spinner centers where the chart goes. */
+    .live-chart-card {
+        display: flex;
+        flex-direction: column;
+        min-height: 262px;
+    }
+    /* Throughput: title, WAN | LAN + WAN centered, the range and eye right, on one line. */
+    .throughput-header {
+        display: grid;
+        grid-template-columns: 1fr auto 1fr;
+    }
+    .throughput-header > h3 {
+        grid-column: 1;
+    }
+    .throughput-header > .throughput-view {
+        grid-column: 2;
+    }
+    .throughput-header > .card-header-right {
+        grid-column: 3;
+        justify-self: end;
+    }
+    .live-chart-card .chart-container {
+        flex: 1 1 auto;
+        position: relative;
+    }
+    /* The Speed tab's section heading: title, the speed test buttons centered, the filter right,
+       on one line. Columns are placed explicitly so a heading without buttons keeps its ends. The
+       gap below comes from the tab pane. */
+    .tab-pane > .speed-tests-header {
+        display: grid;
+        grid-template-columns: 1fr auto 1fr;
+        align-items: center;
+        gap: 0.75rem;
+        margin: 0.5rem 0 0;
+        /* The cards' 20px padding, so the heading lines up with their titles. */
+        padding: 0 20px;
+    }
+    .speed-tests-header > .speed-tests-title {
+        grid-column: 1;
+    }
+    .speed-tests-header > .speed-actions {
+        grid-column: 2;
+    }
+    .speed-tests-header > .time-range-selector {
+        grid-column: 3;
+        justify-self: end;
+    }
+    .speed-tests-header h4 {
+        margin: 0;
+    }
+    /* Usage: title, the series legend centered, the WAN / LAN + WAN switch right, on one line. */
+    .usage-chart-header {
+        display: grid;
+        grid-template-columns: 1fr auto 1fr;
+    }
+    .usage-chart-header > h3 {
+        grid-column: 1;
+    }
+    .usage-chart-header > .usage-legend {
+        grid-column: 2;
+    }
+    .usage-chart-header > .time-range-selector {
+        grid-column: 3;
+        justify-self: end;
+    }
+    .usage-legend {
+        display: flex;
+        gap: 1rem;
+    }
+    /* ApexCharts' legend, as HTML: same marker, text, and dimmed hidden state. */
+    .usage-legend-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 0;
+        border: none;
+        background: none;
+        color: var(--text-primary);
+        font: inherit;
+        font-size: 0.8125rem;
+        cursor: pointer;
+    }
+    .usage-legend-item.is-hidden {
+        opacity: 0.45;
+    }
+    .usage-legend-marker {
+        width: 12px;
+        height: 12px;
+        border-radius: 2px;
+    }
+    /* The chart's own series colors (CreateUsageChartOptions), so a marker matches its bars. */
+    .usage-legend-download {
+        background: var(--speed-download-color);
+    }
+    .usage-legend-upload {
+        background: var(--speed-upload-color);
+    }
+    .speed-tests-title {
+        display: flex;
+        align-items: baseline;
+        gap: 0.5rem;
+    }
+    /* Speed and Latency History share a row on a desktop; either one alone takes it whole. */
+    .speed-history-grid {
+        display: grid;
+        grid-auto-flow: column;
+        grid-auto-columns: minmax(0, 1fr);
+        gap: 1rem;
+    }
+    /* The history's figures sit under the chart, smaller than the speed test hero's. */
+    .throughput-summary {
+        margin-top: 12px;
+        padding-top: 12px;
+        border-top: 1px solid var(--border-color);
+    }
+    .throughput-summary .speed-value {
+        font-size: 1.125rem;
+    }
+    @@media (max-width: 900px) {
+        .speed-history-grid {
+            grid-auto-flow: row;
+        }
+    }
+    /* The Speed tab's filter lives on its Speed Tests heading above a phone's width; below it,
+       in the bottom bar with the tabs (the phone layout in the block further down). */
+    @@media (min-width: 769px) {
+        .dashboard-controls > .speed-tab-filter {
+            display: none;
+        }
     }
     .app-table-hint {
         margin-bottom: 0.5rem;
@@ -4613,7 +5454,7 @@
     .app-glyph {
         position: absolute;
         inset: 0;
-        border-radius: 4px;
+        border-radius: var(--border-radius);
     }
     .app-glyph {
         display: flex;
@@ -4624,6 +5465,8 @@
         color: var(--text-primary);
     }
     .app-icon img {
+        width: 100%;
+        height: 100%;
         object-fit: contain;
         background: var(--bg-tertiary);
     }
@@ -4641,15 +5484,16 @@
         display: block;
         width: 120px;
         height: 6px;
-        border-radius: 0 3px 3px 0;
-        background: var(--bg-tertiary);
+        background: var(--bg-inset);
+        box-shadow: inset 0 0 0 1px var(--border-strong);
         overflow: hidden;
     }
     .share-fill {
         display: block;
         height: 100%;
-        border-radius: 0 3px 3px 0;
         background: var(--speed-download-color);
+        -webkit-mask: var(--meter-face);
+        mask: var(--meter-face);
     }
     /* On a phone the two totals cards stay side by side, scaled down: Download over Upload in
        each, smaller figures, the meta lines stacked. */
@@ -4733,6 +5577,8 @@
     }
     .result-details-row td {
         padding: 0;
+        /* The row stays in the DOM when collapsed; .result-details draws the line when open. */
+        border-bottom: 0;
     }
     .expand-chevron {
         width: 2rem;
@@ -4749,6 +5595,53 @@
     .result-details .test-details {
         padding-left: 1rem;
         padding-right: 1rem;
+    }
+
+    /* Connection History: title and summary on one line, the band legend under them. */
+    .conn-history-header {
+        display: flex;
+        align-items: baseline;
+        flex-wrap: wrap;
+        gap: 0.25rem 0.75rem;
+    }
+    .conn-history-header h3 {
+        margin-bottom: 0;
+    }
+    .conn-history-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.35rem 1rem;
+        margin: 0.5rem 0 0.25rem;
+        font-size: 0.75rem;
+        color: var(--text-secondary);
+    }
+    .conn-legend-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+    }
+    .conn-legend-swatch {
+        width: 10px;
+        height: 10px;
+        border-radius: 2px;
+    }
+    /* The chart runs into the card's right padding, and its own 24 px right padding is room for the
+       last axis label, centred on the plot's end; the AP labels keep the left padding. */
+    .conn-history-chart {
+        margin-right: -1rem;
+    }
+    @@media (max-width: 768px) {
+        .conn-history-chart {
+            margin-right: -0.75rem;
+        }
+    }
+    .conn-tip {
+        padding: 0.5rem 0.65rem;
+        font-size: 0.75rem;
+        line-height: 1.5;
+    }
+    .conn-tip-sub {
+        color: var(--text-secondary);
     }
 
     /* Signal Bars (used in identity bar) */
@@ -4784,7 +5677,7 @@
         gap: 8px 20px;
         padding: 8px 16px;
         background: var(--bg-card);
-        border-radius: 8px;
+        border-radius: var(--border-radius-lg);
         font-size: 0.8125rem;
     }
     .summary-item {
@@ -4800,12 +5693,23 @@
         color: var(--text-primary);
         font-variant-numeric: tabular-nums;
     }
+    .signal-summary .summary-wifi-link {
+        display: inline-flex;
+        align-items: center;
+        margin-left: auto;
+        font-size: 1.125rem;
+        color: var(--text-muted);
+        transition: color 0.15s;
+    }
+    .signal-summary .summary-wifi-link:hover {
+        color: var(--primary-color);
+    }
 
     /* Connection Event badges */
     .event-badge {
         display: inline-block;
         padding: 2px 8px;
-        border-radius: 3px;
+        border-radius: var(--border-radius);
         font-size: 0.6875rem;
         font-weight: 500;
     }
@@ -4876,13 +5780,13 @@
         background: linear-gradient(90deg, var(--bg-tertiary) 25%, rgba(255,255,255,0.06) 50%, var(--bg-tertiary) 75%);
         background-size: 200% 100%;
         animation: skeleton-shimmer 1.5s ease-in-out infinite;
-        border-radius: 4px;
+        border-radius: var(--border-radius);
     }
     .skeleton-title { width: 200px; height: 28px; }
-    .skeleton-gauge { width: 90px; height: 48px; border-radius: 8px; margin-left: auto; }
+    .skeleton-gauge { width: 90px; height: 48px; border-radius: var(--border-radius-lg); margin-left: auto; }
     .skeleton-detail { width: 100px; height: 36px; }
-    .skeleton-tab { width: 80px; height: 44px; border-radius: 6px; }
-    .skeleton-chart-area { width: 100%; height: 200px; border-radius: 4px; }
+    .skeleton-tab { width: 80px; height: 44px; border-radius: var(--border-radius-lg); }
+    .skeleton-chart-area { width: 100%; height: 200px; border-radius: var(--border-radius); }
 
     @@keyframes skeleton-shimmer {
         0% { background-position: 200% 0; }
@@ -4933,22 +5837,63 @@
         .trace-card {
             padding-top: 13px;
         }
-        .live-chart-card > .monitoring-jump-btn {
-            top: 0.55rem;
-        }
         .chart-container {
             margin-left: -0.75rem;
         }
         /* The Usage switch is two words, not the page's time filter: it keeps its own size beside
            the heading instead of the phone's stretched time buttons. */
-        .usage-chart-header .time-range-selector {
+        .chart-card-header > .time-range-selector {
             flex: 0 0 auto;
             width: auto;
         }
-        .usage-chart-header .time-btn {
+        .chart-card-header > .time-range-selector .time-btn {
             flex: 0 0 auto;
             padding: 0.3rem 0.6rem;
             font-size: 0.75rem;
+        }
+        /* A time filter does not fit beside its heading on a phone: it takes the next row, full
+           width, with the app's stretched time buttons (Throughput's eye stays at its end). */
+        .chart-card-header > .card-header-right {
+            flex: 1 1 100%;
+            margin-left: 0;
+        }
+        /* Usage: title and switch on one line, the legend centered under them. */
+        .usage-chart-header {
+            grid-template-columns: 1fr auto;
+        }
+        .usage-chart-header > .time-range-selector {
+            grid-column: 2;
+            grid-row: 1;
+        }
+        .usage-chart-header > .usage-legend {
+            grid-column: 1 / -1;
+            grid-row: 2;
+            justify-self: center;
+        }
+        /* The heading stacks: title, then the full-width buttons (the filter is in the bottom bar). */
+        .tab-pane > .speed-tests-header {
+            grid-template-columns: minmax(0, 1fr);
+        }
+        .speed-tests-header > .speed-tests-title,
+        .speed-tests-header > .speed-actions {
+            grid-column: 1;
+        }
+        /* Title and the compact WAN switch share the first row (31.4, the switch's height), the
+           range takes the second: top 13, 31.4, gap 8, range 38.7, then 12 + 175 + 20. */
+        .live-chart-card {
+            min-height: 299px;
+        }
+        .throughput-header {
+            grid-template-columns: 1fr auto;
+        }
+        .throughput-header > .throughput-view {
+            grid-column: 2;
+            grid-row: 1;
+        }
+        .throughput-header > .card-header-right {
+            grid-column: 1 / -1;
+            grid-row: 2;
+            justify-self: stretch;
         }
         /* Live Throughput bleeds into the card's 1rem phone padding on both sides: the newest
            sample lands on the right edge, the value labels sit close to the left. */
@@ -4976,14 +5921,65 @@
         .identity-signal {
             align-self: stretch;
         }
+        /* A VPN client's row holds only its identity and the Live Traffic jump: one row, the jump upper right. */
+        .identity-row-1:has(.identity-info-vpn) {
+            flex-direction: row;
+            align-items: flex-start;
+        }
+        .identity-row-1:has(.identity-info-vpn) .identity-signal {
+            align-self: auto;
+        }
         .identity-row-2 {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 6px 12px;
             margin-bottom: 0;
         }
+        .identity-figures > .identity-detail {
+            position: relative;
+        }
+        .identity-figures > .identity-detail:nth-child(-n+2)::before {
+            content: "";
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: -3.5px;
+            height: 1px;
+            background: var(--border-color);
+        }
+        /* The first one bridges the column gap, so the pair reads as one rule. */
+        .identity-figures > .identity-detail:first-child::before {
+            right: -12px;
+        }
         .logging-toggle-desktop {
             display: none;
+        }
+        .identity-row-2::before {
+            right: 0;
+        }
+        /* On a phone the rule under the signal row is the signal box's own bottom edge carried
+           across: the box stretches to the row's bottom so the two are one line. */
+        .identity-row-1:not(:has(.identity-info-vpn)) .identity-signal {
+            position: relative;
+        }
+        .identity-row-1:not(:has(.identity-info-vpn)) .identity-signal::after {
+            content: "";
+            position: absolute;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            height: 1px;
+            background: var(--border-color);
+        }
+        .identity-row-1:not(:has(.identity-info-vpn)) .identity-signal > .signal-gauge {
+            align-self: stretch;
+        }
+        /* No signal box (a wired client): the live indicator is the row, so it keeps clear of the rule. */
+        .identity-row-1:not(:has(.identity-info-vpn)) .identity-signal:not(:has(.signal-gauge)) {
+            padding-bottom: 6px;
+        }
+        .identity-row-1:not(:has(.identity-info-vpn)) + .identity-row-2::before {
+            content: none;
         }
         .identity-live-group {
             flex-direction: column;
@@ -4992,6 +5988,16 @@
         }
         .logging-toggle-mobile {
             display: inline-flex;
+        }
+        /* With the button under it, the stack sits 5px high, clear of the rule below. */
+        .identity-live-group:has(.logging-toggle-mobile) {
+            position: relative;
+            top: -5px;
+        }
+        /* The 40px button would sit 3px off the rule; raised, its top meets the signal box's. */
+        .client-roam-btn {
+            position: relative;
+            top: -3px;
         }
         .dashboard-controls {
             position: fixed;
@@ -5014,10 +6020,12 @@
             justify-content: stretch;
             flex: 1;
         }
+        /* Sized to the label, never wrapped: "Data / Apps" in a quarter of a phone took two lines. */
         .tab-btn {
-            flex: 1;
+            flex: 1 1 auto;
+            white-space: nowrap;
             text-align: center;
-            padding: 0.5rem 0.5rem;
+            padding: 0.5rem 0.4rem;
         }
         .speed-hero-results {
             display: grid;

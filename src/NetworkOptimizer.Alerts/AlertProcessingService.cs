@@ -8,6 +8,7 @@ using NetworkOptimizer.Alerts.Delivery;
 using NetworkOptimizer.Alerts.Events;
 using NetworkOptimizer.Alerts.Interfaces;
 using NetworkOptimizer.Alerts.Models;
+using NetworkOptimizer.Core;
 using NetworkOptimizer.Core.Helpers;
 
 namespace NetworkOptimizer.Alerts;
@@ -28,6 +29,7 @@ public class AlertProcessingService : BackgroundService
     private readonly AlertCooldownTracker _cooldownTracker;
     private readonly IAlertSiteNameResolver _siteNameResolver;
     private readonly NetworkOptimizer.Core.ISiteWorkGate? _siteWorkGate;
+    private readonly INotificationTimeZoneResolver? _timeZones;
     private readonly string? _appBaseUrl;
 
     // In-memory rule cache (refreshed periodically)
@@ -48,9 +50,11 @@ public class AlertProcessingService : BackgroundService
         AlertCooldownTracker cooldownTracker,
         IAlertSiteNameResolver siteNameResolver,
         IConfiguration configuration,
-        NetworkOptimizer.Core.ISiteWorkGate? siteWorkGate = null)
+        NetworkOptimizer.Core.ISiteWorkGate? siteWorkGate = null,
+        INotificationTimeZoneResolver? timeZones = null)
     {
         _siteWorkGate = siteWorkGate;
+        _timeZones = timeZones;
         _logger = logger;
         _eventBus = eventBus;
         _scopeFactory = scopeFactory;
@@ -109,14 +113,26 @@ public class AlertProcessingService : BackgroundService
     /// <summary>Whether background work may run for a site; no gate wired means yes (fail-open).</summary>
     private bool MayRunForSite(string? siteKey) => _siteWorkGate?.IsSiteOperational(siteKey) ?? true;
 
+    /// <summary>
+    /// The event with the default site as a null slug, whichever form the publisher used. Kept as
+    /// "main", delivery added the main-site channels a second time (they are the site's own) and
+    /// labeled the copy "[main]".
+    /// </summary>
+    internal static AlertEvent WithDefaultSiteAsNull(AlertEvent alertEvent) =>
+        string.Equals(alertEvent.SiteSlug, SiteSlugs.Default, StringComparison.OrdinalIgnoreCase)
+            ? alertEvent with { SiteSlug = null }
+            : alertEvent;
+
     private async Task ProcessEventAsync(AlertEvent alertEvent, CancellationToken cancellationToken)
     {
+        alertEvent = WithDefaultSiteAsNull(alertEvent);
+
         // Delivery is outbound and user-visible, so a site licensing has closed raises nothing.
         // Checked before the scope is created: no rules read, no history written, no notification.
         if (!MayRunForSite(alertEvent.SiteSlug))
         {
             _logger.LogDebug("Skipping alert {EventType} for non-operational site {Site}",
-                alertEvent.EventType, string.IsNullOrEmpty(alertEvent.SiteSlug) ? "main" : alertEvent.SiteSlug);
+                alertEvent.EventType, string.IsNullOrEmpty(alertEvent.SiteSlug) ? SiteSlugs.Default : alertEvent.SiteSlug);
             return;
         }
 
@@ -146,7 +162,7 @@ public class AlertProcessingService : BackgroundService
         if (matchingRules.Count == 0)
         {
             _logger.LogDebug("No matching rules for event {EventType} (site {Site})",
-                alertEvent.EventType, siteKey.Length == 0 ? "main" : siteKey);
+                alertEvent.EventType, siteKey.Length == 0 ? SiteSlugs.Default : siteKey);
             return;
         }
 
@@ -164,7 +180,7 @@ public class AlertProcessingService : BackgroundService
         }
     }
 
-    // --- WAN outage alerts: one of two open/close families, unlike the rest of the alert catalog ---
+    // --- WAN outage alerts: one of the open/close families, unlike the rest of the alert catalog ---
     //
     // The three monitoring.wan_* event types maintain at most one open alert per (WAN, kind).
     // A WAN raises a partial outage while part of the path out is unreachable but traffic still
@@ -175,8 +191,8 @@ public class AlertProcessingService : BackgroundService
     // than stacking a second open alert on the same WAN.
     //
     // Per-target monitoring alerts (monitoring.target_offline and friends) have no such pairing and
-    // stay open until a user resolves them, so this closing step applies to the two families that
-    // do: monitoring.wan_* here and starlink.* below.
+    // stay open until a user resolves them, so this closing step applies only to the families that
+    // do: monitoring.wan_* here, and starlink.*, the WAN link speed pair, and the rollout pair below.
 
     internal const string WanOutageEventType = "monitoring.wan_outage";
     internal const string WanOutagePartialEventType = "monitoring.wan_outage_partial";
@@ -221,7 +237,7 @@ public class AlertProcessingService : BackgroundService
         return targets;
     }
 
-    // --- Starlink dish alerts: the other open/close family ---
+    // --- Starlink dish alerts: an open/close family ---
     //
     // The dish poll keeps at most one open alert per (dish, condition). A condition that is
     // already alerting republishes only on new evidence, and a starlink.recovered event names the
@@ -268,6 +284,48 @@ public class AlertProcessingService : BackgroundService
         return targets;
     }
 
+    // --- WAN link speed alerts: an open/close pair ---
+    //
+    // At most one open alert per gateway WAN port. A recovery closes it, and a re-publish (new
+    // evidence, e.g. a further downshift) supersedes it, so its rule needs cooldown 0 like Starlink's.
+
+    internal const string WanLinkSpeedDegradedEventType = "wan.link_speed_degraded";
+    internal const string WanLinkSpeedRecoveredEventType = "wan.link_speed_recovered";
+
+    /// <summary>
+    /// Which open WAN link speed alerts an incoming event closes: the degraded alert on the same
+    /// port (DeviceId), for both the recovery and a re-publish. Empty for every other event.
+    /// </summary>
+    internal static List<(string[] EventTypes, string? DeviceId)> GetWanLinkSpeedAlertsToResolve(string eventType, string? deviceId)
+    {
+        var targets = new List<(string[] EventTypes, string? DeviceId)>();
+        var portKey = deviceId?.Trim();
+        if (string.IsNullOrEmpty(portKey)) return targets;
+        if (eventType is WanLinkSpeedDegradedEventType or WanLinkSpeedRecoveredEventType)
+            targets.Add(([WanLinkSpeedDegradedEventType], portKey));
+        return targets;
+    }
+
+    // --- Firmware Rollout: an open/close pair ---
+    //
+    // A site runs one rollout at a time, and its Started alert carries no device, so the Completed
+    // event closes every open Started alert on the site.
+
+    internal const string RolloutStartedEventType = "rollout.started";
+    internal const string RolloutCompletedEventType = "rollout.completed";
+
+    /// <summary>
+    /// Which open rollout alerts an incoming event closes: every open Started alert, for the
+    /// Completed event. Empty for every other event.
+    /// </summary>
+    internal static List<(string[] EventTypes, string? DeviceId)> GetRolloutAlertsToResolve(string eventType)
+    {
+        var targets = new List<(string[] EventTypes, string? DeviceId)>();
+        if (eventType == RolloutCompletedEventType)
+            targets.Add(([RolloutStartedEventType], null));
+        return targets;
+    }
+
     /// <summary>
     /// Closes the open alerts this event supersedes and re-derives the status of any incident they
     /// belonged to. Failures are logged and swallowed: resolution is housekeeping and must never
@@ -281,6 +339,8 @@ public class AlertProcessingService : BackgroundService
         var targets = GetWanAlertsToResolve(alertEvent.EventType, alertEvent.DeviceId);
         targets.AddRange(GetStarlinkAlertsToResolve(
             alertEvent.EventType, alertEvent.DeviceId, alertEvent.Context));
+        targets.AddRange(GetWanLinkSpeedAlertsToResolve(alertEvent.EventType, alertEvent.DeviceId));
+        targets.AddRange(GetRolloutAlertsToResolve(alertEvent.EventType));
         if (targets.Count == 0)
             return;
 
@@ -336,7 +396,7 @@ public class AlertProcessingService : BackgroundService
         await repository.SaveAlertAsync(historyEntry, cancellationToken);
 
         // Correlate into incidents
-        await _correlationService.CorrelateAsync(alertEvent, historyEntry, repository, cancellationToken);
+        var correlation = await _correlationService.CorrelateWithOutcomeAsync(alertEvent, historyEntry, repository, cancellationToken);
 
         // Persist incident correlation even for digest-only rules
         if (historyEntry.IncidentId.HasValue)
@@ -348,6 +408,13 @@ public class AlertProcessingService : BackgroundService
         if (rule.DigestOnly)
         {
             _logger.LogDebug("Rule {RuleId} is digest-only, skipping immediate delivery", rule.Id);
+            return;
+        }
+
+        if (!AlertCorrelationService.ShouldDeliver(alertEvent, correlation))
+        {
+            _logger.LogDebug("{EventType} joined incident {IncidentId} at no higher severity; recorded, not delivered",
+                alertEvent.EventType, historyEntry.IncidentId);
             return;
         }
 
@@ -371,7 +438,7 @@ public class AlertProcessingService : BackgroundService
         await DeliverAsync(deliveryEvent, historyEntry, repository, cancellationToken);
     }
 
-    private async Task DeliverAsync(
+    internal async Task DeliverAsync(
         AlertEvent alertEvent,
         AlertHistoryEntry historyEntry,
         IAlertRepository repository,
@@ -391,6 +458,10 @@ public class AlertProcessingService : BackgroundService
 
         var deliveredTo = new List<int>();
         var errors = new List<string>();
+        // Resolved on the first channel that sends, inside its error handling: an alert no channel
+        // takes costs no lookup, and a failed one is recorded like any other delivery error.
+        TimeZoneInfo? timeZone = null;
+        DisplayFormat? format = null;
 
         foreach (var channel in channels)
         {
@@ -410,7 +481,13 @@ public class AlertProcessingService : BackgroundService
 
             try
             {
-                var success = await handler.SendAsync(alertEvent, historyEntry, channel, cancellationToken);
+                timeZone ??= _timeZones == null
+                    ? TimeZoneInfo.Local
+                    : await _timeZones.ResolveAsync(alertEvent.SiteSlug, cancellationToken);
+                format ??= _timeZones == null
+                    ? DisplayFormat.Fallback
+                    : await _timeZones.ResolveFormatAsync(alertEvent.SiteSlug, cancellationToken);
+                var success = await handler.SendAsync(alertEvent, historyEntry, channel, timeZone, format, cancellationToken);
                 if (success)
                 {
                     deliveredTo.Add(channel.Id);
@@ -455,7 +532,7 @@ public class AlertProcessingService : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to refresh alert rule cache for site {Site}",
-                siteKey.Length == 0 ? "main" : siteKey);
+                siteKey.Length == 0 ? SiteSlugs.Default : siteKey);
             // Keep using stale cache rather than failing
             return hasCache ? cached.Rules : [];
         }
@@ -474,7 +551,7 @@ public class AlertProcessingService : BackgroundService
             return null;
 
         // The default site arrives here as null/empty; its selectable slug is "main".
-        var slug = string.IsNullOrEmpty(siteSlug) ? "main" : siteSlug;
+        var slug = string.IsNullOrEmpty(siteSlug) ? SiteSlugs.Default : siteSlug;
 
         // In front of any #fragment, not on the end of the string. A speed test alert points at
         // one result (/speedtest#result-12), and appending blindly put the query INSIDE the

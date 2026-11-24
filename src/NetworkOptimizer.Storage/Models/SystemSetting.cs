@@ -26,6 +26,7 @@ public static class SystemSettingKeys
 {
     public const string Iperf3Duration = "iperf3.duration_seconds";
     public const string Iperf3Port = "iperf3.port";
+    public const string SpeedTestInfluxBackfillPrefix = "speedtest.influx_backfill.v1.";
 
     // Per-device-type parallel stream settings
     public const string Iperf3GatewayParallelStreams = "iperf3.gateway_parallel_streams";
@@ -112,15 +113,42 @@ public static class SystemSettingKeys
     // key is this prefix + WanInterface; the value is a JSON map of ASN identity -> miss count.
     public const string UpstreamAbsentAsnCountsPrefix = "upstream.absent_asn_counts.";
 
+    // An early re-discovery a Path Map path shift asked for. The full key is this prefix + the WAN's
+    // interface key, or "primary"; the value is when it was asked for (round-trip "o" format).
+    public const string UpstreamShiftRediscoveryRequestedPrefix = "upstream.shift_rediscovery_requested.";
+
+    // When a path shift last started an early re-discovery, same key shape: at most one a day.
+    public const string UpstreamShiftRediscoveryRanPrefix = "upstream.shift_rediscovery_ran.";
+
     // Per-WAN "seen but declined" access-ISP change memory. The full key is this prefix +
     // WanInterface; the value is the new access ASN the user said was NOT a provider switch,
     // so the same detected change doesn't re-prompt on every discovery run. Cleared when a
     // later ISP change is confirmed (fresh baseline).
     public const string UpstreamDeclinedAccessAsnPrefix = "upstream.declined_access_asn.";
 
+    // Per-WAN share of candidates that failed the reachability gate in the last committed discovery
+    // run. The full key is this prefix + WanInterface; the value is a fraction (0-1, invariant).
+    public const string UpstreamUnreachableSharePrefix = "upstream.unreachable_share.";
+
+    // Per-WAN count of automatic discovery runs discarded as degraded, with the time it last
+    // advanced. The full key is this prefix + WanInterface; the value is {"c":count,"t":utc}.
+    public const string UpstreamDegradedRunsPrefix = "upstream.degraded_runs.";
+
+    // Per-WAN count of automatic runs each monitored target went unanswered in. The full key is
+    // this prefix + WanInterface; the value is a JSON map of address -> {"c":count,"t":utc}, or null.
+    public const string UpstreamUnansweredRunsPrefix = "upstream.unanswered_runs.";
+
+    // Per-WAN targets the unanswered counter paused ("paused"), or that an admin resumed after it
+    // did ("kept"). The full key is this prefix + WanInterface; the value is a JSON map of address -> mark.
+    public const string UpstreamUnansweredPausedPrefix = "upstream.unanswered_paused.";
+
     // Map / Satellite settings
     public const string MapboxApiKey = "map.mapbox_token";
 
     // Channel outcome memory: end of the window the collector last aggregated (UTC, round-trip format)
     public const string ChannelMemoryCollectionWatermark = "wifi.channel_memory_watermark";
+
+    // Per-site: UCI MACs (comma-joined, lowercase) whose automatically created cable modem
+    // config the user deleted. Automatic creation never recreates these.
+    public const string UciAutoCreateDismissed = "cable_modem.uci_dismissed";
 }

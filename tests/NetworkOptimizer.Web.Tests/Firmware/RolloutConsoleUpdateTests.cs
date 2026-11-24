@@ -58,6 +58,58 @@ public class RolloutConsoleUpdateTests
     }
 
     [Fact]
+    public async Task Start_MarksThePlanStartingWhileTheConsoleIsCommanded_ButNotRunning()
+    {
+        using var harness = new RolloutHarness();
+        var plan = await harness.SeedScheduledPlanAsync(NetworkAppPlan(), RolloutHarness.Start.AddDays(1), Step(ApMac));
+        harness.Observer.Set(ApMac, Online, FromVersion, upgradeTo: ToVersion);
+        harness.Observer.ConsoleDark = true;
+        FirmwareRolloutPlan? midStart = null;
+        harness.Commands.DuringNetworkAppUpdate = async () => midStart = await harness.PlanAsync(plan.Id);
+
+        (await harness.Orchestrator.StartNowAsync(plan.Id, overrideHealthGate: true)).Should().BeTrue();
+
+        // Running only once the update is commanded: a tick before that would read it as nothing to do.
+        midStart!.Status.Should().Be(FirmwareRolloutStatus.Scheduled);
+        Stored(midStart).StartingAt.Should().NotBeNull();
+        Stored(midStart).NetworkAppUpdate.Triggered.Should().BeFalse();
+        var started = (await harness.PlanAsync(plan.Id))!;
+        started.Status.Should().Be(FirmwareRolloutStatus.Running);
+        Stored(started).NetworkAppUpdate.Triggered.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Start_ThatThrows_ClearsTheStartingMark()
+    {
+        using var harness = new RolloutHarness();
+        var plan = await harness.SeedScheduledPlanAsync(NetworkAppPlan(), RolloutHarness.Start.AddDays(1), Step(ApMac));
+        harness.Observer.Set(ApMac, Online, FromVersion, upgradeTo: ToVersion);
+        harness.Commands.DuringNetworkAppUpdate = () => throw new InvalidOperationException("console gone");
+
+        var start = () => harness.Orchestrator.StartNowAsync(plan.Id, overrideHealthGate: true);
+
+        await start.Should().ThrowAsync<InvalidOperationException>();
+        var stored = (await harness.PlanAsync(plan.Id))!;
+        stored.Status.Should().Be(FirmwareRolloutStatus.Scheduled);
+        Stored(stored).StartingAt.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Start_HeldByTheHealthGate_IsNeverMarkedStarting()
+    {
+        using var harness = new RolloutHarness();
+        harness.Health.Verdict = RolloutHealthVerdict.Blocked("a critical alert is open (WAN Outage)");
+        var plan = await harness.SeedScheduledPlanAsync(NetworkAppPlan(), RolloutHarness.Start, Step(ApMac));
+
+        await harness.TickAsync();
+
+        var stored = (await harness.PlanAsync(plan.Id))!;
+        stored.Status.Should().Be(FirmwareRolloutStatus.Scheduled);
+        Stored(stored).StartingAt.Should().BeNull();
+        harness.Commands.NetworkAppUpdateCalls.Should().Be(0);
+    }
+
+    [Fact]
     public async Task NetworkAppUpdate_ReleasesWave1WhenTheApplicationAnswersAgain()
     {
         using var harness = new RolloutHarness();
@@ -133,6 +185,32 @@ public class RolloutConsoleUpdateTests
     }
 
     [Fact]
+    public async Task APinnedSshInstallThatFailsOnTheConsole_IsRefusedWithItsReason()
+    {
+        // The install runs detached, so Start Now returns before it ends; its log says how it ended.
+        using var harness = new RolloutHarness();
+        var document = NetworkAppPlan();
+        document.NetworkAppUpdate.Pinned = true;
+        document.NetworkAppUpdate.TargetVersion = "99.0.1";
+        document.NetworkAppUpdate.Url = "https://fw-download.ubnt.com/data/unifi-native/8530-uos-deb13-arm64-99.0.1-1-1-0b745a73.deb";
+        var plan = await harness.SeedScheduledPlanAsync(document, RolloutHarness.Start, Step(ApMac));
+        harness.Observer.Set(ApMac, Online, FromVersion, upgradeTo: ToVersion);
+
+        await harness.TickAsync();
+        Stored((await harness.PlanAsync(plan.Id))!).NetworkAppUpdate.Triggered.Should().BeTrue();
+
+        harness.Commands.SshNetworkInstallLog = new NetworkInstallLog(100,
+            " unifi-native : Depends: unifi-matter-controller (= 0.0.9) but it is not installable\n");
+        await harness.TickAsync(TimeSpan.FromMinutes(2));
+
+        var stored = Stored((await harness.PlanAsync(plan.Id))!).NetworkAppUpdate;
+        stored.Outcome.Should().Be("refused");
+        stored.Error.Should().Contain("unifi-matter-controller");
+        harness.Bus.Published.Should().NotContain(e => e.EventType == RolloutAlerts.NetworkAppUpdateStuck);
+        (await harness.StepAsync(plan.Id, ApMac)).State.Should().Be(FirmwareRolloutStepState.Commanded);
+    }
+
+    [Fact]
     public async Task AnSshRetryThatAlsoFails_IsStuckAndTriedOnce()
     {
         using var harness = new RolloutHarness();
@@ -192,6 +270,93 @@ public class RolloutConsoleUpdateTests
         stored.NetworkAppUpdate.Outcome.Should().Be("nothing-to-update");
         (await harness.StepAsync(plan.Id, ApMac)).State.Should().Be(FirmwareRolloutStepState.Commanded);
         harness.Bus.Published.Should().NotContain(e => e.EventType == RolloutAlerts.NetworkAppUpdateStuck);
+    }
+
+    private static RolloutPlanDocument NetworkAppPlanFor(string target, string? url)
+    {
+        var document = NetworkAppPlan();
+        document.NetworkAppUpdate.TargetVersion = target;
+        document.NetworkAppUpdate.Url = url;
+        return document;
+    }
+
+    [Fact]
+    public async Task APlannedBuildTheConsoleNoLongerOffers_WithNoDownload_IsRefusedWithoutAnInstallAttempt()
+    {
+        using var harness = new RolloutHarness();
+        harness.Commands.ConsoleInfo!.NetworkApplication!.UpdateAvailable = null;
+        var plan = await harness.SeedScheduledPlanAsync(NetworkAppPlanFor("9.1.0", url: null), RolloutHarness.Start, Step(ApMac));
+        harness.Observer.Set(ApMac, Online, FromVersion, upgradeTo: ToVersion);
+
+        await harness.TickAsync();
+        await harness.TickAsync(TimeSpan.FromSeconds(20));
+
+        var stored = Stored((await harness.PlanAsync(plan.Id))!).NetworkAppUpdate;
+        stored.Outcome.Should().Be("refused");
+        stored.Error.Should().Be(
+            "The Console is not offering UniFi Network 9.1.0, and no download for this Console's platform is known, so it was not installed.");
+        harness.Commands.Calls.Should().NotContain("ssh-network-app-update");
+        (await harness.StepAsync(plan.Id, ApMac)).State.Should().Be(FirmwareRolloutStepState.Commanded);
+    }
+
+    [Fact]
+    public async Task APlannedBuildAlreadyInstalled_WithNoDownload_IsStillNothingToUpdate()
+    {
+        using var harness = new RolloutHarness();
+        harness.Commands.ConsoleInfo!.NetworkApplication!.UpdateAvailable = null;
+        harness.Commands.ConsoleInfo.NetworkApplication.Version = "9.1.0";
+        var plan = await harness.SeedRunningPlanAsync(NetworkAppPlanFor("9.1.0", url: null), Step(ApMac));
+        harness.Observer.Set(ApMac, Online, FromVersion, upgradeTo: ToVersion);
+
+        await harness.TickAsync();
+
+        Stored((await harness.PlanAsync(plan.Id))!).NetworkAppUpdate.Outcome.Should().NotBe("refused");
+    }
+
+    [Fact]
+    public async Task ARefusedNetworkUpdate_IsInTheCompletionAlert_AsItsOwnSentence()
+    {
+        using var harness = new RolloutHarness();
+        harness.Commands.ConsoleInfo!.NetworkApplication!.UpdateAvailable = null;
+        await harness.SeedScheduledPlanAsync(NetworkAppPlanFor("9.1.0", url: null), RolloutHarness.Start, Step(ApMac));
+        harness.Observer.Set(ApMac, Online, FromVersion, upgradeTo: ToVersion);
+
+        await harness.TickAsync();
+        await harness.TickAsync(TimeSpan.FromSeconds(20));
+        await RunDeviceToLitmusAsync(harness, ApMac);
+
+        harness.Bus.Published.Single(e => e.EventType == RolloutAlerts.Completed).Message.Should().StartWith(
+            "1 device upgraded, 0 failed, 0 dropped. UniFi Network 9.1.0 was not installed: the Console is not offering it, and no download for this Console's platform is known.");
+    }
+
+    [Theory]
+    [InlineData("updated", null, " The UniFi Network application was updated.")]
+    [InlineData("stuck", null, " The UniFi Network application did not come back after its update.")]
+    [InlineData("refused", "curl: (22) The requested URL returned error: 404", " UniFi Network 9.1.0 was not installed: curl: (22) The requested URL returned error: 404.")]
+    [InlineData("refused", "The Console did not accept the update command.", " UniFi Network 9.1.0 was not installed: The Console did not accept the update command.")]
+    [InlineData("refused", null, " UniFi Network 9.1.0 was not installed.")]
+    [InlineData("nothing-to-update", null, "")]
+    [InlineData("skipped", null, "")]
+    public void TheCompletionAlert_StatesEachNetworkOutcome(string outcome, string? error, string expected)
+    {
+        var document = NetworkAppPlanFor("9.1.0", url: null);
+        document.NetworkAppUpdate.Outcome = outcome;
+        document.NetworkAppUpdate.Error = error;
+
+        FirmwareRolloutOrchestrator.ConsoleUpdateSummary(document).Should().Be(expected);
+    }
+
+    [Fact]
+    public void TheCompletionAlert_GivesTheNoDownloadReasonInShort_AndTheReportInFull()
+    {
+        var document = NetworkAppPlanFor("9.1.0", url: null);
+        document.NetworkAppUpdate.Outcome = "refused";
+        document.NetworkAppUpdate.Error = FirmwareRolloutOrchestrator.NetworkAppNoDownloadError("9.1.0");
+
+        FirmwareRolloutOrchestrator.ConsoleUpdateSummary(document).Should().Be(
+            " UniFi Network 9.1.0 was not installed: the Console is not offering it, and no download for this Console's platform is known.");
+        FirmwareRolloutOrchestrator.NetworkAppRefusedIssue(document).Should().Be(
+            "The Console is not offering UniFi Network 9.1.0, and no download for this Console's platform is known, so it was not installed.");
     }
 
     [Fact]
@@ -456,6 +621,207 @@ public class RolloutConsoleUpdateTests
 
         harness.Commands.UniFiOsUpdateCalls.Should().Be(0);
         (await harness.PlanAsync(plan.Id))!.Status.Should().Be(FirmwareRolloutStatus.Running);
+    }
+
+    // --- UniFi OS back, UniFi Network not routed ---------------------------------------------------
+
+    /// <summary>
+    /// Runs the plan to the point UniFi OS is back on its new build while the Network API is still
+    /// dark: devices are through, the console went down and answers again on 4.3.6.
+    /// </summary>
+    private static async Task<FirmwareRolloutPlan> ConsoleBackWithNetworkDarkAsync(RolloutHarness harness)
+    {
+        harness.Commands.PendingUniFiOs = new UniFiConsoleFirmwareRelease { Version = "4.3.6" };
+        var plan = await harness.SeedRunningPlanAsync(UniFiOsPlan(), Step(ApMac));
+        harness.Observer.Set(ApMac, Online, FromVersion, upgradeTo: ToVersion);
+
+        await harness.TickAsync();
+        await RunDeviceToLitmusAsync(harness, ApMac);
+
+        harness.Commands.ConsoleInfo = null;
+        harness.Observer.ConsoleDark = true;
+        await harness.TickAsync(TimeSpan.FromMinutes(3));
+
+        harness.Commands.ConsoleInfo = new UniFiConsoleSystemInfo
+        {
+            Hardware = new UniFiConsoleHardware { FirmwareVersion = "4.3.6" },
+        };
+        harness.Commands.PendingUniFiOs = null;
+        return plan;
+    }
+
+    private static async Task TickMinutesAsync(RolloutHarness harness, int minutes)
+    {
+        for (var i = 0; i < minutes; i++)
+            await harness.TickAsync(TimeSpan.FromMinutes(1));
+    }
+
+    private static int CallCount(RolloutHarness harness, string call) => harness.Commands.Calls.Count(c => c == call);
+
+    [Fact]
+    public async Task UnroutedNetwork_IsRestartedOnceAfterTheHold_AndTheStepSettlesOnceItIsRouted()
+    {
+        using var harness = new RolloutHarness();
+        var plan = await ConsoleBackWithNetworkDarkAsync(harness);
+        harness.Commands.NetworkRoute = NetworkRouteState.Unrouted;
+
+        // The first probe starts the hold; nothing is restarted inside it.
+        await TickMinutesAsync(harness, 5);
+        CallCount(harness, "ssh-restart-network").Should().Be(0);
+        (await harness.PlanAsync(plan.Id))!.Status.Should().Be(FirmwareRolloutStatus.Running);
+
+        await TickMinutesAsync(harness, 1);
+        CallCount(harness, "ssh-restart-network").Should().Be(1);
+        harness.AuditLog.Events.Should().Contain(e =>
+            e.Action == NetworkOptimizer.Storage.Models.Identity.AuditActions.FirmwareRolloutNetworkRecovery
+            && e.DetailsJson!.Contains("restart_network"));
+
+        harness.Commands.NetworkRoute = NetworkRouteState.Routed;
+        await TickMinutesAsync(harness, 1);
+
+        var stored = (await harness.PlanAsync(plan.Id))!;
+        stored.Status.Should().Be(FirmwareRolloutStatus.SoakWait);
+        Stored(stored).UniFiOsUpdate.Outcome.Should().Be("updated");
+        CallCount(harness, "ssh-reboot-console").Should().Be(0);
+    }
+
+    [Fact]
+    public async Task NetworkStillUnroutedAfterTheRestart_RebootsOnce_ThenRaisesACritical()
+    {
+        using var harness = new RolloutHarness();
+        var plan = await ConsoleBackWithNetworkDarkAsync(harness);
+        harness.Commands.NetworkRoute = NetworkRouteState.Unrouted;
+
+        await TickMinutesAsync(harness, 6);
+        CallCount(harness, "ssh-restart-network").Should().Be(1);
+
+        // The hold starts over after the restart.
+        await TickMinutesAsync(harness, 5);
+        CallCount(harness, "ssh-reboot-console").Should().Be(0);
+        await TickMinutesAsync(harness, 1);
+        CallCount(harness, "ssh-reboot-console").Should().Be(1);
+
+        // Dark past the UniFi OS budget as measured from the original trigger: the reboot is the
+        // rollout's own, so the clock runs from it and the console is not called stuck.
+        harness.Commands.ConsoleInfo = null;
+        await TickMinutesAsync(harness, 20);
+        harness.Bus.Published.Should().NotContain(e => e.EventType == RolloutAlerts.DeviceStuckOffline);
+
+        harness.Commands.ConsoleInfo = new UniFiConsoleSystemInfo
+        {
+            Hardware = new UniFiConsoleHardware { FirmwareVersion = "4.3.6" },
+        };
+        await TickMinutesAsync(harness, 6);
+
+        var stored = (await harness.PlanAsync(plan.Id))!;
+        stored.Status.Should().Be(FirmwareRolloutStatus.SoakWait);
+        Stored(stored).UniFiOsUpdate.Outcome.Should().Be("updated");
+        Stored(stored).UniFiOsUpdate.Error.Should().Contain("tried restarting UniFi Network, then rebooting the Console");
+        var alert = harness.Bus.Published.Single(e => e.EventType == RolloutAlerts.DeviceStuckOffline);
+        alert.Title.Should().StartWith("UniFi Network Unreachable After UniFi OS Update");
+        alert.Message.Should().Be(
+            "The Console is on UniFi OS 4.3.6, but UniFi Network is unreachable. Network Optimizer tried restarting UniFi Network, then rebooting the Console. UniFi Network is still unreachable.");
+        CallCount(harness, "ssh-restart-network").Should().Be(1);
+        CallCount(harness, "ssh-reboot-console").Should().Be(1);
+    }
+
+    [Fact]
+    public async Task NetworkStillStarting_IsNeverRestarted_AndTheWaitIsBounded()
+    {
+        using var harness = new RolloutHarness();
+        var plan = await ConsoleBackWithNetworkDarkAsync(harness);
+        harness.Commands.NetworkRoute = NetworkRouteState.NotReady;
+
+        await TickMinutesAsync(harness, 15);
+        (await harness.PlanAsync(plan.Id))!.Status.Should().Be(FirmwareRolloutStatus.Running);
+
+        await TickMinutesAsync(harness, 10);
+        var stored = (await harness.PlanAsync(plan.Id))!;
+        stored.Status.Should().Be(FirmwareRolloutStatus.SoakWait);
+        Stored(stored).UniFiOsUpdate.Outcome.Should().Be("updated");
+        CallCount(harness, "ssh-restart-network").Should().Be(0);
+        CallCount(harness, "ssh-reboot-console").Should().Be(0);
+        // No recovery ran, so this is the step's old behavior: no alert.
+        harness.Bus.Published.Should().NotContain(e => e.EventType == RolloutAlerts.DeviceStuckOffline);
+    }
+
+    [Fact]
+    public async Task NetworkThatNeverStartsAfterTheRestart_RaisesACriticalNamingOnlyTheRestart()
+    {
+        using var harness = new RolloutHarness();
+        var plan = await ConsoleBackWithNetworkDarkAsync(harness);
+        harness.Commands.NetworkRoute = NetworkRouteState.Unrouted;
+        await TickMinutesAsync(harness, 6);
+        CallCount(harness, "ssh-restart-network").Should().Be(1);
+
+        harness.Commands.NetworkRoute = NetworkRouteState.NotReady;
+        await TickMinutesAsync(harness, 19);
+        harness.Bus.Published.Should().NotContain(e => e.EventType == RolloutAlerts.DeviceStuckOffline);
+
+        await TickMinutesAsync(harness, 2);
+
+        var stored = (await harness.PlanAsync(plan.Id))!;
+        stored.Status.Should().Be(FirmwareRolloutStatus.SoakWait);
+        harness.Bus.Published.Single(e => e.EventType == RolloutAlerts.DeviceStuckOffline).Message.Should().Be(
+            "The Console is on UniFi OS 4.3.6, but UniFi Network is unreachable. Network Optimizer tried restarting UniFi Network. UniFi Network is still unreachable.");
+        CallCount(harness, "ssh-reboot-console").Should().Be(0);
+    }
+
+    [Fact]
+    public async Task AnUnroutedStretchBrokenByNetworkRestarting_StartsTheHoldOver()
+    {
+        using var harness = new RolloutHarness();
+        await ConsoleBackWithNetworkDarkAsync(harness);
+
+        harness.Commands.NetworkRoute = NetworkRouteState.Unrouted;
+        await TickMinutesAsync(harness, 4);
+        harness.Commands.NetworkRoute = NetworkRouteState.NotReady;
+        await TickMinutesAsync(harness, 1);
+        harness.Commands.NetworkRoute = NetworkRouteState.Unrouted;
+        await TickMinutesAsync(harness, 5);
+
+        CallCount(harness, "ssh-restart-network").Should().Be(0);
+    }
+
+    [Fact]
+    public async Task AnUnreadableRoute_ActsOnNothing()
+    {
+        using var harness = new RolloutHarness();
+        await ConsoleBackWithNetworkDarkAsync(harness);
+        harness.Commands.NetworkRoute = null;
+
+        await TickMinutesAsync(harness, 10);
+
+        CallCount(harness, "ssh-network-route").Should().BeGreaterThan(0);
+        CallCount(harness, "ssh-restart-network").Should().Be(0);
+    }
+
+    [Fact]
+    public async Task DevicesAnswering_SettlesWithoutReadingTheRoute()
+    {
+        using var harness = new RolloutHarness();
+        var plan = await ConsoleBackWithNetworkDarkAsync(harness);
+        harness.Commands.NetworkRoute = NetworkRouteState.Unrouted;
+        harness.Observer.ConsoleDark = false;
+
+        await TickMinutesAsync(harness, 1);
+
+        Stored((await harness.PlanAsync(plan.Id))!).UniFiOsUpdate.Outcome.Should().Be("updated");
+        CallCount(harness, "ssh-network-route").Should().Be(0);
+    }
+
+    [Fact]
+    public async Task WithoutGatewaySsh_TheStepSettlesAsBefore()
+    {
+        using var harness = new RolloutHarness();
+        var plan = await ConsoleBackWithNetworkDarkAsync(harness);
+        harness.Commands.GatewaySshConfigured = false;
+        harness.Commands.NetworkRoute = NetworkRouteState.Unrouted;
+
+        await TickMinutesAsync(harness, 1);
+
+        Stored((await harness.PlanAsync(plan.Id))!).UniFiOsUpdate.Outcome.Should().Be("updated");
+        CallCount(harness, "ssh-network-route").Should().Be(0);
     }
 
     /// <summary>Walks one commanded device all the way through to its litmus verdict.</summary>

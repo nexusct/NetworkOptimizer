@@ -1,10 +1,12 @@
 using System.Net;
+using System.Net.Sockets;
 using FluentAssertions;
 using Microsoft.Extensions.Logging;
 using Moq;
 using Moq.Protected;
 using NetworkOptimizer.Audit.Dns;
 using NetworkOptimizer.Audit.Models;
+using NetworkOptimizer.Monitoring.Providers;
 using Xunit;
 
 namespace NetworkOptimizer.Audit.Tests.Dns;
@@ -301,6 +303,217 @@ public class ThirdPartyDnsDetectorTests : IDisposable
                 DnsServers = ["10.10.20.30"]
             }
         ];
+    }
+
+    [Fact]
+    public async Task WithDialer_ProbesTheManagementUrlAndLanResolverThroughTheDialer()
+    {
+        // A site reached through its agent: the agent dials the URL's host by name inside the
+        // site, so a split-horizon name is never resolved on this server.
+        var dialer = new RecordingDialer();
+        using var detector = CreateDetector().WithDialer(dialer);
+
+        var result = await detector.DetectThirdPartyDnsAsync(CreateTechnitiumTestNetworks(), customUrl: "https://admin.dns.example.test");
+
+        result.Should().ContainSingle();
+        dialer.Dials.Should().Contain(("admin.dns.example.test", 443));
+        dialer.Dials.Should().Contain(d => d.Host == "10.10.20.30");
+    }
+
+    [Fact]
+    public async Task WithDialer_QueriesTheResolverAtTheEndpointTheDialerHandsBack()
+    {
+        ThirdPartyDnsDetector.NextDnsProbeOverride = null;
+        ThirdPartyDnsDetector.ControlDProbeOverride = null;
+        using var forwarded = new ClosingListener();
+        var dialer = new RecordingDialer { ForwardTo = ("127.0.0.1", forwarded.Port) };
+        using var detector = CreateDetector().WithDialer(dialer);
+
+        var result = await detector.DetectThirdPartyDnsAsync(CreateTechnitiumTestNetworks());
+
+        // Both the NextDNS and ControlD probes asked the dialer for the resolver's port 53.
+        dialer.Resolves.Should().HaveCount(2).And.OnlyContain(r => r.Host == "10.10.20.30" && r.Port == 53);
+        forwarded.Accepted.Should().BeGreaterThan(0);
+        result.Should().ContainSingle(r => !r.IsNextDns && !r.IsControlD);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ProbeGatewayDnsAsync_RealControlDProbe_DetectsOnlyWhenResolverChainsToControlD(bool throughControlD)
+    {
+        // ctrld on the gateway: the resolver only answers verify.controld.com when the query
+        // traverses ControlD, and then only for an A query (a CNAME-type query is NODATA).
+        ThirdPartyDnsDetector.NextDnsProbeOverride = null;
+        ThirdPartyDnsDetector.ControlDProbeOverride = null;
+        using var resolver = new FakeTcpResolver(throughControlD);
+        var dialer = new RecordingDialer { ForwardTo = ("127.0.0.1", resolver.Port) };
+        using var detector = CreateDetector().WithDialer(dialer);
+        var networks = new List<NetworkInfo>
+        {
+            new() { Id = "n1", Name = "Default", VlanId = 1, Enabled = true, DhcpEnabled = true,
+                    Subnet = "192.168.1.0/24", Gateway = "192.168.1.1" }
+        };
+
+        var result = await detector.ProbeGatewayDnsAsync(networks);
+
+        resolver.Queries.Should().Contain(("verify.controld.com", (ushort)1));
+        if (throughControlD)
+            result.Should().ContainSingle(r => r.IsControlD && r.DnsServerIp == "192.168.1.1");
+        else
+            result.Should().BeEmpty();
+    }
+
+    /// <summary>
+    /// A loopback DNS-over-TCP resolver. With <c>throughControlD</c> it answers an A query for
+    /// verify.controld.com the way ControlD does (CNAME to api.controld.com plus its A record);
+    /// every other query, and every query without it, gets NOERROR with no answers.
+    /// </summary>
+    private sealed class FakeTcpResolver : IDisposable
+    {
+        private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
+        private readonly bool _throughControlD;
+
+        public FakeTcpResolver(bool throughControlD)
+        {
+            _throughControlD = throughControlD;
+            _listener.Start();
+            _ = AcceptLoopAsync();
+        }
+
+        public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
+        public List<(string Name, ushort Type)> Queries { get; } = [];
+
+        private async Task AcceptLoopAsync()
+        {
+            try
+            {
+                while (true)
+                {
+                    var client = await _listener.AcceptTcpClientAsync();
+                    _ = ServeAsync(client);
+                }
+            }
+            catch (ObjectDisposedException) { }
+            catch (SocketException) { }
+        }
+
+        private async Task ServeAsync(TcpClient client)
+        {
+            using (client)
+            {
+                try
+                {
+                    var stream = client.GetStream();
+                    var lengthPrefix = new byte[2];
+                    while (true)
+                    {
+                        await stream.ReadExactlyAsync(lengthPrefix);
+                        var query = new byte[(lengthPrefix[0] << 8) | lengthPrefix[1]];
+                        await stream.ReadExactlyAsync(query);
+                        var response = Answer(query);
+                        await stream.WriteAsync(new[] { (byte)(response.Length >> 8), (byte)response.Length });
+                        await stream.WriteAsync(response);
+                    }
+                }
+                catch (EndOfStreamException) { }
+                catch (IOException) { }
+            }
+        }
+
+        private byte[] Answer(byte[] query)
+        {
+            // Question starts after the 12-byte header: labels, then QTYPE and QCLASS.
+            var offset = 12;
+            var labels = new List<string>();
+            while (query[offset] != 0)
+            {
+                labels.Add(System.Text.Encoding.ASCII.GetString(query, offset + 1, query[offset]));
+                offset += query[offset] + 1;
+            }
+            var questionEnd = offset + 5;
+            var name = string.Join('.', labels).ToLowerInvariant();
+            var type = (ushort)((query[offset + 1] << 8) | query[offset + 2]);
+            lock (Queries) Queries.Add((name, type));
+
+            var chain = _throughControlD && name == "verify.controld.com" && type == 1;
+            var response = new List<byte>
+            {
+                query[0], query[1], 0x81, 0x80, 0, 1, 0, (byte)(chain ? 2 : 0), 0, 0, 0, 0
+            };
+            response.AddRange(query[12..questionEnd]);
+            if (chain)
+            {
+                var target = EncodeName("api.controld.com");
+                // verify.controld.com (pointer to the question) CNAME api.controld.com
+                response.AddRange(new byte[] { 0xC0, 0x0C, 0, 5, 0, 1, 0, 0, 0, 20, 0, (byte)target.Length });
+                response.AddRange(target);
+                // api.controld.com A 147.185.34.1
+                response.AddRange(target);
+                response.AddRange(new byte[] { 0, 1, 0, 1, 0, 0, 0, 20, 0, 4, 147, 185, 34, 1 });
+            }
+            return response.ToArray();
+        }
+
+        private static byte[] EncodeName(string name) =>
+            name.Split('.')
+                .SelectMany(label => new[] { (byte)label.Length }.Concat(System.Text.Encoding.ASCII.GetBytes(label)))
+                .Append((byte)0)
+                .ToArray();
+
+        public void Dispose() => _listener.Stop();
+    }
+
+    /// <summary>Records every dial and refuses it; hands back <see cref="ForwardTo"/> for a library's own socket.</summary>
+    private sealed class RecordingDialer : IDeviceDialer
+    {
+        public List<(string Host, int Port)> Dials { get; } = [];
+        public List<(string Host, int Port)> Resolves { get; } = [];
+        public (string Host, int Port)? ForwardTo { get; init; }
+
+        public ValueTask<Stream> DialAsync(string host, int port, CancellationToken cancellationToken)
+        {
+            lock (Dials) Dials.Add((host, port));
+            return ValueTask.FromException<Stream>(new SocketException((int)SocketError.ConnectionRefused));
+        }
+
+        public Task<(string Host, int Port)> ResolveAsync(string host, int port)
+        {
+            lock (Resolves) Resolves.Add((host, port));
+            return Task.FromResult(ForwardTo ?? (host, port));
+        }
+    }
+
+    /// <summary>A loopback listener that accepts and closes at once, so a query to it fails fast.</summary>
+    private sealed class ClosingListener : IDisposable
+    {
+        private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
+        private int _accepted;
+
+        public ClosingListener()
+        {
+            _listener.Start();
+            _ = AcceptLoopAsync();
+        }
+
+        public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
+        public int Accepted => Volatile.Read(ref _accepted);
+
+        private async Task AcceptLoopAsync()
+        {
+            try
+            {
+                while (true)
+                {
+                    using var client = await _listener.AcceptTcpClientAsync();
+                    Interlocked.Increment(ref _accepted);
+                }
+            }
+            catch (ObjectDisposedException) { }
+            catch (SocketException) { }
+        }
+
+        public void Dispose() => _listener.Stop();
     }
 
     private ThirdPartyDnsDetector CreateDetector(HttpClient? httpClient = null)
@@ -1869,6 +2082,180 @@ public class ThirdPartyDnsDetectorTests : IDisposable
         result.Should().HaveCount(1);
         result[0].IsPublicDns.Should().BeTrue();
         result[0].ProviderName.Should().BeNull();
+    }
+
+    #endregion
+
+    #region DetectExternalDns IPv6 Tests
+
+    private static NetworkInfo DualStack(string id, string name, int vlan, List<string>? ipv6Dns,
+        List<string>? ipv4Dns = null, bool enabled = true, bool dhcp = true, string? ipv6Prefix = null) => new()
+    {
+        Id = id,
+        Name = name,
+        VlanId = vlan,
+        Enabled = enabled,
+        DhcpEnabled = dhcp,
+        Gateway = $"192.0.2.{vlan}",
+        Subnet = $"192.0.2.{vlan}/32",
+        DnsServers = ipv4Dns,
+        HasIpv6 = true,
+        Ipv6Subnets = [ipv6Prefix ?? $"2001:db8:{vlan}::/64"],
+        Ipv6DnsServers = ipv6Dns
+    };
+
+    [Fact]
+    public void DetectExternalDns_Ipv6PublicResolver_ReportedEvenWhenIpv4UsesGateway()
+    {
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["2001:4860:4860::8888"]) };
+
+        var result = CreateDetector().DetectExternalDns(networks);
+
+        result.Should().ContainSingle();
+        result[0].DnsServerIp.Should().Be("2001:4860:4860::8888");
+        result[0].NetworkName.Should().Be("Home");
+        result[0].IsPublicDns.Should().BeTrue();
+        result[0].ProviderName.Should().Be("Google");
+    }
+
+    [Theory]
+    [InlineData("2606:4700:4700::1111", "Cloudflare")]
+    [InlineData("2620:fe::fe", "Quad9")]
+    [InlineData("2620:119:35::35", "OpenDNS")]
+    [InlineData("2a07:a8c0::ab:cd12", "NextDNS")]
+    [InlineData("2001:4860:4860:0:0:0:0:8888", "Google")] // Expanded form still identified
+    [InlineData("2a10:50c0::ad1:ff", "AdGuard DNS")]       // Same name as the IPv4 AdGuard servers
+    [InlineData("2a0d:2a00:1::", "CleanBrowsing")]
+    [InlineData("2a01:4f8:1c0c:8274::1", "LibreDNS")]
+    [InlineData("2606:1a40::2", "ControlD")]
+    [InlineData("2606:1a40:f000::11", "ControlD")]
+    public void DetectExternalDns_Ipv6KnownProviders_ReturnsProviderName(string dnsIp, string expectedProvider)
+    {
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, [dnsIp]) };
+
+        var result = CreateDetector().DetectExternalDns(networks);
+
+        result.Should().ContainSingle().Which.ProviderName.Should().Be(expectedProvider);
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6DnsInOwnPrefix_NotReported()
+    {
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["2001:db8:10::53"]) };
+
+        CreateDetector().DetectExternalDns(networks).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6DnsInAnotherNetworksPrefix_NotReported()
+    {
+        var networks = new List<NetworkInfo>
+        {
+            DualStack("n1", "Home", 10, ["2001:db8:20::53"]),
+            DualStack("n2", "Servers", 20, null)
+        };
+
+        CreateDetector().DetectExternalDns(networks).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6LinkLocalDns_NotReported()
+    {
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["fe80::1"]) };
+
+        CreateDetector().DetectExternalDns(networks).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6UlaOutsideKnownPrefixes_ReportedAsPrivate()
+    {
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["fd00:99::53"]) };
+
+        var result = CreateDetector().DetectExternalDns(networks);
+
+        result.Should().ContainSingle();
+        result[0].IsPublicDns.Should().BeFalse();
+        result[0].ProviderName.Should().BeNull();
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6UnknownGlobal_AllPrefixesKnown_ReportedAsPublic()
+    {
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["2001:db8:ffff::53"]) };
+
+        var result = CreateDetector().DetectExternalDns(networks);
+
+        result.Should().ContainSingle();
+        result[0].IsPublicDns.Should().BeTrue();
+        result[0].ProviderName.Should().BeNull();
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6UnknownGlobal_WithUnknownDelegatedPrefix_NotReported()
+    {
+        // The unknown PD prefix may hold this server, so no claim is made either way
+        var pdWithoutPrefix = new NetworkInfo { Id = "pd", Name = "Gaming", VlanId = 69, DhcpEnabled = true, HasIpv6 = true };
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["2001:db8:ffff::53"]), pdWithoutPrefix };
+
+        CreateDetector().DetectExternalDns(networks).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6KnownResolver_WithUnknownDelegatedPrefix_StillReported()
+    {
+        var pdWithoutPrefix = new NetworkInfo { Id = "pd", Name = "Gaming", VlanId = 69, DhcpEnabled = true, HasIpv6 = true };
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["2620:fe::fe"]), pdWithoutPrefix };
+
+        CreateDetector().DetectExternalDns(networks).Should().ContainSingle().Which.ProviderName.Should().Be("Quad9");
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6DisabledNetwork_Skipped()
+    {
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["2001:4860:4860::8888"], enabled: false) };
+
+        CreateDetector().DetectExternalDns(networks).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv6DnsOnNetworkWithoutIpv4Dhcp_StillReported()
+    {
+        // RA RDNSS hands the server out without DHCP, so the IPv4 DHCP flag does not gate IPv6
+        var networks = new List<NetworkInfo> { DualStack("n1", "Home", 10, ["2001:4860:4860::8888"], dhcp: false) };
+
+        CreateDetector().DetectExternalDns(networks).Should().ContainSingle();
+    }
+
+    [Fact]
+    public void DetectExternalDns_DualStack_Ipv4ResultsUnchangedAndIpv6Appended()
+    {
+        var networks = new List<NetworkInfo>
+        {
+            DualStack("n1", "Home", 10, ["2606:4700:4700::1111"], ipv4Dns: ["1.1.1.1"]),
+            DualStack("n2", "IoT", 20, null, ipv4Dns: ["8.8.8.8"])
+        };
+
+        var result = CreateDetector().DetectExternalDns(networks);
+
+        result.Select(r => (r.NetworkName, r.DnsServerIp, r.ProviderName, r.IsPublicDns)).Should().Equal(
+            ("Home", "1.1.1.1", "Cloudflare", true),
+            ("IoT", "8.8.8.8", "Google", true),
+            ("Home", "2606:4700:4700::1111", "Cloudflare", true));
+    }
+
+    [Fact]
+    public void DetectExternalDns_Ipv4Only_NoIpv6Results()
+    {
+        // IPv4 regression guard: networks without IPv6 produce exactly the IPv4 results
+        var networks = new List<NetworkInfo>
+        {
+            new() { Id = "n1", Name = "Home", VlanId = 1, DhcpEnabled = true, Gateway = "192.168.1.1",
+                Subnet = "192.168.1.0/24", DnsServers = ["1.1.1.1", "192.168.1.1"] }
+        };
+
+        var result = CreateDetector().DetectExternalDns(networks);
+
+        result.Should().ContainSingle().Which.DnsServerIp.Should().Be("1.1.1.1");
     }
 
     #endregion

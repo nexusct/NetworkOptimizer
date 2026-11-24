@@ -157,6 +157,9 @@ function paintHoverDots(w, at) {
         if (!p) continue;
         const [cx, cy] = p;
         if (cx == null || cy == null || isNaN(cx) || isNaN(cy)) continue;
+        // A transparent series is a tooltip-only carrier (Wi-Fi Metrics' Channel), not a line to mark.
+        const color = w.globals.colors[i % w.globals.colors.length];
+        if (color === 'transparent' || /^rgba\([^)]*,\s*0\)$/.test(color)) continue;
 
         const dot = document.createElementNS(SVG_NS, 'circle');
         dot.setAttribute('cx', cx);
@@ -225,14 +228,14 @@ export function valueSortedTooltip({ series, seriesIndex, dataPointIndex, w }, o
     const timeParts = options.omitSeconds
         ? { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }
         : { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false };
-    const when = ts ? new Date(ts).toLocaleString(undefined, timeParts) : '';
+    const when = ts ? noTime.string(noTime.instantOf(ts, w), timeParts) : '';
     const hidden = syncedCopy ? Math.max(0, rows.length - SYNCED_ROW_CAP) : 0;
     const shown = hidden ? rows.slice(0, SYNCED_ROW_CAP) : rows;
-    return (when ? '<div class="apexcharts-tooltip-title" style="font-family:Helvetica, Arial, sans-serif;font-size:12px">' + esc(when) + '</div>' : '')
+    return (when ? '<div class="apexcharts-tooltip-title" style="font-size:12px">' + esc(when) + '</div>' : '')
         + shown.map((r, idx) =>
             '<div class="apexcharts-tooltip-series-group apexcharts-active" style="display:flex">'
             + '<span class="apexcharts-tooltip-marker" style="background-color:' + r.color + ';border-radius:50%;width:12px;height:12px"></span>'
-            + '<div class="apexcharts-tooltip-text" style="font-family:Helvetica, Arial, sans-serif;font-size:12px"><div class="apexcharts-tooltip-y-group">'
+            + '<div class="apexcharts-tooltip-text" style="font-size:12px"><div class="apexcharts-tooltip-y-group">'
             + '<span class="apexcharts-tooltip-text-y-label">' + esc(r.name) + ': </span>'
             + '<span class="apexcharts-tooltip-text-y-value">' + esc(fmtFor(r.i)(r.v)) + '</span>'
             + '</div></div>'
@@ -295,9 +298,10 @@ function medianDelta(pts) {
     return deltas[deltas.length >> 1];
 }
 
+// x values are chart x (noTime.toChart): every caller draws on a noTime.timeAxisLabels axis.
 export function alignedPoints(pts, sel, timeKey = 'time', gapBridgeMs = 0, interpolateNulls = true) {
     if (!pts?.some(p => sel(p) != null)) return [];
-    const out = pts.map(p => ({ x: new Date(p[timeKey]).getTime(), y: sel(p) ?? null }));
+    const out = pts.map(p => ({ x: noTime.toChart(new Date(p[timeKey]).getTime()), y: sel(p) ?? null }));
     if (gapBridgeMs <= 0) return out;
 
     // The budget must follow the data's own cadence, not a wall-clock constant. The server picks an

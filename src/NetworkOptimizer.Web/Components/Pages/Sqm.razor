@@ -12,6 +12,7 @@
 @inject NetworkOptimizer.Web.Services.SqmLearning.ISqmLearningService LearningService
 @inject IJSRuntime JS
 @inject ILogger<Sqm> Logger
+@inject NetworkOptimizer.Web.Services.Identity.IUserPreferences UserPreferences
 @inject PullToRefreshState PtrState
 @inject Microsoft.AspNetCore.Authorization.IAuthorizationService Authz
 @inject Microsoft.AspNetCore.Components.Authorization.AuthenticationStateProvider AuthState
@@ -21,12 +22,14 @@
 @using NetworkOptimizer.Storage.Models
 @using NetworkOptimizer.Web.Services.Ssh
 @using NetworkOptimizer.Web.Services.SqmLearning
+@inject IDisplayTimeZone DisplayTime
 
 <PageTitle>Adaptive SQM - Network Optimizer</PageTitle>
 
 <NavigationLock OnBeforeInternalNavigation="OnBeforeInternalNavigation" ConfirmExternalNavigation="@HasUndeployedChanges" />
 
 <div class="page-header">
+    <PageBackButton />
     <h1>Adaptive SQM Manager</h1>
     <p class="page-description">Dynamic bandwidth optimization with dual-mode (Speedtest + Ping) adjustment. Uses 7-day congestion profiles tuned for your connection type to keep SQM tight and bufferbloat in check. Queue memory and burst sizes are scaled to your WAN speed to prevent hard packet drops - reducing collateral impact on other devices and slightly improving overall throughput.</p>
 </div>
@@ -37,7 +40,7 @@
 {
     <div class="connection-banner connection-error">
         <div class="banner-content">
-            <span class="banner-icon">!</span>
+            <span class="banner-icon"><GatewayIcon /></span>
             <div class="banner-text">
                 <strong>UniFi Connection Error</strong>
                 <span>@ConnectionService.LastError - WAN detection requires a working UniFi connection.</span>
@@ -141,6 +144,13 @@
                         </div>
                     }
 
+                    @if (deploymentStatus?.ScriptsUsingBc > 0)
+                    {
+                        <div class="alert alert-warning" style="margin-top: 1rem;">
+                            <strong>Redeploy recommended:</strong> a UniFi OS upgrade can break rate adjustments. Redeploy to make them upgrade-proof.
+                        </div>
+                    }
+
                     @if (gatewayConnected && deploymentStatus?.UdmBootInstalled != true)
                     {
                         <div class="alert alert-warning" style="margin-top: 1rem;">
@@ -234,7 +244,7 @@
                     @if (sqmMonitorData?.Timestamp != default)
                     {
                         <div class="tc-timestamp">
-                            <small>Updated: @sqmMonitorData?.Timestamp.ToLocalTime().ToString("HH:mm:ss")</small>
+                            <small>Updated: @sqmMonitorData?.Timestamp.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.TimeSeconds, DisplayFormat.Culture)</small>
                         </div>
                     }
                     <button class="btn btn-sm btn-secondary" @onclick="RefreshDashboard" disabled="@isRefreshingDashboard">
@@ -278,14 +288,14 @@
                     @if (sqmMonitorData.Wan1.LastSpeedtestFailed)
                     {
                         <div class="speedtest-failed-indicator">
-                            <span class="warning-icon">⚠</span>
+                            <span class="warning-icon"><AppIcon Name="warning" /></span>
                             <span>Last speedtest failed - <a href="./sqm#check-logs">check logs</a></span>
                         </div>
                     }
                     @if (sqmMonitorData.Wan1.LastError != null && !sqmMonitorData.Wan1.SpeedtestRunning)
                     {
                         <div class="sqm-error-indicator">
-                            <span class="warning-icon">⚠</span>
+                            <span class="warning-icon"><AppIcon Name="warning" /></span>
                             <span>@sqmMonitorData.Wan1.LastError.Message</span>
                         </div>
                     }
@@ -363,14 +373,14 @@
                     @if (sqmMonitorData.Wan2.LastSpeedtestFailed)
                     {
                         <div class="speedtest-failed-indicator">
-                            <span class="warning-icon">⚠</span>
+                            <span class="warning-icon"><AppIcon Name="warning" /></span>
                             <span>Last speedtest failed - <a href="./sqm#check-logs">check logs</a></span>
                         </div>
                     }
                     @if (sqmMonitorData.Wan2.LastError != null && !sqmMonitorData.Wan2.SpeedtestRunning)
                     {
                         <div class="sqm-error-indicator">
-                            <span class="warning-icon">⚠</span>
+                            <span class="warning-icon"><AppIcon Name="warning" /></span>
                             <span>@sqmMonitorData.Wan2.LastError.Message</span>
                         </div>
                     }
@@ -662,10 +672,17 @@
                 @* Tour anchor sits on WAN 1 only; a duplicate selector would just resolve to this one. *@
                 <div class="form-group" data-tour="sqm-download-burst">
                     <label class="checkbox-label">
-                        <input type="checkbox" @bind="wan1Config.RateProportionalDownloadBurst" />
+                        <input type="checkbox" @bind="wan1Config.RateProportionalDownloadBurst" disabled="@wan1Config.CakeDownload" />
                         <span>Larger download burst</span>
                     </label>
                     <small class="form-hint">@BurstOptInHint</small>
+                </div>
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" @bind="wan1Config.CakeDownload" />
+                        <span>CAKE download shaper (experimental)</span>
+                    </label>
+                    <small class="form-hint">@CakeOptInHint</small>
                 </div>
             </div>
                 </div>
@@ -843,10 +860,17 @@
                 </div>
                 <div class="form-group">
                     <label class="checkbox-label">
-                        <input type="checkbox" @bind="wan2Config.RateProportionalDownloadBurst" />
+                        <input type="checkbox" @bind="wan2Config.RateProportionalDownloadBurst" disabled="@wan2Config.CakeDownload" />
                         <span>Larger download burst</span>
                     </label>
                     <small class="form-hint">@BurstOptInHint</small>
+                </div>
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" @bind="wan2Config.CakeDownload" />
+                        <span>CAKE download shaper (experimental)</span>
+                    </label>
+                    <small class="form-hint">@CakeOptInHint</small>
                 </div>
             </div>
                 </div>
@@ -957,7 +981,14 @@
                     <ul class="step-list" id="deployment-step-list">
                         @foreach (var step in deploymentSteps)
                         {
-                            <li>@step</li>
+                            @if (step.StartsWith(SqmDeploymentService.StepWarningMark, StringComparison.Ordinal))
+                            {
+                                <li class="step-warning"><AppIcon Name="warning" /> @step[SqmDeploymentService.StepWarningMark.Length..]</li>
+                            }
+                            else
+                            {
+                                <li>@step</li>
+                            }
                         }
                     </ul>
                 </div>
@@ -1063,7 +1094,7 @@
 
     .calculated-params {
         background: var(--surface-secondary);
-        border-radius: 0.5rem;
+        border-radius: var(--border-radius-lg);
         padding: 1rem;
         margin: 1rem 0;
     }
@@ -1098,7 +1129,7 @@
         gap: 0.25rem;
         padding: 0.5rem;
         background: var(--surface);
-        border-radius: 0.375rem;
+        border-radius: var(--border-radius-lg);
         text-align: center;
     }
 
@@ -1111,7 +1142,9 @@
 
     .param-value {
         font-weight: 600;
-        font-family: var(--font-mono);
+        font-family: var(--font-display);
+        font-variant-numeric: tabular-nums;
+        word-spacing: var(--display-word-spacing);
         font-size: 1.1rem;
         color: var(--text-primary);
     }
@@ -1123,7 +1156,7 @@
         color: var(--text-primary);
         background: var(--bg-tertiary);
         border: 1px solid transparent;
-        border-radius: 4px;
+        border-radius: var(--border-radius);
         text-align: center;
         width: 5rem;
         padding: 2px 4px;
@@ -1150,7 +1183,7 @@
         text-align: center;
         padding: 1.25rem;
         background: var(--surface-secondary);
-        border-radius: 0.5rem;
+        border-radius: var(--border-radius-lg);
     }
 
     .metric-label {
@@ -1202,7 +1235,7 @@
         gap: 0.5rem;
         padding: 0.5rem 1rem;
         background: var(--surface-secondary);
-        border-radius: 0.5rem;
+        border-radius: var(--border-radius-lg);
     }
 
     .tc-name {
@@ -1215,7 +1248,9 @@
     }
 
     .tc-rate {
-        font-family: var(--font-mono);
+        font-family: var(--font-display);
+        font-variant-numeric: tabular-nums;
+        word-spacing: var(--display-word-spacing);
         color: var(--accent-color);
     }
 
@@ -1233,7 +1268,7 @@
 
     .deployment-log {
         background: var(--surface-secondary);
-        border-radius: 0.5rem;
+        border-radius: var(--border-radius-lg);
         padding: 1rem;
     }
 
@@ -1277,11 +1312,10 @@
     }
 
     .wan-status-card {
-        background: linear-gradient(315deg, var(--surface) 0%, var(--surface-secondary) 100%);
+        background: var(--bg-inset);
         border: 1px solid var(--border-color);
-        border-radius: 1rem;
+        border-radius: var(--border-radius-lg);
         padding: 1.5rem;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
     }
 
     .wan-status-header {
@@ -1331,7 +1365,9 @@
     .rate-value {
         font-size: 3rem;
         font-weight: 700;
-        font-family: var(--font-mono);
+        font-family: var(--font-display);
+        font-variant-numeric: tabular-nums;
+        word-spacing: var(--display-word-spacing);
         color: var(--accent-color);
         line-height: 1;
     }
@@ -1392,7 +1428,7 @@
         padding: 0.5rem;
         margin-bottom: 0.5rem;
         background: rgba(239, 68, 68, 0.1);
-        border-radius: 0.375rem;
+        border-radius: var(--border-radius-lg);
     }
 
     .sqm-error-indicator .warning-icon {
@@ -1402,7 +1438,7 @@
     .log-output {
         background: var(--surface-secondary);
         border: 1px solid var(--border-color);
-        border-radius: 0.5rem;
+        border-radius: var(--border-radius-lg);
         padding: 1rem;
         font-family: var(--font-mono);
         font-size: 0.8rem;
@@ -1422,7 +1458,7 @@
 
     .detail-section {
         background: var(--surface-secondary);
-        border-radius: 0.5rem;
+        border-radius: var(--border-radius-lg);
         padding: 0.75rem 1rem;
     }
 
@@ -1448,7 +1484,9 @@
     }
 
     .detail-value {
-        font-family: var(--font-mono);
+        font-family: var(--font-display);
+        font-variant-numeric: tabular-nums;
+        word-spacing: var(--display-word-spacing);
         font-weight: 500;
         color: var(--text-primary);
     }
@@ -1457,7 +1495,9 @@
         font-size: 0.75rem;
         color: var(--text-secondary);
         margin-top: 0.5rem;
-        font-family: var(--font-mono);
+        font-family: var(--font-display);
+        font-variant-numeric: tabular-nums;
+        word-spacing: var(--display-word-spacing);
     }
 
     .baseline-info {
@@ -1551,7 +1591,7 @@
     .adjustment-result {
         margin-top: 1rem;
         padding: 0.75rem 1rem;
-        border-radius: 0.375rem;
+        border-radius: var(--border-radius-lg);
         font-size: 0.9rem;
     }
 
@@ -1593,7 +1633,7 @@
         color: var(--text-primary);
         background: var(--bg-tertiary);
         border: 1px solid transparent;
-        border-radius: 4px;
+        border-radius: var(--border-radius);
         padding: 2px 4px;
         max-width: 100%;
     }
@@ -1843,13 +1883,13 @@
                     }
                     else if (status.IsCompleted)
                     {
-                        <span><span class="detail-label">Status:</span>@(status.IsReliable ? "Complete" : "Ended") @(status.CompletedAt.HasValue ? status.CompletedAt.Value.ToLocalTime().ToString("MMM d, HH:mm") : "")</span>
+                        <span><span class="detail-label">Status:</span>@(status.IsReliable ? "Complete" : "Ended") @(status.CompletedAt.HasValue ? status.CompletedAt.Value.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DayTime, DisplayFormat.Culture) : "")</span>
                     }
                     <span><span class="detail-label">Samples:</span>@status.ValidSampleCount valid of @status.TotalSampleCount</span>
                     <span><span class="detail-label">Week covered:</span>@status.CoveragePercent.ToString("F0")%</span>
                     @if (status.LastSampleAt.HasValue)
                     {
-                        <span><span class="detail-label">Last sample:</span>@status.LastSampleAt.Value.ToLocalTime().ToString("MMM d, HH:mm")</span>
+                        <span><span class="detail-label">Last sample:</span>@status.LastSampleAt.Value.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DayTime, DisplayFormat.Culture)</span>
                     }
                     @if (status.IsRunning)
                     {
@@ -1857,7 +1897,7 @@
                     }
                     else if (status.IsActive && status.NextRunAt.HasValue)
                     {
-                        <span><span class="detail-label">Next check:</span>@status.NextRunAt.Value.ToLocalTime().ToString("HH:mm")</span>
+                        <span><span class="detail-label">Next check:</span>@status.NextRunAt.Value.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.Time, DisplayFormat.Culture)</span>
                     }
                     @if (status.IsActive && status.LastSummary?.StartsWith("Waiting", StringComparison.Ordinal) == true)
                     {
@@ -2123,6 +2163,10 @@
         "Helps downloads that fall short of full speed, especially to Wi-Fi clients. " +
         "Upload is unchanged. Turn it off if loaded latency gets worse.";
 
+    private const string CakeOptInHint =
+        "Replaces UniFi's download queue with CAKE: fair shares per device and per-packet overhead accounting. " +
+        "UniFi QoS rules don't apply to this WAN's download; its upload and other WANs keep them.";
+
     // Cache settings
     private static readonly TimeSpan CacheDuration = TimeSpan.FromMinutes(5);
     private static DateTime _lastStatusCheck = DateTime.MinValue;
@@ -2136,6 +2180,8 @@
     private static SqmDeploymentStatus? _cachedDeploymentStatus;
     private static List<TcInterfaceStats>? _cachedTcInterfaces;
     private static List<WanInterfaceInfo>? _cachedWanInterfaces;
+    // Own slug, not _cachedSlug: a refresh sets that one before comparing against the previous WANs.
+    private static string? _cachedWanInterfacesSlug;
     private static bool _cachedGatewayConnected;
     private static bool _cachedGatewayConfigured;
     private static bool _refreshNeeded = false;  // Flag to trigger refresh on next page load
@@ -2251,7 +2297,16 @@
     private bool _wan2Collapsed = false;
 
     private void ToggleWan1Section() => _wan1Collapsed = !_wan1Collapsed;
-    private void ToggleWan2Section() => _wan2Collapsed = !_wan2Collapsed;
+    // WAN2 opens expanded for first-time setup, so people see they can shape a second WAN; once
+    // the user collapses or expands it, that choice is kept per user and per site.
+    private string Wan2CollapsedPreferenceKey => $"sqm.wan2_collapsed:{SiteContext.Slug}";
+
+    private async Task ToggleWan2Section()
+    {
+        _wan2Collapsed = !_wan2Collapsed;
+        try { await UserPreferences.SetAsync(Wan2CollapsedPreferenceKey, _wan2Collapsed ? "true" : "false"); }
+        catch (Exception ex) { Logger.LogDebug(ex, "Could not save the WAN2 collapse preference"); }
+    }
 
     // Auto-refresh timer (1 minute interval)
     private System.Threading.Timer? _refreshTimer;
@@ -2366,20 +2421,55 @@
     private static readonly TimeSpan NormalPollingInterval = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan FastPollingInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan InitialPollDelay = TimeSpan.FromSeconds(3);
-    private static readonly TimeSpan PostDeploySingleWanFastPolling = TimeSpan.FromSeconds(20);
-    private static readonly TimeSpan PostDeployDualWanFastPolling = TimeSpan.FromSeconds(65);
+    // Covers a calibration's run (about 20 s) plus a poll's worth of slack after it starts.
+    private static readonly TimeSpan CalibrationFastPollingMargin = TimeSpan.FromSeconds(30);
+    // Wide enough that a 60 s poll always lands inside it before the scheduled minute.
+    private static readonly TimeSpan ScheduledCalibrationLeadIn = TimeSpan.FromSeconds(75);
+    private static readonly TimeSpan ScheduledCalibrationTail = TimeSpan.FromSeconds(90);
     private bool _isFastPolling = false;
     private DateTime? _fastPollingUntil = null;
+
+    // Seconds from the boot script to the first calibration; WAN2 staggers behind WAN1 by default.
+    private int Wan1BootDelaySeconds => wan1Config.BootDelaySeconds ?? 5;
+    private int Wan2BootDelaySeconds => wan2Config.BootDelaySeconds ?? (wan1Config.Enabled ? 50 : 5);
+
+    /// <summary>
+    /// True from shortly before to shortly after an enabled WAN's scheduled calibration. The
+    /// schedule is gateway-local, so it is compared on the site's clock, as the ISP Health probe
+    /// exclusions do; the server's zone only when the site's is not known.
+    /// </summary>
+    private bool IsNearScheduledCalibration()
+    {
+        if (deploymentStatus?.IsDeployed != true) return false;
+        var now = TimeZoneCatalog.ToZone(DateTime.UtcNow, DisplayTime.SiteZone ?? TimeZoneInfo.Local);
+        foreach (var wan in new[] { wan1Config, wan2Config })
+        {
+            if (!wan.Enabled) continue;
+            foreach (var (hour, minute) in new[] { (wan.MorningHour, wan.MorningMinute), (wan.EveningHour, wan.EveningMinute) })
+            {
+                var due = now.Date.AddHours(hour).AddMinutes(minute);
+                // The nearest occurrence, so a time just past midnight still counts.
+                foreach (var candidate in new[] { due.AddDays(-1), due, due.AddDays(1) })
+                {
+                    if (now >= candidate - ScheduledCalibrationLeadIn && now <= candidate + ScheduledCalibrationTail)
+                        return true;
+                }
+            }
+        }
+        return false;
+    }
 
     private void AdjustRefreshInterval(bool useInitialDelay = false)
     {
         if (_refreshTimer == null) return;
 
-        // Fast poll if: speedtest running, UI-initiated adjustment, or within post-deploy window
+        // Fast poll if: speedtest running, UI-initiated adjustment, within the post-deploy window,
+        // or around a scheduled calibration
         var shouldFastPoll = sqmMonitorData?.Wan1?.SpeedtestRunning == true ||
                              sqmMonitorData?.Wan2?.SpeedtestRunning == true ||
                              isRunningAdjustment ||
-                             (_fastPollingUntil != null && DateTime.UtcNow < _fastPollingUntil);
+                             (_fastPollingUntil != null && DateTime.UtcNow < _fastPollingUntil) ||
+                             IsNearScheduledCalibration();
 
         if (shouldFastPoll && !_isFastPolling)
         {
@@ -2505,6 +2595,7 @@
                     config.LinkSpeedOverrideMbps = saved.LinkSpeedOverrideMbps;
                     config.BootDelaySeconds = saved.BootDelaySeconds;
                     config.RateProportionalDownloadBurst = saved.RateProportionalDownloadBurst;
+                    config.CakeDownload = saved.CakeDownload;
 
                     UpdateCalculatedSpeeds(config);
 
@@ -2526,9 +2617,16 @@
 
             await LoadLearningStatusAsync();
 
-            // Set initial collapsed state: collapsed if config exists, expanded if needs setup
+            // Set initial collapsed state: collapsed if config exists, expanded if needs setup.
+            // WAN2 follows the user's own choice once they have made one.
             _wan1Collapsed = wan1HasSavedConfig;
             _wan2Collapsed = wan2HasSavedConfig;
+            try
+            {
+                if (await UserPreferences.GetAsync(Wan2CollapsedPreferenceKey) is { } wan2Pref)
+                    _wan2Collapsed = wan2Pref == "true";
+            }
+            catch (Exception ex) { Logger.LogDebug(ex, "Could not read the WAN2 collapse preference"); }
 
             // Capture loaded state as deployed snapshot (saved configs = deployed state)
             if (wan1HasSavedConfig || wan2HasSavedConfig)
@@ -2569,6 +2667,7 @@
                     LinkSpeedOverrideMbps = wan1Config.LinkSpeedOverrideMbps,
                     BootDelaySeconds = wan1Config.BootDelaySeconds,
                     RateProportionalDownloadBurst = wan1Config.RateProportionalDownloadBurst,
+                    CakeDownload = wan1Config.CakeDownload,
                     SpeedtestMorningHour = wan1Config.MorningHour,
                     SpeedtestMorningMinute = wan1Config.MorningMinute,
                     SpeedtestEveningHour = wan1Config.EveningHour,
@@ -2601,6 +2700,7 @@
                     LinkSpeedOverrideMbps = wan2Config.LinkSpeedOverrideMbps,
                     BootDelaySeconds = wan2Config.BootDelaySeconds,
                     RateProportionalDownloadBurst = wan2Config.RateProportionalDownloadBurst,
+                    CakeDownload = wan2Config.CakeDownload,
                     SpeedtestMorningHour = wan2Config.MorningHour,
                     SpeedtestMorningMinute = wan2Config.MorningMinute,
                     SpeedtestEveningHour = wan2Config.EveningHour,
@@ -2642,7 +2742,10 @@
 
         foreach (var wan in newInterfaces)
         {
-            oldLookup.TryGetValue(wan.Interface, out var wasEnabled);
+            // Absent from the old list is no evidence it was disabled: that list can be empty after a
+            // failed WAN fetch. The list carries every WAN, so a real toggle is present with false.
+            if (!oldLookup.TryGetValue(wan.Interface, out var wasEnabled))
+                continue;
 
             // The timestamps dictionary is static (shared across sites), so key by
             // site to keep same-named interfaces (e.g. "eth8") on different sites
@@ -2669,6 +2772,11 @@
         foreach (var key in staleKeys)
             _smartqEnabledTimestamps.Remove(key);
     }
+
+    // The previous WAN list only when it was fetched for this site; another site's WANs would read
+    // as Smart Queues just enabled on every interface, and trip the settle timer on a site switch.
+    private static List<WanInterfaceInfo>? CachedWanInterfacesFor(string siteSlug) =>
+        _cachedWanInterfacesSlug == siteSlug ? _cachedWanInterfaces : null;
 
     // Site-scoped key for the static SmartQ settle-timer dictionary.
     private static string SmartqKey(string siteSlug, string iface) => $"{siteSlug}:{iface}";
@@ -2856,6 +2964,7 @@
         wan1Config.EveningMinute = 0;
         wan1Config.BootDelaySeconds = null;
         wan1Config.RateProportionalDownloadBurst = true;
+        wan1Config.CakeDownload = false;
         wan1Config.UseLearnedProfile = false;
         UpdateCalculatedSpeeds(wan1Config);
 
@@ -2874,6 +2983,7 @@
         wan2Config.EveningMinute = 0;
         wan2Config.BootDelaySeconds = null;
         wan2Config.RateProportionalDownloadBurst = true;
+        wan2Config.CakeDownload = false;
         wan2Config.UseLearnedProfile = false;
         UpdateCalculatedSpeeds(wan2Config);
     }
@@ -3066,7 +3176,7 @@
                 try
                 {
                     wanInterfaces = await wanInterfacesTask;
-                    TrackSmartqTransitions(SiteContext.Slug, _cachedWanInterfaces, wanInterfaces);
+                    TrackSmartqTransitions(SiteContext.Slug, CachedWanInterfacesFor(SiteContext.Slug), wanInterfaces);
                     // Only apply detected interfaces if we don't have saved configs
                     if (!hasSavedConfigs)
                         ApplyDetectedWanInterfaces();
@@ -3087,6 +3197,7 @@
                 _cachedDeploymentStatus = deploymentStatus;
                 _cachedTcInterfaces = tcInterfaces;
                 _cachedWanInterfaces = wanInterfaces;
+                _cachedWanInterfacesSlug = SiteContext.Slug;
                 _lastStatusCheck = DateTime.UtcNow;
             }
             else
@@ -3299,8 +3410,9 @@
             deploymentSteps.Add("Checking Smart Queue configuration...");
             await ScrollDeploymentLog();
             wanInterfaces = await SqmService.GetWanInterfacesFromControllerAsync();
-            TrackSmartqTransitions(SiteContext.Slug, _cachedWanInterfaces, wanInterfaces);
+            TrackSmartqTransitions(SiteContext.Slug, CachedWanInterfacesFor(SiteContext.Slug), wanInterfaces);
             _cachedWanInterfaces = wanInterfaces;
+            _cachedWanInterfacesSlug = SiteContext.Slug;
 
             // Validate WANs still have Smart Queues enabled - disable any that don't
             var availableInterfaces = sqmEligibleWans.Select(w => w.Interface).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -3317,31 +3429,24 @@
                 await ScrollDeploymentLog();
             }
 
-            // Smart Queue download rate validation - commented out because UniFi Network
-            // never clobbers our TC config once Adaptive SQM takes over. The rate shown in
-            // the UniFi UI becomes irrelevant after our scripts replace the qdiscs.
-            // foreach (var wanConfig in new[] { (config: wan1Config, ready: wan1Config.Enabled), (config: wan2Config, ready: wan2Config.Enabled) })
-            // {
-            //     if (!wanConfig.ready) continue;
-            //
-            //     var wanInfo = wanInterfaces.FirstOrDefault(w =>
-            //         w.Interface.Equals(wanConfig.config.Interface, StringComparison.OrdinalIgnoreCase));
-            //     if (wanInfo?.SmartqDownRateMbps == null) continue;
-            //
-            //     var effectiveMax = wanConfig.config.EffectiveLinkSpeedMbps is > 0
-            //         ? Math.Min(wanConfig.config.AbsoluteMax, wanConfig.config.EffectiveLinkSpeedMbps.Value)
-            //         : wanConfig.config.AbsoluteMax;
-            //     if (wanInfo.SmartqDownRateMbps < effectiveMax - 1)
-            //     {
-            //         statusMessage = $"Smart Queue download rate for {wanConfig.config.Name} is {wanInfo.SmartqDownRateMbps} Mbps, " +
-            //             $"but Adaptive SQM needs up to {effectiveMax} Mbps. " +
-            //             $"Increase the rate in UniFi Network > Settings > Internet > {wanInfo.Name} > Advanced > Smart Queues.";
-            //         statusSuccess = false;
-            //         isDeploying = false;
-            //         StateHasChanged();
-            //         return;
-            //     }
-            // }
+            // Smart Queues rates below Adaptive SQM's: a warning, not a block. The scripts set the
+            // shaping rate themselves, but UniFi's QoS-rule classes keep their ceiling at UniFi's
+            // rate, and UniFi's own tree shapes until the first calibration.
+            foreach (var model in new[] { wan1Config, wan2Config }.Where(w => w.Enabled))
+            {
+                var wanInfo = wanInterfaces.FirstOrDefault(w =>
+                    w.Interface.Equals(model.Interface, StringComparison.OrdinalIgnoreCase));
+                if (wanInfo == null) continue;
+                var planned = CreateSqmConfiguration(model);
+                foreach (var warning in SmartQueuesRateCheck.Warnings(model.Name, wanInfo.SmartqDownRateMbps, wanInfo.SmartqUpRateMbps,
+                    SmartQueuesRateCheck.MaxShapedDownloadMbps(planned.MaxDownloadSpeed, planned.WanLinkSpeedMbps),
+                    planned.NominalUploadSpeed))
+                {
+                    deploymentWarnings.Add(warning);
+                    deploymentSteps.Add($"{SqmDeploymentService.StepWarningMark}{warning}");
+                }
+            }
+            await ScrollDeploymentLog();
 
             // Validate IFB device settle time - Smart Queues needs ~45s after enabling for the IFB device to initialize
             foreach (var wanConfig in new[] { wan1Config, wan2Config })
@@ -3367,11 +3472,17 @@
             // Clean ALL existing SQM scripts and cron entries first (handles renamed connections)
             deploymentSteps.Add("Cleaning existing SQM scripts and cron entries...");
             await ScrollDeploymentLog();
-            var cleanResult = await DeploymentService.CleanAllSqmScriptsAsync();
+            // Which WANs deploy, and with CAKE, decides whether UniFi's trees are restored first
+            var deploying = new[] { wan1Config, wan2Config }.Where(w => w.Enabled).ToList();
+            var cleanResult = await DeploymentService.CleanAllSqmScriptsAsync(
+                deploying.Select(w => w.Interface).ToList(),
+                deploying.Where(w => w.CakeDownload).Select(w => w.Interface).ToList());
             if (!cleanResult.success)
             {
                 throw new Exception($"Failed to clean existing scripts: {cleanResult.message}");
             }
+            deploymentWarnings.AddRange(cleanResult.warnings);
+            deploymentSteps.AddRange(cleanResult.warnings.Select(w => $"{SqmDeploymentService.StepWarningMark}{w}"));
             deploymentSteps.Add("Existing scripts cleaned");
             await ScrollDeploymentLog();
 
@@ -3383,7 +3494,7 @@
             // Deploy first WAN
             if (wan1Config.Enabled)
             {
-                var wan1Delay = wan1Config.BootDelaySeconds ?? 5;
+                var wan1Delay = Wan1BootDelaySeconds;
                 deploymentSteps.Add($"Deploying SQM for {wan1Config.Name} ({wan1Config.Interface})...");
                 await ScrollDeploymentLog();
 
@@ -3410,7 +3521,7 @@
             // Deploy second WAN (stagger speedtest only if first WAN is also deployed and no custom delay set)
             if (wan2Config.Enabled)
             {
-                var wan2Delay = wan2Config.BootDelaySeconds ?? (wan1Config.Enabled ? 50 : 5);
+                var wan2Delay = Wan2BootDelaySeconds;
                 deploymentSteps.Add($"Deploying SQM for {wan2Config.Name} ({wan2Config.Interface})...");
                 await ScrollDeploymentLog();
 
@@ -3454,7 +3565,7 @@
                 if (!monitorSuccess)
                 {
                     deploymentWarnings.Add(monitorError ?? "SQM Monitor deployment failed");
-                    deploymentSteps.Add($"⚠️ SQM Monitor deployment failed: {monitorError ?? "Unknown error"}");
+                    deploymentSteps.Add($"{SqmDeploymentService.StepWarningMark}SQM Monitor deployment failed: {monitorError ?? "Unknown error"}");
                     deploymentSteps.Add("SQM Monitor cleaned up after failure");
                 }
                 else
@@ -3481,12 +3592,11 @@
             InvalidateCache();
             await RefreshStatus();
 
-            // Deploy triggers initial speedtests - start fast polling after delay to catch them
-            // Duration depends on number of enabled WANs (staggered speedtests)
-            var postDeployDuration = (wan1Config.Enabled && wan2Config.Enabled)
-                ? PostDeployDualWanFastPolling
-                : PostDeploySingleWanFastPolling;
-            _fastPollingUntil = DateTime.UtcNow.Add(postDeployDuration);
+            // Deploy triggers initial speedtests - fast poll until the last one has had time to run
+            var lastDelaySeconds = Math.Max(
+                wan1Config.Enabled ? Wan1BootDelaySeconds : 0,
+                wan2Config.Enabled ? Wan2BootDelaySeconds : 0);
+            _fastPollingUntil = DateTime.UtcNow.AddSeconds(lastDelaySeconds).Add(CalibrationFastPollingMargin);
 
             // 5s delay + 3s initial poll delay = poll at 8s mark
             _ = Task.Run(async () =>
@@ -3546,7 +3656,7 @@
             }
             else
             {
-                deploymentSteps.Add($"⚠️ SQM Monitor deployment failed: {errorMessage ?? "Unknown error"}");
+                deploymentSteps.Add($"{SqmDeploymentService.StepWarningMark}SQM Monitor deployment failed: {errorMessage ?? "Unknown error"}");
                 deploymentSteps.Add("SQM Monitor cleaned up after failure");
                 statusMessage = $"SQM Monitor deployment failed: {errorMessage ?? "Unknown error"}";
                 statusSuccess = false;
@@ -3780,6 +3890,7 @@
             NominalUploadSpeed = model.NominalUpload,
             ShapeUpload = true,
             RateProportionalDownloadBurst = model.RateProportionalDownloadBurst,
+            CakeDownload = model.CakeDownload,
             PingHost = model.PingHost,
             PreferredSpeedtestServerId = model.SpeedtestServerId,
             // Use user-configured schedule times
@@ -3935,6 +4046,19 @@
         // Opt-in rate-proportional download burst (~1 ms of line time) instead of the 5 KB clamp
         public bool RateProportionalDownloadBurst { get; set; }
 
+        // CAKE has no burst setting, so turning it on clears the larger burst rather than leaving it
+        // saved but inert.
+        public bool CakeDownload
+        {
+            get => _cakeDownload;
+            set
+            {
+                _cakeDownload = value;
+                if (value) RateProportionalDownloadBurst = false;
+            }
+        }
+        private bool _cakeDownload;
+
         // Physical WAN port link speed (null if unknown, e.g., GRE tunnels)
         public int? WanLinkSpeedMbps { get; set; }
 
@@ -4085,7 +4209,7 @@
             Enabled, Name, Interface, ConnectionType, NominalDownload, NominalUpload,
             PingHost, SpeedtestServerId, MorningHour, MorningMinute, EveningHour, EveningMinute,
             BaselineLatency, LatencyThreshold, CongestionSeverity, LinkSpeedOverrideMbps,
-            BootDelaySeconds, RateProportionalDownloadBurst, UploadCongestionSeverity, UseLearnedProfile);
+            BootDelaySeconds, RateProportionalDownloadBurst, CakeDownload, UploadCongestionSeverity, UseLearnedProfile);
 
         // Check if current config differs from a snapshot
         public bool DiffersFrom(WanConfigSnapshot? snapshot)
@@ -4109,6 +4233,7 @@
                    LinkSpeedOverrideMbps != snapshot.LinkSpeedOverrideMbps ||
                    BootDelaySeconds != snapshot.BootDelaySeconds ||
                    RateProportionalDownloadBurst != snapshot.RateProportionalDownloadBurst ||
+                   CakeDownload != snapshot.CakeDownload ||
                    Math.Abs(UploadCongestionSeverity - snapshot.UploadCongestionSeverity) > 0.001 ||
                    UseLearnedProfile != snapshot.UseLearnedProfile;
         }
@@ -4121,7 +4246,7 @@
         int MorningHour, int MorningMinute, int EveningHour, int EveningMinute,
         double BaselineLatency, double LatencyThreshold, double CongestionSeverity,
         int? LinkSpeedOverrideMbps, int? BootDelaySeconds, bool RateProportionalDownloadBurst,
-        double UploadCongestionSeverity, bool UseLearnedProfile);
+        bool CakeDownload, double UploadCongestionSeverity, bool UseLearnedProfile);
 
     public void Dispose()
     {

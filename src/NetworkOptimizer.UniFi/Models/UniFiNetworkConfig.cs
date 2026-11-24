@@ -24,162 +24,6 @@ public class WanProviderCapabilities
 }
 
 /// <summary>
-/// JSON converter that handles bool values that may come as strings ("true"/"false") instead of native booleans.
-/// UniFi OS Server returns some boolean fields as strings.
-/// </summary>
-public class FlexibleBoolConverter : JsonConverter<bool>
-{
-    public override bool Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
-    {
-        return reader.TokenType switch
-        {
-            JsonTokenType.True => true,
-            JsonTokenType.False => false,
-            JsonTokenType.String => bool.TryParse(reader.GetString(), out var value) && value,
-            JsonTokenType.Number => reader.GetInt32() != 0,
-            _ => false
-        };
-    }
-
-    public override void Write(Utf8JsonWriter writer, bool value, JsonSerializerOptions options)
-    {
-        writer.WriteBooleanValue(value);
-    }
-}
-
-/// <summary>
-/// Nullable version of FlexibleBoolConverter for fields that may be absent from the response.
-/// </summary>
-public class FlexibleNullableBoolConverter : JsonConverter<bool?>
-{
-    public override bool? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
-    {
-        return reader.TokenType switch
-        {
-            JsonTokenType.True => true,
-            JsonTokenType.False => false,
-            JsonTokenType.String => bool.TryParse(reader.GetString(), out var value) ? value : null,
-            JsonTokenType.Number => reader.GetInt32() != 0,
-            JsonTokenType.Null => null,
-            _ => null
-        };
-    }
-
-    public override void Write(Utf8JsonWriter writer, bool? value, JsonSerializerOptions options)
-    {
-        if (value.HasValue)
-            writer.WriteBooleanValue(value.Value);
-        else
-            writer.WriteNullValue();
-    }
-}
-
-/// <summary>
-/// JSON converter that handles int values that may come as strings, empty strings, or null.
-/// UniFi API sometimes returns VLAN IDs as strings or empty strings instead of numbers.
-/// </summary>
-public class FlexibleIntConverter : JsonConverter<int?>
-{
-    public override int? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
-    {
-        return reader.TokenType switch
-        {
-            JsonTokenType.Number when reader.TryGetInt32(out var i) => i,
-            JsonTokenType.Number => (int)reader.GetDouble(),
-            JsonTokenType.String when int.TryParse(reader.GetString(), out var value) => value,
-            JsonTokenType.String => null, // Empty string or non-numeric string
-            JsonTokenType.Null => null,
-            _ => null
-        };
-    }
-
-    public override void Write(Utf8JsonWriter writer, int? value, JsonSerializerOptions options)
-    {
-        if (value.HasValue)
-            writer.WriteNumberValue(value.Value);
-        else
-            writer.WriteNullValue();
-    }
-}
-
-/// <summary>
-/// <see cref="FlexibleIntConverter"/> for a non-nullable int: a number, a stringified number, a
-/// float, or nothing. A value that cannot be read is 0, which port and speed readers already
-/// treat as "none".
-/// </summary>
-public class FlexibleNonNullableIntConverter : JsonConverter<int>
-{
-    public override int Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
-    {
-        return reader.TokenType switch
-        {
-            JsonTokenType.Number when reader.TryGetInt32(out var i) => i,
-            JsonTokenType.Number => (int)reader.GetDouble(),
-            JsonTokenType.String when int.TryParse(reader.GetString(), out var value) => value,
-            _ => 0,
-        };
-    }
-
-    public override void Write(Utf8JsonWriter writer, int value, JsonSerializerOptions options)
-        => writer.WriteNumberValue(value);
-}
-
-/// <summary>
-/// Tolerant parser for 64-bit counters (byte and packet totals) that may arrive as a number, a
-/// stringified number, a float, or nothing. Mirrors FlexibleIntConverter; a value that cannot be
-/// read is 0, which the byte-delta readers treat as "no sample" rather than as a reset.
-/// </summary>
-public class FlexibleLongConverter : JsonConverter<long>
-{
-    public override long Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
-    {
-        return reader.TokenType switch
-        {
-            JsonTokenType.Number when reader.TryGetInt64(out var l) => l,
-            JsonTokenType.Number => (long)reader.GetDouble(),
-            JsonTokenType.String when long.TryParse(reader.GetString(), out var value) => value,
-            _ => 0,
-        };
-    }
-
-    public override void Write(Utf8JsonWriter writer, long value, JsonSerializerOptions options)
-        => writer.WriteNumberValue(value);
-}
-
-/// <summary>
-/// Tolerant nullable-double parser for UniFi API fields that may arrive as a number, a
-/// stringified number, or an empty string. Mirrors FlexibleIntConverter but for floating
-/// point. SFP DDM values (rxpower, current, temperature, voltage) are the primary case;
-/// some firmwares stringify them.
-/// </summary>
-public class FlexibleDoubleConverter : JsonConverter<double?>
-{
-    public override double? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
-    {
-        return reader.TokenType switch
-        {
-            JsonTokenType.Number => reader.GetDouble(),
-            JsonTokenType.String when double.TryParse(
-                reader.GetString(),
-                System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture,
-                out var value) => value,
-            JsonTokenType.String => null, // Empty / non-numeric string
-            JsonTokenType.Null => null,
-            _ => null
-        };
-    }
-
-    public override void Write(Utf8JsonWriter writer, double? value, JsonSerializerOptions options)
-    {
-        if (value.HasValue)
-            writer.WriteNumberValue(value.Value);
-        else
-            writer.WriteNullValue();
-    }
-}
-
-/// <summary>
 /// Response from GET /api/s/{site}/rest/networkconf
 /// Represents a network/VLAN configuration
 /// </summary>
@@ -265,6 +109,12 @@ public class UniFiNetworkConfig
     [JsonPropertyName("ipv6_interface_type")]
     public string? Ipv6InterfaceType { get; set; }
 
+    /// <summary>
+    /// Static IPv6 prefix in gateway form (e.g., "2001:db8:1::1/64"). Absent for prefix-delegated networks.
+    /// </summary>
+    [JsonPropertyName("ipv6_subnet")]
+    public string? Ipv6Subnet { get; set; }
+
     [JsonPropertyName("ipv6_pd_interface")]
     public string? Ipv6PdInterface { get; set; }
 
@@ -292,12 +142,45 @@ public class UniFiNetworkConfig
     [JsonConverter(typeof(FlexibleIntConverter))]
     public int? Ipv6RaPreferredLifetime { get; set; }
 
+    /// <summary>
+    /// UI "DHCPv6/RDNSS DNS Control": true (or absent) hands out the gateway, false hands out
+    /// <see cref="Dhcpdv6Dns1"/>-<see cref="Dhcpdv6Dns4"/> over both DHCPv6 and RA RDNSS.
+    /// </summary>
+    [JsonPropertyName("dhcpdv6_dns_auto")]
+    [JsonConverter(typeof(FlexibleNullableBoolConverter))]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Dhcpdv6DnsAuto { get; set; }
+
+    [JsonPropertyName("dhcpdv6_dns_1")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Dhcpdv6Dns1 { get; set; }
+
+    [JsonPropertyName("dhcpdv6_dns_2")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Dhcpdv6Dns2 { get; set; }
+
+    [JsonPropertyName("dhcpdv6_dns_3")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Dhcpdv6Dns3 { get; set; }
+
+    [JsonPropertyName("dhcpdv6_dns_4")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Dhcpdv6Dns4 { get; set; }
+
     // WAN configuration
     [JsonPropertyName("wan_networkgroup")]
     public string? WanNetworkgroup { get; set; }
 
     [JsonPropertyName("wan_type")]
     public string? WanType { get; set; } // "dhcp", "static", "pppoe"
+
+    /// <summary>
+    /// MAC of the UniFi cellular modem that carries this WAN as a GRE tunnel over the LAN (a U5G Max
+    /// or U-LTE on a switch port, WAN on gre1). Absent on every other WAN.
+    /// </summary>
+    [JsonPropertyName("lan_tunnel_wan_device")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? LanTunnelWanDevice { get; set; }
 
     /// <summary>
     /// The interface name for this WAN (e.g., "eth4", "eth0")
@@ -347,6 +230,28 @@ public class UniFiNetworkConfig
 
     [JsonPropertyName("wan_dns2")]
     public string? WanDns2 { get; set; }
+
+    /// <summary>
+    /// The WAN's IPv6 connection type ("dhcpv6", "static", ...); "disabled" when the WAN has no IPv6.
+    /// </summary>
+    [JsonPropertyName("wan_type_v6")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WanTypeV6 { get; set; }
+
+    /// <summary>
+    /// "auto" takes the ISP's IPv6 DNS; "manual" uses <see cref="WanIpv6Dns1"/> / <see cref="WanIpv6Dns2"/>.
+    /// </summary>
+    [JsonPropertyName("wan_ipv6_dns_preference")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WanIpv6DnsPreference { get; set; }
+
+    [JsonPropertyName("wan_ipv6_dns1")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WanIpv6Dns1 { get; set; }
+
+    [JsonPropertyName("wan_ipv6_dns2")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WanIpv6Dns2 { get; set; }
 
     [JsonPropertyName("wan_username")]
     public string? WanUsername { get; set; }

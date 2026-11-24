@@ -32,12 +32,14 @@ public static class ApiEndpoints
         DemoMappingEndpoints.Map(app);
         ConfigTransferEndpoints.Map(app);
         LanFlowMapEndpoints.Map(app);
+        ClientIconEndpoints.Map(app);
         SiteAgentEndpoints.Map(app);
         MonitoringChartEndpoints.Map(app);
         IspHealthEndpoints.Map(app);
         FirmwareRolloutEndpoints.Map(app);
         MonitoringInvestigateEndpoints.Map(app);
         FlakyTargetEndpoints.Map(app);
+        WafEndpoints.Map(app);
         DeviceHealthChartEndpoints.Map(app);
         PortStatsEndpoints.Map(app);
         SfpChartEndpoints.Map(app);

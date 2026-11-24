@@ -2,6 +2,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using NetworkOptimizer.Audit.Models;
 using NetworkOptimizer.Audit.Services;
+using NetworkOptimizer.Core;
 using NetworkOptimizer.Core.Helpers;
 using NetworkOptimizer.UniFi.Models;
 using static NetworkOptimizer.Core.Enums.DeviceTypeExtensions;
@@ -59,7 +60,9 @@ public class VlanAnalyzer
             var deviceType = device.GetStringOrNull("type");
             if (deviceType == null)
                 continue;
-            var isGateway = FromUniFiApiType(deviceType).IsGateway();
+            var isGateway = NetworkOptimizer.UniFi.UniFiProductDatabase.ClassifyDeviceType(
+                deviceType, device.GetStringOrNull("model"), device.GetStringOrNull("shortname"),
+                device.GetStringOrNull("device_mode_override")).IsGateway();
 
             var networkTableItems = device.GetArrayOrEmpty("network_table").ToList();
             if (networkTableItems.Count == 0)
@@ -96,25 +99,7 @@ public class VlanAnalyzer
                 _logger.LogInformation("No Management network found - designating VLAN 1 '{Name}' as Management", vlan1Network.Name);
                 // NetworkInfo is immutable, so we need to replace it
                 var index = networks.IndexOf(vlan1Network);
-                networks[index] = new NetworkInfo
-                {
-                    Id = vlan1Network.Id,
-                    Name = vlan1Network.Name,
-                    VlanId = vlan1Network.VlanId,
-                    Purpose = NetworkPurpose.Management,
-                    Subnet = vlan1Network.Subnet,
-                    Gateway = vlan1Network.Gateway,
-                    DnsServers = vlan1Network.DnsServers,
-                    AllowsRouting = vlan1Network.AllowsRouting,
-                    DhcpEnabled = vlan1Network.DhcpEnabled,
-                    NetworkIsolationEnabled = vlan1Network.NetworkIsolationEnabled,
-                    InternetAccessEnabled = vlan1Network.InternetAccessEnabled,
-                    IsUniFiGuestNetwork = vlan1Network.IsUniFiGuestNetwork,
-                    FirewallZoneId = vlan1Network.FirewallZoneId,
-                    NetworkGroup = vlan1Network.NetworkGroup,
-                    UpnpLanEnabled = vlan1Network.UpnpLanEnabled,
-                    Enabled = vlan1Network.Enabled
-                };
+                networks[index] = vlan1Network.WithPurpose(NetworkPurpose.Management, vlan1Network.HasPurposeOverride);
             }
         }
 
@@ -137,26 +122,7 @@ public class VlanAnalyzer
                 Enum.TryParse<NetworkPurpose>(purposeStr, ignoreCase: true, out var purpose))
             {
                 var oldPurpose = network.Purpose;
-                networks[i] = new NetworkInfo
-                {
-                    Id = network.Id,
-                    Name = network.Name,
-                    VlanId = network.VlanId,
-                    Purpose = purpose,
-                    Subnet = network.Subnet,
-                    Gateway = network.Gateway,
-                    DnsServers = network.DnsServers,
-                    AllowsRouting = network.AllowsRouting,
-                    DhcpEnabled = network.DhcpEnabled,
-                    NetworkIsolationEnabled = network.NetworkIsolationEnabled,
-                    InternetAccessEnabled = network.InternetAccessEnabled,
-                    IsUniFiGuestNetwork = network.IsUniFiGuestNetwork,
-                    FirewallZoneId = network.FirewallZoneId,
-                    NetworkGroup = network.NetworkGroup,
-                    UpnpLanEnabled = network.UpnpLanEnabled,
-                    Enabled = network.Enabled,
-                    HasPurposeOverride = true
-                };
+                networks[i] = network.WithPurpose(purpose, hasPurposeOverride: true);
                 if (oldPurpose != purpose)
                 {
                     _logger.LogInformation("Applied user override: Network '{Name}' ({Id}) purpose changed from {OldPurpose} to {NewPurpose}",
@@ -189,6 +155,8 @@ public class VlanAnalyzer
             if (dnsServers.Count == 0) dnsServers = null;
         }
 
+        var hasIpv6 = IsIpv6InterfaceEnabled(nc.Ipv6InterfaceType);
+
         return new NetworkInfo
         {
             Id = nc.Id,
@@ -205,8 +173,101 @@ public class VlanAnalyzer
             FirewallZoneId = nc.FirewallZoneId,
             NetworkGroup = nc.Networkgroup,
             UpnpLanEnabled = nc.UpnpLanEnabled,
-            Enabled = nc.Enabled
+            Enabled = nc.Enabled,
+            HasIpv6 = hasIpv6,
+            Ipv6Subnets = NormalizeIpv6Prefixes([nc.Ipv6Subnet]),
+            Ipv6GatewayAddresses = ExtractIpv6GatewayAddresses([nc.Ipv6Subnet]),
+            Ipv6DnsServers = SelectIpv6DnsServers(hasIpv6, nc.Dhcpdv6DnsAuto,
+                [nc.Dhcpdv6Dns1, nc.Dhcpdv6Dns2, nc.Dhcpdv6Dns3, nc.Dhcpdv6Dns4])
         };
+    }
+
+    /// <summary>
+    /// The custom IPv6 DNS servers a network hands out, or null when it hands out the gateway.
+    /// An absent dhcpdv6_dns_auto means auto, and IPv6 off means no IPv6 DNS is handed out at all.
+    /// Only IPv6 literals are kept, so nothing here reaches an IPv4 consumer.
+    /// </summary>
+    internal static List<string>? SelectIpv6DnsServers(bool hasIpv6, bool? dnsAuto, IEnumerable<string?> servers)
+    {
+        if (!hasIpv6 || dnsAuto != false)
+            return null;
+
+        var result = servers
+            .Where(s => System.Net.IPAddress.TryParse(s?.Trim(), out var ip) &&
+                ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
+            .Select(s => s!.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        return result.Count > 0 ? result : null;
+    }
+
+    /// <summary>
+    /// Whether an ipv6_interface_type value turns IPv6 on for the network ("static", "pd", ...).
+    /// </summary>
+    internal static bool IsIpv6InterfaceEnabled(string? ipv6InterfaceType) =>
+        !string.IsNullOrEmpty(ipv6InterfaceType) &&
+        !ipv6InterfaceType.Equals("none", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Normalize gateway-form IPv6 prefixes ("2001:db8:1::1/64") to network form ("2001:db8:1::/64"),
+    /// dropping blanks and anything that is not an IPv6 CIDR. Returns null when none remain.
+    /// </summary>
+    internal static List<string>? NormalizeIpv6Prefixes(IEnumerable<string?> prefixes)
+    {
+        var result = new List<string>();
+        foreach (var prefix in prefixes)
+        {
+            if (string.IsNullOrWhiteSpace(prefix))
+                continue;
+
+            var parts = prefix.Trim().Split('/');
+            if (parts.Length != 2 || !int.TryParse(parts[1], out var length) || length is < 0 or > 128 ||
+                !System.Net.IPAddress.TryParse(parts[0], out var address) ||
+                address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6)
+                continue;
+
+            var bytes = address.GetAddressBytes();
+            for (var bit = length; bit < 128; bit++)
+                bytes[bit / 8] &= (byte)~(0x80 >> (bit % 8));
+
+            var normalized = $"{new System.Net.IPAddress(bytes)}/{length}";
+            if (!result.Contains(normalized, StringComparer.OrdinalIgnoreCase))
+                result.Add(normalized);
+        }
+
+        return result.Count > 0 ? result : null;
+    }
+
+    /// <summary>
+    /// The gateway addresses in gateway-form IPv6 prefixes ("2001:db8:1::1/64" gives "2001:db8:1::1"),
+    /// plus its link-local address when the gateway's network_table reports one. A prefix written in
+    /// network form names no gateway and is skipped. Returns null when none remain.
+    /// </summary>
+    internal static List<string>? ExtractIpv6GatewayAddresses(IEnumerable<string?> prefixes, string? linkLocal = null)
+    {
+        var result = new List<string>();
+        if (System.Net.IPAddress.TryParse(linkLocal?.Trim(), out var ll) && ll.IsIPv6LinkLocal)
+            result.Add(ll.ToString());
+
+        foreach (var prefix in prefixes)
+        {
+            var parts = prefix?.Trim().Split('/');
+            if (parts is not { Length: 2 } || !int.TryParse(parts[1], out var length) || length is < 0 or > 128 ||
+                !System.Net.IPAddress.TryParse(parts[0], out var address) ||
+                address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6)
+                continue;
+
+            var bytes = address.GetAddressBytes();
+            var hasHostBits = false;
+            for (var bit = length; bit < 128 && !hasHostBits; bit++)
+                hasHostBits = (bytes[bit / 8] & (0x80 >> (bit % 8))) != 0;
+
+            var gateway = address.ToString();
+            if (hasHostBits && !result.Contains(gateway, StringComparer.OrdinalIgnoreCase))
+                result.Add(gateway);
+        }
+
+        return result.Count > 0 ? result : null;
     }
 
     private static string? ExtractGatewayFromSubnet(string? ipSubnet)
@@ -215,6 +276,22 @@ public class VlanAnalyzer
             return null;
         var slashIndex = ipSubnet.IndexOf('/');
         return slashIndex > 0 ? ipSubnet[..slashIndex] : null;
+    }
+
+    /// <summary>
+    /// A network_table entry for a WAN: purpose "wan", a WAN network group ("WAN", "WAN3"), or a WAN type.
+    /// </summary>
+    [VendorSpecific("UniFi", "network_table WAN markers; the UDR 5G Max's cellular WAN shape is inferred (#1384)")]
+    internal static bool IsWanEntry(JsonElement network)
+    {
+        if (string.Equals(network.GetStringOrNull("purpose"), "wan", StringComparison.OrdinalIgnoreCase))
+            return true;
+        foreach (var key in new[] { "networkgroup", "wan_networkgroup" })
+        {
+            if (network.GetStringOrNull(key)?.StartsWith("WAN", StringComparison.OrdinalIgnoreCase) == true)
+                return true;
+        }
+        return !string.IsNullOrEmpty(network.GetStringOrNull("wan_type"));
     }
 
     /// <summary>
@@ -232,6 +309,14 @@ public class VlanAnalyzer
         {
             var sysName = network.GetStringOrDefault("name", "Unknown");
             _logger.LogDebug("Skipping system network '{Name}' (attr_hidden_id=ROUTE)", sysName);
+            return null;
+        }
+
+        // Skip a WAN. The table lists LAN networks, but a UDR 5G Max lists its built-in cellular WAN too,
+        // which then read as a VLAN 1 network with no subnet. Any one WAN marker is enough.
+        if (IsWanEntry(network))
+        {
+            _logger.LogDebug("Skipping WAN '{Name}' in network_table", network.GetStringOrDefault("name", "Unknown"));
             return null;
         }
 
@@ -279,6 +364,16 @@ public class VlanAnalyzer
             _logger.LogDebug("Network '{Name}' has DNS servers: {DnsServers}", name, string.Join(", ", dnsServers));
         }
 
+        // Static prefixes arrive as ipv6_subnet; a delegated prefix only as the gateway's ipv6_subnets array.
+        var hasIpv6 = IsIpv6InterfaceEnabled(network.GetStringOrNull("ipv6_interface_type"));
+        var rawIpv6Prefixes = new List<string?> { network.GetStringOrNull("ipv6_subnet") };
+        if (network.TryGetProperty("ipv6_subnets", out var ipv6Subnets) && ipv6Subnets.ValueKind == JsonValueKind.Array)
+        {
+            rawIpv6Prefixes.AddRange(ipv6Subnets.EnumerateArray()
+                .Where(e => e.ValueKind == JsonValueKind.String)
+                .Select(e => e.GetString()));
+        }
+
         return new NetworkInfo
         {
             Id = networkId,
@@ -295,7 +390,14 @@ public class VlanAnalyzer
             FirewallZoneId = firewallZoneId,
             NetworkGroup = networkGroup,
             UpnpLanEnabled = upnpLanEnabled,
-            Enabled = networkEnabled
+            Enabled = networkEnabled,
+            HasIpv6 = hasIpv6,
+            Ipv6Subnets = NormalizeIpv6Prefixes(rawIpv6Prefixes),
+            Ipv6GatewayAddresses = ExtractIpv6GatewayAddresses(rawIpv6Prefixes,
+                network.GetStringOrNull("ipv6_link_local_address")),
+            Ipv6DnsServers = SelectIpv6DnsServers(hasIpv6,
+                network.GetBoolOrDefault("dhcpdv6_dns_auto", true),
+                Enumerable.Range(1, 4).Select(i => network.GetStringOrNull($"dhcpdv6_dns_{i}")))
         };
     }
 
@@ -706,6 +808,34 @@ public class VlanAnalyzer
             }
         }
 
+        // The same check for custom IPv6 DNS, compared by value so any written form matches
+        foreach (var isolated in isolatedNetworks.Where(n => n.Ipv6DnsServers is { Count: > 0 }))
+        {
+            foreach (var corporate in corporateNetworks.Where(n => n.Ipv6DnsServers is { Count: > 0 }))
+            {
+                var sharedDns = isolated.Ipv6DnsServers!
+                    .Where(s => corporate.Ipv6DnsServers!.Any(c => NetworkUtilities.IpAddressesAreEqual(s, c)))
+                    .ToList();
+                if (sharedDns.Count == 0)
+                    continue;
+
+                issues.Add(new AuditIssue
+                {
+                    Type = IssueTypes.DnsSharedServers,
+                    Severity = AuditSeverity.Informational,
+                    Message = $"Network '{isolated.Name}' shares DNS servers with corporate network{IpFamilyText.OverIpv6}",
+                    Metadata = IpFamilyText.Tag(new Dictionary<string, object>
+                    {
+                        { "isolated_network", isolated.Name },
+                        { "corporate_network", corporate.Name },
+                        { "shared_dns", sharedDns }
+                    }, ipv6Only: true),
+                    RuleId = "DNS-001",
+                    ScoreImpact = 3
+                });
+            }
+        }
+
         return issues;
     }
 
@@ -781,8 +911,7 @@ public class VlanAnalyzer
                 continue;
 
             var deviceNames = clientsWithoutFixedIp
-                .Select(c => !string.IsNullOrEmpty(c.Name) ? c.Name :
-                             !string.IsNullOrEmpty(c.Hostname) ? c.Hostname : c.Mac)
+                .Select(c => UniFi.ClientNames.For(c) ?? c.Mac)
                 .ToList();
 
             var deviceList = string.Join(", ", deviceNames.Take(5));
@@ -834,9 +963,14 @@ public class VlanAnalyzer
                 && network.Purpose != NetworkPurpose.Management)
                 continue;
 
-            // Check if network is effectively isolated (via setting or firewall rule)
-            var isEffectivelyIsolated = network.NetworkIsolationEnabled ||
-                IsIsolatedViaFirewall(network, networks, firewallRules);
+            // Check if network is effectively isolated (via setting or firewall rule). The setting
+            // covers IPv6 too: UniFi lists static prefixes in Isolated Networks and adds PD rules.
+            var isolatedOverIpv4 = network.NetworkIsolationEnabled ||
+                IsIsolatedViaFirewall(network, networks, firewallRules, IpFamily.IPv4);
+            var ipv6Only = isolatedOverIpv4 && !network.NetworkIsolationEnabled && network.IsIpv6Evaluable &&
+                !IsIsolatedViaFirewall(network, networks, firewallRules, IpFamily.IPv6);
+            var isEffectivelyIsolated = isolatedOverIpv4 && !ipv6Only;
+            var suffix = IpFamilyText.Suffix(ipv6Only);
 
             // Check Security/Camera networks
             if (network.Purpose == NetworkPurpose.Security && !isEffectivelyIsolated)
@@ -845,16 +979,16 @@ public class VlanAnalyzer
                 {
                     Type = IssueTypes.SecurityNetworkNotIsolated,
                     Severity = AuditSeverity.Critical,
-                    Message = $"Security/Camera VLAN '{network.Name}' is not isolated",
+                    Message = $"Security/Camera VLAN '{network.Name}' is not isolated{suffix}",
                     DeviceName = gatewayName,
                     CurrentNetwork = network.Name,
                     CurrentVlan = network.VlanId,
-                    Metadata = new Dictionary<string, object>
+                    Metadata = IpFamilyText.Tag(new Dictionary<string, object>
                     {
                         { "network", network.Name },
                         { "vlan", network.VlanId },
                         { "network_isolation_enabled", network.NetworkIsolationEnabled }
-                    },
+                    }, ipv6Only),
                     RuleId = "NET-ISO-001",
                     ScoreImpact = 15,
                     RecommendedAction = "Enable network isolation to prevent cameras from accessing other network segments. If incorrect, set a different Purpose for the network in Network Reference below."
@@ -868,16 +1002,16 @@ public class VlanAnalyzer
                 {
                     Type = IssueTypes.MgmtNetworkNotIsolated,
                     Severity = AuditSeverity.Critical,
-                    Message = $"Management VLAN '{network.Name}' is not isolated",
+                    Message = $"Management VLAN '{network.Name}' is not isolated{suffix}",
                     DeviceName = gatewayName,
                     CurrentNetwork = network.Name,
                     CurrentVlan = network.VlanId,
-                    Metadata = new Dictionary<string, object>
+                    Metadata = IpFamilyText.Tag(new Dictionary<string, object>
                     {
                         { "network", network.Name },
                         { "vlan", network.VlanId },
                         { "network_isolation_enabled", network.NetworkIsolationEnabled }
-                    },
+                    }, ipv6Only),
                     RuleId = "NET-ISO-002",
                     ScoreImpact = 15,
                     RecommendedAction = network.VlanId == 1
@@ -893,16 +1027,16 @@ public class VlanAnalyzer
                 {
                     Type = IssueTypes.IotNetworkNotIsolated,
                     Severity = AuditSeverity.Recommended,
-                    Message = $"IoT VLAN '{network.Name}' is not isolated",
+                    Message = $"IoT VLAN '{network.Name}' is not isolated{suffix}",
                     DeviceName = gatewayName,
                     CurrentNetwork = network.Name,
                     CurrentVlan = network.VlanId,
-                    Metadata = new Dictionary<string, object>
+                    Metadata = IpFamilyText.Tag(new Dictionary<string, object>
                     {
                         { "network", network.Name },
                         { "vlan", network.VlanId },
                         { "network_isolation_enabled", network.NetworkIsolationEnabled }
-                    },
+                    }, ipv6Only),
                     RuleId = "NET-ISO-003",
                     ScoreImpact = 10,
                     RecommendedAction = "Enable Isolate Network in Network Settings, or add inter-VLAN blocking Firewall Rules to prevent IoT devices from reaching other VLANs. If incorrect, set a different Purpose for the network in Network Reference below."
@@ -916,16 +1050,16 @@ public class VlanAnalyzer
                 {
                     Type = IssueTypes.MediaNetworkNotIsolated,
                     Severity = AuditSeverity.Recommended,
-                    Message = $"Media VLAN '{network.Name}' is not isolated",
+                    Message = $"Media VLAN '{network.Name}' is not isolated{suffix}",
                     DeviceName = gatewayName,
                     CurrentNetwork = network.Name,
                     CurrentVlan = network.VlanId,
-                    Metadata = new Dictionary<string, object>
+                    Metadata = IpFamilyText.Tag(new Dictionary<string, object>
                     {
                         { "network", network.Name },
                         { "vlan", network.VlanId },
                         { "network_isolation_enabled", network.NetworkIsolationEnabled }
-                    },
+                    }, ipv6Only),
                     RuleId = "NET-ISO-006",
                     ScoreImpact = 10,
                     RecommendedAction = "Enable Isolate Network in Network Settings, or add inter-VLAN blocking Firewall Rules to prevent media devices from reaching other VLANs. If incorrect, set a different Purpose for the network in Network Reference below."
@@ -945,17 +1079,24 @@ public class VlanAnalyzer
     private bool IsIsolatedViaFirewall(
         NetworkInfo network,
         List<NetworkInfo> allNetworks,
-        List<FirewallRule>? firewallRules)
+        List<FirewallRule>? firewallRules,
+        IpFamily family)
     {
+        // IPv6 traffic only reaches networks that carry IPv6 themselves
+        var otherNetworks = allNetworks
+            .Where(n => n.Id != network.Id && (family == IpFamily.IPv4 || n.IsIpv6Evaluable))
+            .ToList();
+
+        if (family == IpFamily.IPv6 && otherNetworks.Count == 0)
+            return true;
+
         if (firewallRules == null || firewallRules.Count == 0)
             return false;
-
-        var otherNetworks = allNetworks.Where(n => n.Id != network.Id).ToList();
 
         // Isolation can only be claimed by a rule that blocks every protocol and port, so
         // require one before asking what actually takes effect below.
         var hasBroadBlock = firewallRules.Any(rule =>
-            rule.Enabled && IsBroadBlock(rule) && rule.AppliesToSourceNetwork(network));
+            rule.Enabled && IsBroadBlock(rule) && rule.AppliesToSourceNetwork(network, family));
 
         if (!hasBroadBlock)
             return false;
@@ -967,16 +1108,17 @@ public class VlanAnalyzer
         var allBlocked = otherNetworks.All(otherNet =>
             FirewallRuleEvaluator.Evaluate(
                 firewallRules,
-                rule => rule.AppliesToSourceNetwork(network)
-                        && RuleTargetsNetwork(rule, otherNet)
+                rule => rule.AppliesToSourceNetwork(network, family)
+                        && RuleTargetsNetwork(rule, otherNet, family)
                         && (rule.ActionType.IsAllowAction() || IsBroadBlock(rule)),
-                forNewConnections: true).IsBlocked);
+                forNewConnections: true,
+                family: family).IsBlocked);
 
         if (allBlocked)
         {
             _logger.LogDebug(
-                "Network '{NetworkName}' is isolated: the effective rule to every other network blocks it",
-                network.Name);
+                "Network '{NetworkName}' is isolated over {Family}: the effective rule to every other network blocks it",
+                network.Name, family);
         }
 
         return allBlocked;
@@ -998,7 +1140,7 @@ public class VlanAnalyzer
     /// agnostic, so it answers the same question for an allow rule as for a block.
     /// Considers destination zone scoping, network ID matching (with Match Opposite), and IP/CIDR coverage.
     /// </summary>
-    private static bool RuleTargetsNetwork(FirewallRule rule, NetworkInfo targetNetwork)
+    private static bool RuleTargetsNetwork(FirewallRule rule, NetworkInfo targetNetwork, IpFamily family)
     {
         // If rule specifies a destination zone and target has a zone, they must match.
         // A zone-scoped rule only blocks traffic to networks within that zone.
@@ -1024,10 +1166,11 @@ public class VlanAnalyzer
             return rule.DestinationMatchOppositeNetworks ? !isInList : isInList;
         }
 
-        // IP destination - check if CIDRs cover the target network's subnet
-        if (destTarget == "IP" && rule.DestinationIps?.Count > 0 && !string.IsNullOrEmpty(targetNetwork.Subnet))
+        // IP destination - check if CIDRs cover the target network's subnets for this family
+        var subnets = targetNetwork.SubnetsFor(family);
+        if (destTarget == "IP" && rule.DestinationIps?.Count > 0 && subnets.Count > 0)
         {
-            return NetworkUtilities.AnyCidrCoversSubnet(rule.DestinationIps, targetNetwork.Subnet);
+            return subnets.All(s => NetworkUtilities.AnyCidrCoversSubnet(rule.DestinationIps, s));
         }
 
         return false;
@@ -1062,8 +1205,13 @@ public class VlanAnalyzer
                 && network.Purpose != NetworkPurpose.Management)
                 continue;
 
-            // Check if internet is effectively enabled (not disabled via setting OR firewall rule)
-            var hasEffectiveInternetAccess = HasEffectiveInternetAccess(network, firewallRules, externalZoneId, firewallAnalyzer);
+            // Check if internet is effectively enabled (not disabled via setting OR firewall rule),
+            // in any family the network carries
+            var ipv4InternetAccess = HasEffectiveInternetAccess(network, firewallRules, externalZoneId, firewallAnalyzer, IpFamily.IPv4);
+            var ipv6Only = !ipv4InternetAccess && network.IsIpv6Evaluable &&
+                HasEffectiveInternetAccess(network, firewallRules, externalZoneId, firewallAnalyzer, IpFamily.IPv6);
+            var hasEffectiveInternetAccess = ipv4InternetAccess || ipv6Only;
+            var suffix = IpFamilyText.Suffix(ipv6Only);
 
             // Check Security/Camera networks - should NOT have internet access
             if (network.Purpose == NetworkPurpose.Security && hasEffectiveInternetAccess)
@@ -1072,16 +1220,16 @@ public class VlanAnalyzer
                 {
                     Type = IssueTypes.SecurityNetworkHasInternet,
                     Severity = AuditSeverity.Critical,
-                    Message = $"Security/Camera VLAN '{network.Name}' has internet access enabled",
+                    Message = $"Security/Camera VLAN '{network.Name}' has internet access enabled{suffix}",
                     DeviceName = gatewayName,
                     CurrentNetwork = network.Name,
                     CurrentVlan = network.VlanId,
-                    Metadata = new Dictionary<string, object>
+                    Metadata = IpFamilyText.Tag(new Dictionary<string, object>
                     {
                         { "network", network.Name },
                         { "vlan", network.VlanId },
                         { "internet_access_enabled", network.InternetAccessEnabled }
-                    },
+                    }, ipv6Only),
                     RuleId = "NET-INT-001",
                     ScoreImpact = 15,
                     RecommendedAction = "Disable internet access to prevent cameras from phoning home to unknown servers."
@@ -1095,16 +1243,16 @@ public class VlanAnalyzer
                 {
                     Type = IssueTypes.MgmtNetworkHasInternet,
                     Severity = AuditSeverity.Recommended,
-                    Message = $"Management VLAN '{network.Name}' has internet access enabled",
+                    Message = $"Management VLAN '{network.Name}' has internet access enabled{suffix}",
                     DeviceName = gatewayName,
                     CurrentNetwork = network.Name,
                     CurrentVlan = network.VlanId,
-                    Metadata = new Dictionary<string, object>
+                    Metadata = IpFamilyText.Tag(new Dictionary<string, object>
                     {
                         { "network", network.Name },
                         { "vlan", network.VlanId },
                         { "internet_access_enabled", network.InternetAccessEnabled }
-                    },
+                    }, ipv6Only),
                     RuleId = "NET-INT-002",
                     ScoreImpact = 5,
                     RecommendedAction = "Consider disabling internet access and using firewall rules to allow specific traffic (UniFi cloud, AFC, etc.)."
@@ -1125,7 +1273,8 @@ public class VlanAnalyzer
         NetworkInfo network,
         List<FirewallRule>? firewallRules,
         string? externalZoneId,
-        FirewallRuleAnalyzer? firewallAnalyzer = null)
+        FirewallRuleAnalyzer? firewallAnalyzer,
+        IpFamily family)
     {
         // If internet access is disabled in network config, it's blocked
         if (!network.InternetAccessEnabled)
@@ -1144,7 +1293,7 @@ public class VlanAnalyzer
         // rule ordering and connection state checks (e.g., skipping INVALID-only rules)
         if (firewallAnalyzer != null)
         {
-            var isBlockedByFirewall = firewallAnalyzer.IsInternetBlockedViaFirewall(network, firewallRules, externalZoneId);
+            var isBlockedByFirewall = firewallAnalyzer.IsInternetBlockedViaFirewall(network, firewallRules, externalZoneId, family);
             if (isBlockedByFirewall)
             {
                 _logger.LogDebug("Network '{Name}' has internet blocked via firewall rule", network.Name);
@@ -1180,7 +1329,7 @@ public class VlanAnalyzer
             var model = device.GetStringOrNull("model");
             var shortname = device.GetStringOrNull("shortname");
             var parsedType = NetworkOptimizer.UniFi.UniFiProductDatabase.ClassifyDeviceType(
-                deviceType, model, shortname);
+                deviceType, model, shortname, device.GetStringOrNull("device_mode_override"));
 
             // Skip gateways - they're typically on VLAN 1 by default and that's OK
             if (parsedType.IsGateway())

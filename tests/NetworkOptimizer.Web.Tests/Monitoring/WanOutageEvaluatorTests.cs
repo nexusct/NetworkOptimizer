@@ -1,4 +1,5 @@
 using FluentAssertions;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using NetworkOptimizer.Alerts.Events;
 using NetworkOptimizer.Core.Enums;
@@ -77,7 +78,8 @@ public class WanOutageEvaluatorTests
 
     private readonly CapturingAlertEventBus _bus = new();
     private readonly FakeTimeProvider _time = new(Start);
-    private readonly MonitoringAlertEvaluator _evaluator;
+    // Reassigned by the restart tests, which start from stored alerts.
+    private MonitoringAlertEvaluator _evaluator;
 
     public WanOutageEvaluatorTests()
     {
@@ -85,12 +87,13 @@ public class WanOutageEvaluatorTests
     }
 
     private MonitoringAlertEvaluator BuildEvaluator(WanOutageContext context,
-        RolloutSuppressionRegistry? rolloutWindows = null)
+        RolloutSuppressionRegistry? rolloutWindows = null, IServiceScopeFactory? stored = null)
     {
         var wanOutages = new WanOutageEvaluator(_bus, NullLogger<WanOutageEvaluator>.Instance,
-            new FakeContextSource(context), rolloutWindows: rolloutWindows, timeProvider: _time);
+            new FakeContextSource(context), rolloutWindows: rolloutWindows, timeProvider: _time, scopeFactory: stored);
         return new MonitoringAlertEvaluator(_bus, NullLogger<MonitoringAlertEvaluator>.Instance,
-            new DeviceTransitionTracker(), wanOutages, new DeviceOfflineDeduplicator(), rolloutWindows: rolloutWindows);
+            new DeviceTransitionTracker(), wanOutages, new DeviceOfflineDeduplicator(), rolloutWindows: rolloutWindows,
+            scopeFactory: stored);
     }
 
     #region Per-WAN outages
@@ -120,6 +123,32 @@ public class WanOutageEvaluatorTests
         evt.EventType.Should().Be("monitoring.wan_outage_partial");
         evt.Severity.Should().Be(AlertSeverity.Warning);
         evt.DeviceId.Should().Be("wan");
+    }
+
+    /// <summary>
+    /// Two scattered destinations among many healthy ones is a narrow partial: it holds about
+    /// three minutes before opening, where a broad one opens on the total's clock.
+    /// </summary>
+    [Fact]
+    public async Task NarrowPartial_OpensOnlyOnceItHoldsThreeMinutes()
+    {
+        MonitoringTarget[] healthyDestinations =
+        [
+            Target("wan-resolver-c", "resolver-c", "203.0.113.30", MonitoringTargetType.InternetService, "wan", 64530, "Gamma Cloud"),
+            Target("wan-resolver-d", "resolver-d", "203.0.113.40", MonitoringTargetType.InternetService, "wan", 64531, "Delta Cloud"),
+            Target("wan-resolver-e", "resolver-e", "203.0.113.50", MonitoringTargetType.InternetService, "wan", 64532, "Echo Cloud"),
+            Target("wan-resolver-f", "resolver-f", "203.0.113.60", MonitoringTargetType.InternetService, "wan", 64533, "Foxtrot Cloud"),
+            Target("wan-resolver-g", "resolver-g", "203.0.113.70", MonitoringTargetType.InternetService, "wan", 64534, "Golf Cloud"),
+        ];
+
+        await RoundsAsync(RoundsToConfirm, failing: WanDestinations,
+            passing: [.. WanPath, .. healthyDestinations, .. Wan2Targets]);
+        _bus.Published.Should().BeEmpty();
+
+        await RoundsAsync(12, failing: WanDestinations,
+            passing: [.. WanPath, .. healthyDestinations, .. Wan2Targets]);
+        _bus.Published.Should().ContainSingle()
+            .Which.EventType.Should().Be("monitoring.wan_outage_partial");
     }
 
     /// <summary>
@@ -209,6 +238,87 @@ public class WanOutageEvaluatorTests
 
     #endregion
 
+    #region Alert links open on the targets that went down
+
+    [Fact]
+    public async Task OutageWithTheFirstHopDown_LinksToIsp()
+    {
+        await RoundsAsync(RoundsToConfirm, failing: WanTargets, passing: Wan2Targets);
+
+        _bus.Published.Single().SourceUrl.Should().Contain("category=AccessIsp").And.Contain("wan=wan");
+    }
+
+    [Fact]
+    public async Task OutageBeyondAnAnsweringFirstHop_LinksToTransit()
+    {
+        await RoundsAsync(RoundsToConfirm, failing: [WanTransit, .. WanDestinations],
+            passing: [WanAccess, .. Wan2Targets]);
+
+        var evt = _bus.Published.Should().ContainSingle().Subject;
+        evt.EventType.Should().Be("monitoring.wan_outage");
+        evt.SourceUrl.Should().Contain("category=Transit");
+    }
+
+    [Fact]
+    public async Task PartialWithNoSharedBranch_LinksToInternet()
+    {
+        await RoundsAsync(RoundsToConfirm, failing: WanDestinations,
+            passing: [.. WanPath, .. Wan2Targets]);
+
+        _bus.Published.Single().SourceUrl.Should().Contain("category=InternetService");
+    }
+
+    [Fact]
+    public async Task PartialBehindATransitHop_LinksToTransit()
+    {
+        await RoundsAsync(RoundsToConfirm, failing: [WanTransit, WanResolverA],
+            passing: [WanAccess, WanResolverB, .. Wan2Targets]);
+
+        var evt = _bus.Published.Should().ContainSingle().Subject;
+        evt.EventType.Should().Be("monitoring.wan_outage_partial");
+        evt.SourceUrl.Should().Contain("category=Transit");
+    }
+
+    [Fact]
+    public async Task Recovery_LinksToTheSameViewAsItsOutage()
+    {
+        await RoundsAsync(RoundsToConfirm, failing: [WanTransit, .. WanDestinations],
+            passing: [WanAccess, .. Wan2Targets]);
+        await RoundsAsync(RoundsToConfirm, failing: NoTargets, passing: [.. WanTargets, .. Wan2Targets]);
+
+        _bus.Published.Single(e => e.EventType == "monitoring.wan_recovered")
+            .SourceUrl.Should().Contain("category=Transit");
+    }
+
+    [Fact]
+    public async Task RecoveryAfterRestart_LinksToTheStoredOutagesView()
+    {
+        var stored = OpenAlertTestScope.Alert("monitoring.wan_outage", "wan", TimeSpan.FromMinutes(10));
+        stored.SourceUrl = "/monitoring?tab=performance&category=Transit&at=1&wan=wan";
+        _evaluator = BuildEvaluator(BuildContext(), stored: OpenAlertTestScope.With(stored));
+
+        await RoundsAsync(RoundsToConfirm, failing: NoTargets, passing: [.. WanTargets, .. Wan2Targets]);
+
+        _bus.Published.Should().ContainSingle().Which.SourceUrl.Should().Contain("category=Transit");
+    }
+
+    [Fact]
+    public async Task Rollup_LinksToTheShallowestCategoryDownAcrossTheWans()
+    {
+        await RoundsAsync(RoundsToConfirm, failing: [.. WanTargets, .. Wan2Targets], passing: NoTargets);
+
+        _bus.Published.Single().SourceUrl.Should().Contain("category=AccessIsp").And.Contain("wan=all");
+    }
+
+    [Theory]
+    [InlineData("/monitoring?tab=performance&category=Transit&at=1&wan=wan", "Transit")]
+    [InlineData("/monitoring?tab=performance&at=1", null)]
+    [InlineData(null, null)]
+    public void LinkCategory_ReadsTheCategoryBackOffAStoredLink(string? url, string? expected) =>
+        WanOutageEvaluator.LinkCategory(url).Should().Be(expected);
+
+    #endregion
+
     #region What the WAN alerts must not change
 
     [Theory]
@@ -250,6 +360,92 @@ public class WanOutageEvaluatorTests
         evt.EventType.Should().Be("monitoring.wan_outage");
         evt.DeviceId.Should().Be("wan2");
         evt.Severity.Should().Be(AlertSeverity.Critical);
+    }
+
+    #endregion
+
+    #region Fabric results for device offline confirmation
+
+    [Fact]
+    public async Task FabricResult_IsReadableByMacWhileFresh()
+    {
+        var target = Target("lan-switch", "Switch 1", "192.0.2.10", MonitoringTargetType.Fabric, deviceMac: "aa:bb:cc:dd:ee:ff");
+
+        await _evaluator.EvaluateAsync(target, Probe(target, success: true));
+
+        _evaluator.FabricReachable("AA-BB-CC-DD-EE-FF", TimeSpan.FromSeconds(30), DateTime.UtcNow).Should().BeTrue();
+        _evaluator.FabricReachable("aa:bb:cc:dd:ee:ff", TimeSpan.FromSeconds(30), DateTime.UtcNow.AddMinutes(1)).Should().BeNull();
+        _evaluator.FabricReachable("aa:bb:cc:dd:ee:00", TimeSpan.FromSeconds(30), DateTime.UtcNow).Should().BeNull();
+    }
+
+    /// <summary>A device whose fabric target answers is management-only: no ping needed, no outage announced.</summary>
+    [Fact]
+    public async Task DeviceDisconnected_WhileItsFabricTargetAnswers_IsNotAnOutage()
+    {
+        var target = Target("lan-switch", "Switch 1", "192.0.2.10", MonitoringTargetType.Fabric, deviceMac: "aa:bb:cc:dd:ee:ff");
+        var devices = new DeviceStateAlertEvaluator(_bus, new DeviceTransitionTracker(), new DeviceOfflineDeduplicator(),
+            NullLogger<DeviceStateAlertEvaluator>.Instance, fabric: _evaluator);
+
+        for (var i = 0; i < 3; i++)
+        {
+            await _evaluator.EvaluateAsync(target, Probe(target, success: true));
+            await devices.EvaluateAsync("aa:bb:cc:dd:ee:ff", "Switch 1", "192.0.2.10", DeviceType.Switch, 0, DateTime.UtcNow);
+        }
+
+        _bus.Published.Should().BeEmpty();
+    }
+
+    #endregion
+
+    #region Restart
+
+    [Fact]
+    public async Task WanOutageOpenBeforeRestart_StillDown_IsNotRepublished()
+    {
+        _evaluator = BuildEvaluator(BuildContext(), stored: OpenAlertTestScope.With(
+            OpenAlertTestScope.Alert("monitoring.wan_outage", "wan", TimeSpan.FromMinutes(10))));
+
+        await RoundsAsync(RoundsToConfirm, failing: WanTargets, passing: Wan2Targets);
+
+        _bus.Published.Should().BeEmpty();
+    }
+
+    /// <summary>An outage that ended while the server was down is closed, not left open forever.</summary>
+    [Fact]
+    public async Task WanOutageOpenBeforeRestart_BackNow_PublishesRecovery()
+    {
+        _evaluator = BuildEvaluator(BuildContext(), stored: OpenAlertTestScope.With(
+            OpenAlertTestScope.Alert("monitoring.wan_outage_partial", "wan", TimeSpan.FromMinutes(10))));
+
+        await RoundsAsync(RoundsToConfirm, failing: NoTargets, passing: [.. WanTargets, .. Wan2Targets]);
+
+        var evt = _bus.Published.Should().ContainSingle().Subject;
+        evt.EventType.Should().Be("monitoring.wan_recovered");
+        evt.DeviceId.Should().Be("wan");
+    }
+
+    [Fact]
+    public async Task RollupOpenBeforeRestart_OneWanBack_ClosesItAndOpensTheOtherWan()
+    {
+        _evaluator = BuildEvaluator(BuildContext(), stored: OpenAlertTestScope.With(
+            OpenAlertTestScope.Alert("monitoring.wan_outage", "all-wans", TimeSpan.FromMinutes(10))));
+
+        await RoundsAsync(RoundsToConfirm, failing: Wan2Targets, passing: WanTargets);
+
+        _bus.Published.Select(e => (e.EventType, e.DeviceId)).Should().Equal(
+            ("monitoring.wan_recovered", "wan"), ("monitoring.wan_outage", "wan2"));
+    }
+
+    [Fact]
+    public async Task TargetOfflineBeforeRestart_PublishesItsRecovery()
+    {
+        var target = Target("lan-switch", "Switch 1", "192.0.2.10", MonitoringTargetType.Custom);
+        _evaluator = BuildEvaluator(BuildContext(), stored: OpenAlertTestScope.With(
+            OpenAlertTestScope.Alert("monitoring.target_offline", null, TimeSpan.FromMinutes(10), context: ("target_id", "lan-switch"))));
+
+        await RoundsAsync(3, failing: NoTargets, passing: [target]);
+
+        _bus.Published.Should().ContainSingle().Which.EventType.Should().Be("monitoring.target_recovered");
     }
 
     #endregion

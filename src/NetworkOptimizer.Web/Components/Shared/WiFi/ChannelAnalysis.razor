@@ -2,12 +2,17 @@
 @using NetworkOptimizer.WiFi
 @using NetworkOptimizer.WiFi.Helpers
 @using NetworkOptimizer.WiFi.Models
+@using NetworkOptimizer.WiFi.Services
 @using NetworkOptimizer.Storage.Models
 @inject WiFiOptimizerService WiFiService
+@* Scans go through the gated interface (Site Operator, audited); the concrete class above is for reads. *@
+@inject IWiFiScanService ScanService
 @inject UniFiConnectionService ConnectionService
-@inject ISystemSettingsService SettingsService
+@inject NetworkOptimizer.Web.Services.Identity.IUserDismissals Dismissals
 @inject IWiFiRadioKeepService RadioKeep
+@inject IChannelPlanApplyService ChannelApply
 @implements IDisposable
+@inject IDisplayTimeZone DisplayTime
 
 <div class="channel-analysis-container wifi-sections" data-tour="wifi-channels">
     <div class="channel-header">
@@ -30,7 +35,7 @@
             {
                 <span class="channel-plan-age">Last computed: @TimeFormatHelper.FormatRelativeTimeShort(computedAt)</span>
             }
-            <button class="btn btn-sm btn-secondary" @onclick="RefreshData" disabled="@_loading">
+            <button class="btn btn-sm btn-secondary" @onclick="RefreshData" disabled="@(_loading || _applying)">
                 @if (_loading)
                 {
                     <span class="spinner-sm"></span>
@@ -109,10 +114,10 @@
 
         @if (_showRecommendations)
         {
-            <div class="recommendation-view">
+            <div class="recommendation-view" data-tour="channel-recommendation">
                 <div class="section-header">
                     <h4>Recommended Channel Plan - @_selectedBand.ToDisplayString()</h4>
-                    <button class="btn btn-sm btn-ghost" @onclick="() => { _showRecommendations = false; _channelPlans = new(); }"><span class="btn-label-full">Show Current Channels</span><span class="btn-label-compact">Show Current</span></button>
+                    <button class="btn btn-sm btn-ghost" disabled="@_applying" @onclick="() => { _showRecommendations = false; _channelPlans = new(); }"><span class="btn-label-full">Show Current Channels</span><span class="btn-label-compact">Show Current</span></button>
                 </div>
 
                 @* Auto-hide once every scannable radio has a measurement (no gaps): the rec is then
@@ -220,10 +225,21 @@
                         }
                         else if (!plan.Recommendations.Any(r => r.IsChanged))
                         {
-                            <div class="channel-stat-card">
-                                <div class="channel-stat-value score-excellent">Optimal</div>
-                                <div class="channel-stat-label">No changes needed</div>
-                            </div>
+                            @* A soaking radio is held where it is, so "Optimal" would claim what is not measured yet. *@
+                            @if (plan.Recommendations.Any(r => r.IsSoaking))
+                            {
+                                <div class="channel-stat-card">
+                                    <div class="channel-stat-value">Soaking</div>
+                                    <div class="channel-stat-label">Judging recent moves</div>
+                                </div>
+                            }
+                            else
+                            {
+                                <div class="channel-stat-card">
+                                    <div class="channel-stat-value score-excellent">Optimal</div>
+                                    <div class="channel-stat-label">No changes needed</div>
+                                </div>
+                            }
                         }
                     </div>
 
@@ -288,7 +304,7 @@
                                     @if (!rec.IsMeshConstrained)
                                     {
                                         <SiteAdminOnly>
-                                            <button class="rec-pin-btn @(rec.IsKept ? "pinned" : "")" disabled="@_keepBusy"
+                                            <button class="rec-pin-btn @(rec.IsKept ? "pinned" : "")" disabled="@(_keepBusy || _applying)"
                                                     data-tooltip="@(rec.IsKept ? "Unpin Channel - let Channel Recommendation move this radio again" : "Pin Channel - Channel Recommendation will leave this radio where it is")"
                                                     aria-label="@(rec.IsKept ? "Unpin Channel" : "Pin Channel")"
                                                     @onclick="() => ToggleKeepAsync(rec)">
@@ -298,7 +314,7 @@
                                     }
                                 </div>
                                 <div class="rec-col rec-score-col">
-                                    <span class="@GetScoreClass(rec.CurrentScore)">@FormatScore(rec.CurrentScore)</span>
+                                    <span class="@GetScoreClass(rec.CurrentScore, rec.Band)">@FormatScore(rec.CurrentScore)</span>
                                 </div>
                                 <div class="rec-col rec-channels-col">
                                     @if (rec.IsChanged)
@@ -338,17 +354,53 @@
                                             }
                                             else if (rec.MoveVerdictDueAt.HasValue)
                                             {
-                                                <span>Measuring the new channel; the first hour's result lands at @rec.MoveVerdictDueAt.Value.ToLocalTime().ToString("t").</span>
+                                                <span>Measuring the new channel; the first hour's result lands at @rec.MoveVerdictDueAt.Value.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.Time, DisplayFormat.Culture).</span>
                                             }
                                         </div>
                                     }
                                 </div>
                                 <div class="rec-col rec-score-col">
-                                    <span class="@GetScoreClass(rec.RecommendedScore)">@FormatScore(rec.RecommendedScore)</span>
+                                    <span class="@GetScoreClass(rec.RecommendedScore, rec.Band)">@FormatScore(rec.RecommendedScore)</span>
                                 </div>
                             </div>
                         }
                     </div>
+
+                    <SiteAdminOnly>
+                        @{
+                            var (applyItems, _) = ChannelPlanApply.FromPlan(plan);
+                            var run = _applyRun is { } r && r.Band == _selectedBand ? r : null;
+                        }
+                        @if (run != null)
+                        {
+                            <div class="recommendation-notice channel-apply-panel">
+                                <div class="channel-apply-title">@(run.Running ? "Applying channel changes" : "Channel changes")</div>
+                                @RenderApplyList(run)
+                                <div class="action-buttons channel-apply-actions">
+                                    <button class="btn btn-contrast" @onclick="CloseApply" disabled="@run.Running">
+                                        @if (run.Running)
+                                        {
+                                            <span class="spinner-sm"></span> <span>Applying wave @(run.CurrentWave + 1) of @run.WaveCount</span>
+                                        }
+                                        else
+                                        {
+                                            <span>Done</span>
+                                        }
+                                    </button>
+                                </div>
+                            </div>
+                        }
+                        else if (applyItems.Count > 0)
+                        {
+                            <div class="action-buttons channel-apply-actions">
+                                <button class="btn btn-primary" data-tour="apply-channels" @onclick="() => ApplyChannelsAsync(plan)" disabled="@(_keepBusy || _loading || _applying)">Apply Recommended Channels</button>
+                            </div>
+                        }
+                        @if (_applyError != null)
+                        {
+                            <div class="alert-danger">@_applyError</div>
+                        }
+                    </SiteAdminOnly>
 
                     <!-- Notices -->
                     @if (!plan.HasBuildingData)
@@ -679,6 +731,9 @@
     [Parameter] public int? InitialChannel { get; set; }
     [Parameter] public bool AutoRunRecommendation { get; set; }
 
+    /// <summary>Raised after an apply run finishes and the page has re-read the radios.</summary>
+    [Parameter] public EventCallback OnPlanApplied { get; set; }
+
     private bool _loading = true;
     private List<AccessPointSnapshot> _accessPoints = new();
     private RegulatoryChannelData? _regulatoryData;
@@ -720,7 +775,11 @@
         }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
     }
 
-    public void Dispose() => _ageTimer?.Dispose();
+    public void Dispose()
+    {
+        _ageTimer?.Dispose();
+        _applyPoll?.Dispose();
+    }
     private bool _loadingRecommendations;
     private Dictionary<RadioBand, ChannelPlan> _channelPlans = new();
     private bool _keepBusy;
@@ -748,6 +807,144 @@
             _keepBusy = false;
         }
     }
+    // Apply Recommended Channels: the site's run, which lives on the server and is polled while it runs.
+    private ChannelApplyRunSnapshot? _applyRun;
+    private string? _applyError;
+    private System.Threading.Timer? _applyPoll;
+    private bool _applying => _applyRun?.Running == true;
+
+    /// <summary>
+    /// Picks up a run started earlier, from this page or another. A run still going opens its band's
+    /// plan and is followed; a finished one only shows once that plan is open.
+    /// </summary>
+    private async Task LoadApplyRunAsync()
+    {
+        try
+        {
+            _applyRun = await ChannelApply.GetRunAsync();
+        }
+        catch
+        {
+            _applyRun = null; // a role that cannot read it simply sees no panel
+        }
+        if (_applyRun is not { Running: true }) return;
+        if (!_showRecommendations) await RunRecommendation();
+        _selectedBand = _applyRun.Band;
+        _bandManuallySelected = true;
+        StartApplyPolling();
+    }
+
+    private void StartApplyPolling()
+    {
+        _applyPoll?.Dispose();
+        _applyPoll = new System.Threading.Timer(_ =>
+        {
+            try { _ = InvokeAsync(PollApplyRunAsync); }
+            catch { /* a dead circuit must not kill the timer callback */ }
+        }, null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2));
+    }
+
+    private async Task PollApplyRunAsync()
+    {
+        var wasRunning = _applying;
+        _applyRun = await ChannelApply.GetRunAsync();
+        if (_applying)
+        {
+            StateHasChanged();
+            return;
+        }
+        _applyPoll?.Dispose();
+        _applyPoll = null;
+        StateHasChanged();
+        // The radios moved, so the plan and the current channels both need a fresh read.
+        if (wasRunning)
+        {
+            await RefreshData();
+            await OnPlanApplied.InvokeAsync();
+        }
+    }
+
+    private async Task CloseApply()
+    {
+        if (_applying) return;
+        _applyError = null;
+        if (_applyRun == null) return;
+        _applyRun = null;
+        await ChannelApply.DismissAsync();
+    }
+
+    /// <summary>Starts the run on the server; the panel follows it from there.</summary>
+    private async Task ApplyChannelsAsync(ChannelPlan plan)
+    {
+        if (_applying) return;
+        var (items, notApplied) = ChannelPlanApply.FromPlan(plan);
+        if (items.Count == 0) return;
+
+        _applyError = null;
+        try
+        {
+            if (!await ChannelApply.StartAsync(plan.Band, items, notApplied, plan.HearingNeighbors))
+                _applyError = "Channels are already being applied on this site.";
+            _applyRun = await ChannelApply.GetRunAsync();
+            if (_applying) StartApplyPolling();
+        }
+        catch (Exception ex)
+        {
+            _applyError = ex.Message;
+        }
+    }
+
+    private RenderFragment RenderApplyList(ChannelApplyRunSnapshot run) => @<ul class="channel-apply-list">
+        @for (var i = 0; i < run.Items.Count; i++)
+        {
+            var item = run.Items[i];
+            var outcome = run.Outcomes.FirstOrDefault(o => o.Item == item);
+            <li>
+                <span class="channel-apply-ap">@item.ApName</span>
+                <span class="channel-apply-change">
+                    <span>Ch @item.CurrentChannel / @(item.CurrentWidth) MHz</span>
+                    <span class="channel-change-arrow"><svg width="20" height="14" viewBox="0 0 20 14" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 1L19 7L12 13M19 7H1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+                    <span class="rec-changed">Ch @item.Channel / @(item.Width) MHz</span>
+                    @if (item.IsDfs)
+                    {
+                        <span class="dfs-badge">DFS</span>
+                    }
+                </span>
+                @if (outcome != null)
+                {
+                    <span class="@ApplyStatusClass(outcome.Status)">@ApplyStatusText(outcome)</span>
+                }
+                else if (run.Running && run.ItemWaves[i] == run.CurrentWave)
+                {
+                    <span class="spinner-sm"></span>
+                }
+            </li>
+        }
+        @foreach (var skipped in run.NotApplied)
+        {
+            <li>
+                <span class="channel-apply-ap">@skipped.Item.ApName</span>
+                <span class="text-muted">@skipped.Reason</span>
+            </li>
+        }
+    </ul>;
+
+    private static string ApplyStatusClass(ChannelApplyStatus status) => status switch
+    {
+        ChannelApplyStatus.Applied => "score-excellent",
+        ChannelApplyStatus.Unconfirmed => "score-fair",
+        ChannelApplyStatus.Failed => "score-poor",
+        _ => "text-muted"
+    };
+
+    private static string ApplyStatusText(ChannelApplyOutcome outcome) => outcome.Status switch
+    {
+        ChannelApplyStatus.Applied => "Applied",
+        ChannelApplyStatus.Unconfirmed => $"Not confirmed: {outcome.Reason}",
+        ChannelApplyStatus.Failed => $"Failed: {outcome.Reason}",
+        _ => $"Skipped: {outcome.Reason}"
+    };
+
     private ChannelPlan? _channelPlan => _channelPlans.TryGetValue(_selectedBand, out var plan) ? plan : null;
     private DfsPreference _dfsPreference = DfsPreference.IncludeWithPenalty;
 
@@ -773,8 +970,7 @@
         StartAgeTicker();
         try
         {
-            var dismissed = await SettingsService.GetGlobalAsync(SystemSettingKeys.ChannelDisclaimerDismissed);
-            _channelDisclaimerDismissed = !string.IsNullOrEmpty(dismissed) && dismissed.Equals("true", StringComparison.OrdinalIgnoreCase);
+            _channelDisclaimerDismissed = await Dismissals.IsDismissedAsync(SystemSettingKeys.ChannelDisclaimerDismissed);
         }
         catch { /* Non-critical */ }
 
@@ -783,9 +979,7 @@
         // Default the DFS toggle to match the console's Auto-Optimize configuration
         // (dfs=true -> Include DFS, dfs=false -> Avoid DFS). Falls back to the field
         // default when the setting is unavailable.
-        var autoOptimizeDfs = await WiFiService.GetAutoOptimizeDfsEnabledAsync();
-        if (autoOptimizeDfs.HasValue)
-            _dfsPreference = autoOptimizeDfs.Value ? DfsPreference.IncludeWithPenalty : DfsPreference.Exclude;
+        _dfsPreference = await WiFiService.GetDefaultDfsPreferenceAsync();
 
         // Apply initial filters from parent navigation (explicit band is treated as a manual pick)
         if (InitialBand.HasValue)
@@ -798,6 +992,8 @@
 
         if (AutoRunRecommendation)
             await RunRecommendation();
+
+        await LoadApplyRunAsync();
     }
 
     private async Task LoadDataAsync()
@@ -1105,7 +1301,7 @@
     // "Scanning… X/N bands" label so a multi-minute serial scan reads as working, not hung.
     private int _scanCompletedBands;
     private int _scanTotalBands;
-    // Set when a scan fails because the UniFi account lacks the Site Admin role.
+    // Set when a scan fails because the UniFi account lacks Network: Full (Site Admin in older versions).
     private string? _scanError;
 
     private string ScanProgressLabel() =>
@@ -1173,7 +1369,7 @@
                 _scanCompletedBands = Math.Max(_scanCompletedBands, n);
                 InvokeAsync(StateHasChanged);
             });
-            await WiFiService.RunQuickScansAsync(targets, progress);
+            await ScanService.RunQuickScansAsync(targets, progress);
 
             // Re-run recommendations on the fresh spectrum data, then re-check what's still missing.
             var options = new RecommendationOptions { DfsPreference = _dfsPreference };
@@ -1209,7 +1405,7 @@
                 _scanCompletedBands = Math.Max(_scanCompletedBands, n);
                 InvokeAsync(StateHasChanged);
             });
-            await WiFiService.RunQuickScansAsync(targets, progress);
+            await ScanService.RunQuickScansAsync(targets, progress);
 
             // Re-run recommendations on the fresh spectrum data, then re-evaluate both banners.
             var options = new RecommendationOptions { DfsPreference = _dfsPreference };
@@ -1268,25 +1464,40 @@
 
     private static string FormatPercent(double pct) => pct.ToString("F0");
 
-    private static string GetSoakTooltip(ApChannelRecommendation rec)
+    private string GetSoakTooltip(ApChannelRecommendation rec)
     {
         var channels = string.Join(", ", rec.SoakSuppressedChannels);
         var chLabel = rec.SoakSuppressedChannels.Count == 1 ? "Ch" : "Channels";
         var until = rec.SoakEndsAt.HasValue
-            ? $" until {rec.SoakEndsAt.Value.ToLocalTime():MMM d h:mm tt}"
+            ? $" until {rec.SoakEndsAt.Value.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DayTime, DisplayFormat.Culture)}"
             : "";
         return $"Channel changed recently. {chLabel} {channels} won't be re-suggested{until} " +
                "so the new channel can prove itself on measured data.";
     }
 
-    private static string GetScoreClass(double score) => score switch
+    /// <summary>
+    /// Upper bounds for excellent, good, fair, and poor per band (lower is better; above the last is
+    /// bad). A score that is ordinary on crowded 2.4 GHz is very poor on 6 GHz.
+    /// </summary>
+    private static readonly Dictionary<RadioBand, double[]> ScoreClassBounds = new()
     {
-        <= 0.5 => "score-excellent",
-        <= 1.5 => "score-good",
-        <= 3.0 => "score-fair",
-        <= 5.0 => "score-poor",
-        _ => "score-bad"
+        [RadioBand.Band2_4GHz] = [2.0, 4.0, 6.5, 9.0],
+        [RadioBand.Band5GHz] = [1.0, 2.0, 3.5, 5.0],
+        [RadioBand.Band6GHz] = [0.25, 0.75, 1.5, 2.5],
     };
+
+    private static readonly string[] ScoreClasses = ["score-excellent", "score-good", "score-fair", "score-poor"];
+
+    private static string GetScoreClass(double score, RadioBand band)
+    {
+        // Classed on the shown value, so a 1.55 printed as "1.6" never colors as a different class.
+        var shown = double.Parse(score.ToString("F1", System.Globalization.CultureInfo.InvariantCulture),
+            System.Globalization.CultureInfo.InvariantCulture);
+        var bounds = ScoreClassBounds.GetValueOrDefault(band) ?? ScoreClassBounds[RadioBand.Band5GHz];
+        for (var i = 0; i < bounds.Length; i++)
+            if (shown <= bounds[i]) return ScoreClasses[i];
+        return "score-bad";
+    }
 
     private class WidthGroupInfo
     {
@@ -1492,7 +1703,7 @@
         _channelDisclaimerDismissed = true;
         try
         {
-            await SettingsService.SetGlobalAsync(SystemSettingKeys.ChannelDisclaimerDismissed, "true");
+            await Dismissals.DismissAsync(SystemSettingKeys.ChannelDisclaimerDismissed);
         }
         catch { /* Still hide it */ }
     }

@@ -41,10 +41,23 @@ public sealed record SiteAccessGrant(int MembershipId, string UserId, string? Us
 public sealed record RoleMfaPolicy(string Role, bool RequireMfa);
 
 /// <summary>Result of an identity-admin mutation; carries a user-facing error for refusals (e.g. last-admin).</summary>
-public sealed record AdminActionResult(bool Succeeded, string? Error = null)
+/// <param name="Code">
+/// Set where a caller must tell failures apart, such as <see cref="PasswordChangeFailures"/>;
+/// null otherwise.
+/// </param>
+public sealed record AdminActionResult(bool Succeeded, string? Error = null, string? Code = null)
 {
     public static AdminActionResult Ok() => new(true);
     public static AdminActionResult Fail(string error) => new(false, error);
+    public static AdminActionResult Fail(string error, string code) => new(false, error, code);
+}
+
+/// <summary>Why <see cref="IIdentityAdminService.ChangeOwnPasswordAsync"/> refused, in the order it checks.</summary>
+public static class PasswordChangeFailures
+{
+    public const string CurrentWrong = "current_wrong";
+    public const string Same = "same";
+    public const string Policy = "policy";
 }
 
 /// <summary>
@@ -258,7 +271,6 @@ public sealed class IdentityAdminService : IIdentityAdminService
     private readonly IAuthPolicyOptions _policy;
     private readonly SiteRegistryChangeNotifier _siteRegistryChanges;
     private readonly UserSessionRevocationNotifier _revocations;
-    private readonly IJwtService? _legacyJwt;
     private readonly IAdminAuthService _adminAuth;
     private readonly ILogger<IdentityAdminService> _logger;
 
@@ -274,8 +286,7 @@ public sealed class IdentityAdminService : IIdentityAdminService
         SiteRegistryChangeNotifier siteRegistryChanges,
         UserSessionRevocationNotifier revocations,
         ILogger<IdentityAdminService> logger,
-        IAdminAuthService adminAuth,
-        IJwtService? legacyJwt = null)
+        IAdminAuthService adminAuth)
     {
         _userManager = userManager;
         _roleManager = roleManager;
@@ -288,29 +299,7 @@ public sealed class IdentityAdminService : IIdentityAdminService
         _siteRegistryChanges = siteRegistryChanges;
         _revocations = revocations;
         _adminAuth = adminAuth;
-        _legacyJwt = legacyJwt;
         _logger = logger;
-    }
-
-    /// <summary>
-    /// Revoking the built-in admin's sessions has to reach the legacy <c>auth_token</c> too. That JWT
-    /// carries no security stamp, so rotating the stamp leaves it valid, and the bridge would exchange
-    /// a token captured before this revocation for a brand new cookie carrying the CURRENT stamp -
-    /// which is to say a password change and a sign out everywhere would both appear to work and
-    /// revoke nothing. Only the signing key can retire those tokens. The admin account is the only
-    /// principal a legacy token maps to, so no other account needs this.
-    ///
-    /// Optional by design: a container with no <see cref="IJwtService"/> is one where legacy tokens
-    /// cannot exist, so there is nothing to retire. That is what makes this removable in one piece.
-    /// SUNSET: remove with <see cref="LegacyJwtBridgeMiddleware"/> one release after the cutover.
-    /// </summary>
-    private async Task RetireLegacyTokensIfBuiltInAdminAsync(ApplicationUser user)
-    {
-        if (_legacyJwt is not null
-            && string.Equals(user.UserName, IdentityBootstrapService.AdminUserName, StringComparison.OrdinalIgnoreCase))
-        {
-            await _legacyJwt.RotateSigningKeyAsync();
-        }
     }
 
     /// <summary>
@@ -504,7 +493,6 @@ public sealed class IdentityAdminService : IIdentityAdminService
         if (!result.Succeeded) return AdminActionResult.Fail(Describe(result));
 
         await _userManager.UpdateSecurityStampAsync(user);
-        await RetireLegacyTokensIfBuiltInAdminAsync(user);
         Emit(AuditCategories.User, AuditActions.ExternalUnlinked, user, new { loginProvider });
         return AdminActionResult.Ok();
     }
@@ -522,16 +510,20 @@ public sealed class IdentityAdminService : IIdentityAdminService
         if (!await _userManager.HasPasswordAsync(user))
             return AdminActionResult.Fail("This account signs in without a password.");
 
-        if (await _userManager.CheckPasswordAsync(user, newPassword))
-            return AdminActionResult.Fail("The new password is the one already in use.");
+        // Proven first, so each refusal names the one thing that is wrong. Comparing the two fields
+        // first answered a mistyped current password with "choose a different one".
+        if (!await _userManager.CheckPasswordAsync(user, currentPassword))
+            return AdminActionResult.Fail("The current password is not correct.", PasswordChangeFailures.CurrentWrong);
+
+        if (string.Equals(currentPassword, newPassword, StringComparison.Ordinal))
+            return AdminActionResult.Fail("The new password is the one already in use.", PasswordChangeFailures.Same);
 
         var result = await _userManager.ChangePasswordAsync(user, currentPassword, newPassword);
         if (!result.Succeeded)
-            return AdminActionResult.Fail(Describe(result));
+            return AdminActionResult.Fail(Describe(result), PasswordChangeFailures.Policy);
 
         await ClearTemporaryPasswordFlagAsync(user);
         await SyncAdminSettingsIfBuiltInAdminAsync(user, newPassword);
-        await RetireLegacyTokensIfBuiltInAdminAsync(user);
         Emit(AuditCategories.User, AuditActions.PasswordReset, user, new { self = true });
         return AdminActionResult.Ok();
     }
@@ -547,7 +539,6 @@ public sealed class IdentityAdminService : IIdentityAdminService
         var stamped = await _userManager.UpdateSecurityStampAsync(user);
         if (!stamped.Succeeded)
             return AdminActionResult.Fail(Describe(stamped));
-        await RetireLegacyTokensIfBuiltInAdminAsync(user);
         Emit(AuditCategories.Auth, AuditActions.SignedOutEverywhere, user, new { self = true });
         return AdminActionResult.Ok();
     }
@@ -568,7 +559,6 @@ public sealed class IdentityAdminService : IIdentityAdminService
 
         await ClearTemporaryPasswordFlagAsync(user);
         await SyncAdminSettingsIfBuiltInAdminAsync(user, newPassword);
-        await RetireLegacyTokensIfBuiltInAdminAsync(user);
         Emit(AuditCategories.Auth, AuditActions.PasswordChanged, user);
         return AdminActionResult.Ok();
     }
@@ -592,6 +582,8 @@ public sealed class IdentityAdminService : IIdentityAdminService
             UserName = username,
             DisplayName = displayName,
             IsEnabled = true,
+            // The admin chose it, so the account replaces it at its first sign-in.
+            PasswordIsTemporary = !string.IsNullOrEmpty(password),
         };
 
         var create = string.IsNullOrEmpty(password)
@@ -688,10 +680,14 @@ public sealed class IdentityAdminService : IIdentityAdminService
         var result = await _userManager.ResetPasswordAsync(user, token, newPassword);
         if (!result.Succeeded) return AdminActionResult.Fail(Describe(result));
 
-        // Clearing the temporary flag: an admin-set password is no longer the auto-generated one.
-        await ClearTemporaryPasswordFlagAsync(user);
-        await RetireLegacyTokensIfBuiltInAdminAsync(user);
-        Emit(AuditCategories.Auth, AuditActions.PasswordReset, user);
+        // Someone else's password is one the admin knows, so the account must replace it. The built-in
+        // admin keeps its own first-run flow, and an admin setting their own has nothing to replace.
+        var temporary = !IsSelf(userId) && !IdentityBootstrapService.IsBuiltInAdmin(user);
+        if (temporary)
+            await MarkPasswordTemporaryAsync(user);
+        else
+            await ClearTemporaryPasswordFlagAsync(user);
+        Emit(AuditCategories.Auth, AuditActions.PasswordReset, user, new { mustChange = temporary });
         return AdminActionResult.Ok();
     }
 
@@ -1011,12 +1007,7 @@ public sealed class IdentityAdminService : IIdentityAdminService
 
         // Members revalidate against the new policy on their next stamp check.
         foreach (var member in await _userManager.GetUsersInRoleAsync(role))
-        {
             await _userManager.UpdateSecurityStampAsync(member);
-            // A bridged legacy session is precisely the one that never met the second-factor
-            // requirement, so turning the policy on has to reach it as well as the cookies.
-            await RetireLegacyTokensIfBuiltInAdminAsync(member);
-        }
 
         EmitSystemTarget(AuditCategories.Rbac, AuditActions.RoleGranted, "role", role, new { requireMfa });
         return AdminActionResult.Ok();
@@ -1123,12 +1114,6 @@ public sealed class IdentityAdminService : IIdentityAdminService
     }
 
     /// <summary>
-    /// Clears the "this is still the auto-generated password" nag after a real one is set. Logged
-    /// rather than returned: the password change itself has already succeeded by this point, so
-    /// failing the call would report the opposite of what happened. The cost of losing it is that the
-    /// banner keeps asking for a password the user has already set.
-    /// </summary>
-    /// <summary>
     /// The install's own record of where the admin password comes from lives in AdminSettings, and it
     /// is what Settings - Application reports and what the "set a real password" nag reads. A password
     /// set through Settings goes through SaveAdminSettingsAsync and flips that row to Database; a
@@ -1154,6 +1139,12 @@ public sealed class IdentityAdminService : IIdentityAdminService
         }
     }
 
+    /// <summary>
+    /// Clears the temporary-password flag after the account's own password is set. Logged rather than
+    /// returned: the password change itself has already succeeded by this point, so failing the call
+    /// would report the opposite of what happened. The cost of losing it is that the account keeps
+    /// being asked for a password it has already set.
+    /// </summary>
     private async Task ClearTemporaryPasswordFlagAsync(ApplicationUser user)
     {
         if (!user.PasswordIsTemporary)
@@ -1165,6 +1156,25 @@ public sealed class IdentityAdminService : IIdentityAdminService
         {
             _logger.LogWarning(
                 "Password was changed for {User} but the temporary-password flag could not be cleared: {Errors}",
+                user.UserName, Describe(update));
+        }
+    }
+
+    /// <summary>
+    /// Flags an administrator-set password, so the account is confined to replacing it at its next
+    /// sign-in. Logged rather than returned, for the same reason as clearing it.
+    /// </summary>
+    private async Task MarkPasswordTemporaryAsync(ApplicationUser user)
+    {
+        if (user.PasswordIsTemporary)
+            return;
+
+        user.PasswordIsTemporary = true;
+        var update = await _userManager.UpdateAsync(user);
+        if (!update.Succeeded)
+        {
+            _logger.LogWarning(
+                "Password was set for {User} but it could not be flagged for replacement: {Errors}",
                 user.UserName, Describe(update));
         }
     }

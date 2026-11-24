@@ -6,6 +6,12 @@ namespace NetworkOptimizer.Core.Helpers;
 /// </summary>
 public static class DisplayFormatters
 {
+    /// <summary>A negotiated link rate as the app shows it: "1000 Mbps" below 1 Gbps steps, "2.5 Gbps" above.</summary>
+    public static string FormatLinkSpeed(int mbps) =>
+        mbps >= 1000
+            ? (mbps / 1000.0).ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) + " Gbps"
+            : mbps.ToString(System.Globalization.CultureInfo.InvariantCulture) + " Mbps";
+
     #region Device Name Formatting
 
     // Known network device type keywords for prefix/suffix stripping
@@ -309,6 +315,17 @@ public static class DisplayFormatters
     {
         if (percent < 0) percent = 0;
         return percent.ToString(percent < 10 ? "0.0" : "0", System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// A response time with at least two digits: one decimal under 10 ms ("0.5 ms", "1.5 ms"), whole
+    /// above ("22 ms"). Never "0 ms": under 0.1 ms reads "&lt;0.1 ms".
+    /// </summary>
+    public static string FormatResponseMs(double ms)
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        if (ms < 0.05) return "<0.1 ms";
+        return Math.Round(ms, 1) < 10 ? $"{ms.ToString("0.0", inv)} ms" : $"{ms.ToString("0", inv)} ms";
     }
 
     public static string FormatRate(double? bps)
@@ -623,6 +640,43 @@ public static class DisplayFormatters
             return true;
 
         return false;
+    }
+
+    #endregion
+
+    #region PON
+
+    /// <summary>
+    /// The OLT an ONT reports, as "Nokia (ALCL)" or "Calix E7 (CALX)". The raw ID stays visible
+    /// because it is what the ONT and the ISP's tooling show. Null when neither part is known.
+    /// </summary>
+    public static string? FormatOltVendor(string? vendorId, string? model = null)
+    {
+        var id = vendorId?.Trim();
+        var mdl = model?.Trim();
+        if (string.IsNullOrEmpty(id))
+            return string.IsNullOrEmpty(mdl) ? null : mdl;
+
+        var name = NetworkFormatHelpers.PonVendorName(id);
+        var head = name ?? id;
+        if (!string.IsNullOrEmpty(mdl)) head = $"{head} {mdl}";
+        return name != null ? $"{head} ({id.ToUpperInvariant()})" : head;
+    }
+
+    /// <summary>
+    /// ONT registration with the OLT plus its key exchange, as "Yes · key OK". Values the device
+    /// words some other way are shown as it words them. Null when the device reports neither.
+    /// </summary>
+    public static string? FormatPonRegistration(string? registration, string? keyExchange)
+    {
+        var reg = registration?.Trim();
+        var key = keyExchange?.Trim();
+        var parts = new List<string>(2);
+        if (!string.IsNullOrEmpty(reg))
+            parts.Add(reg.Equals("Registered", StringComparison.OrdinalIgnoreCase) ? "Yes" : reg);
+        if (!string.IsNullOrEmpty(key))
+            parts.Add(key.Equals("success", StringComparison.OrdinalIgnoreCase) ? "key OK" : $"key {key}");
+        return parts.Count == 0 ? null : string.Join(" · ", parts);
     }
 
     #endregion

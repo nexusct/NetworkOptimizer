@@ -12,12 +12,15 @@
 @inject IJSRuntime JS
 @inject Microsoft.AspNetCore.Mvc.ViewFeatures.IFileVersionProvider FileVersionProvider
 @inject NetworkOptimizer.Web.Services.PullToRefreshState PtrState
-@inject NetworkOptimizer.Web.Services.ISystemSettingsService SettingsService
+@inject NetworkOptimizer.Web.Services.Identity.IUserDismissals Dismissals
 @inject NetworkOptimizer.Web.Services.SiteContextService SiteContext
 @inject Microsoft.AspNetCore.Authorization.IAuthorizationService Authz
+@inject NetworkOptimizer.Web.Services.Monitoring.PathLocalization.IPathEpisodeService PathEpisodes
+@inject IIspFindingAcknowledgmentService FindingAcks
 @inject ILogger<IspHealthPanel> Logger
 @using NetworkOptimizer.Web.Services.Authorization
 @using Microsoft.AspNetCore.Components.Authorization
+@inject IDisplayTimeZone DisplayTime
 
 @* Date/time filter (left) + Refresh. The live/cached view (the effective auto-computed window, which
    auto-fallback may have reduced below the configured target) is the only state where Refresh is
@@ -288,6 +291,22 @@ else
             </div>
         </div>
     }
+    @if (_episodeBanner is { } banner && !_episodeBannerDismissed)
+    {
+        <div class="alert @banner.CssClass" style="margin-bottom: 0.75rem;">
+            <div class="banner-content">
+                <span class="banner-icon @(banner.CssClass == "alert-warning" ? "banner-icon-warning" : "banner-icon-info")">@(banner.CssClass == "alert-warning" ? "!" : "i")</span>
+                <div class="banner-text" style="flex: 1;">
+                    <strong>@banner.Lead</strong>
+                    <span><TextWithCode Text="@banner.Text" />@(banner.More > 0 ? $" {banner.More} more in the last 24 hours." : "")</span>
+                </div>
+                <div class="banner-actions">
+                    <button class="btn btn-sm btn-primary" @onclick="() => ShowEpisodeTraceAsync(banner.EpisodeId)">See the trace</button>
+                    <button class="btn btn-sm btn-contrast" @onclick="DismissEpisodeBannerAsync">Dismiss</button>
+                </div>
+            </div>
+        </div>
+    }
     @* While an explicit recompute is in flight (Refresh, a time-window change, or an access-tech
        change) swap just the hero for the same area spinner shown on initial load, so the headline
        score never displays a stale number mid-recompute. The detail cards below stay put. *@
@@ -312,7 +331,7 @@ else
                 <IspHealthScoreGauge Score="r.OverallScore" Label="ISP Health" />
                 <div class="isp-health-profile-chip isp-health-profile-chip-selectable"
                      data-tooltip="@(_canOperate ? "Thresholds are tuned per access technology; change it to re-score." : "Thresholds are tuned per access technology. A Site Operator or Admin can change it.")" data-tooltip-hover-only>
-                    Scored as @r.Profile.DisplayName@PppoeSuffix(r) &middot; @ScoredWindowLabel(r)
+                    Scored as @r.Profile.DisplayName@PppoeSuffix(r) &middot; @ScoredWindowLabel(r, DisplayTime.Zone, DisplayTime.Format)
                     <span class="isp-profile-chip-caret"></span>
                     <select class="isp-profile-chip-select" aria-label="Access technology" disabled="@(!_canOperate)"
                             value="@((int)r.AccessTechnology)" @onchange="OnAccessTechnologyChanged">
@@ -359,7 +378,7 @@ else
             </a>
             <div class="isp-health-hero-side">
                 <div class="isp-health-uptime" data-tour="isp-uptime"
-                     data-tooltip="Share of the window the internet was reachable. Excludes your own LAN drops and &quot;that was me&quot; events."
+                     data-tooltip='Share of the window the internet was reachable. Excludes your own LAN drops and "that was me" events.'
                      data-tooltip-click data-tooltip-wide>
                     <div class="isp-uptime-label">Uptime</div>
                     <div class="isp-uptime-value">@FormatUptime(r)</div>
@@ -380,23 +399,49 @@ else
         <IspPlanSpeedHint OnDismiss="DismissPlanHintAsync" />
     }
 
-    @if (r.Issues.Count > 0)
+    // Path Localization's findings ride after the report's own: evidence for the same events,
+    // read from the episode store rather than the scorer.
+    var allFindings = r.Issues.Concat(EpisodeFindings).ToList();
+    var ackedFindings = allFindings.Where(IsAcknowledged).ToList();
+    var findings = _findingsTab == "acknowledged" ? ackedFindings : allFindings.Where(f => !IsAcknowledged(f)).ToList();
+    @if (allFindings.Count > 0)
     {
         <div class="card isp-health-card">
-            <div class="card-header"><h2 class="card-title">Findings</h2></div>
-            <div class="card-body">
-                @foreach (var issue in r.Issues)
+            <div class="card-header isp-findings-header">
+                <h2 class="card-title">Findings</h2>
+                @if (ackedFindings.Count > 0 || _findingsTab == "acknowledged")
                 {
-                    <div class="issue-item @IssueClass(issue.Severity)">
+                    <div class="filter-tabs">
+                        <button class="tab @(_findingsTab == "active" ? "active" : "")" @onclick='() => _findingsTab = "active"'>Active (@(allFindings.Count - ackedFindings.Count))</button>
+                        <button class="tab tab-muted @(_findingsTab == "acknowledged" ? "active" : "")" @onclick='() => _findingsTab = "acknowledged"'>Acknowledged (@ackedFindings.Count)</button>
+                    </div>
+                }
+            </div>
+            <div class="card-body">
+                @if (_findingsTab == "acknowledged")
+                {
+                    <p class="acknowledged-note">Acknowledged findings stay in ISP Health's score. They are hidden here, not fixed.</p>
+                }
+                @if (findings.Count == 0)
+                {
+                    <p class="acknowledged-note">@(_findingsTab == "acknowledged" ? "Nothing acknowledged." : "No active findings.")</p>
+                }
+                @foreach (var issue in findings)
+                {
+                    <div class="issue-item @IssueClass(issue.Severity) @(IsAcknowledged(issue) ? "issue-dismissed" : "") @(issue.AckKey != null ? "has-action" : "")">
                         <div class="issue-content">
                             <span class="issue-severity">@issue.Severity</span>
-                            <div class="issue-title">@issue.Title</div>
-                            <div class="issue-description">@issue.Description</div>
+                            <div class="issue-title"><TextWithCode Text="@issue.Title" /></div>
+                            <div class="issue-description"><TextWithCode Text="@issue.Description" /></div>
                             @if (!string.IsNullOrEmpty(issue.Recommendation))
                             {
                                 <div class="issue-recommendation">
                                     @issue.Recommendation
-                                    @if (!string.IsNullOrEmpty(issue.LinkUrl))
+                                    @if (issue.EpisodeId is int findingEpisode)
+                                    {
+                                        <a href="javascript:void(0)" @onclick="() => ShowEpisodeTraceAsync(findingEpisode)" style="margin-left: 0.4rem;">@(issue.LinkText ?? "See the trace")</a>
+                                    }
+                                    else if (!string.IsNullOrEmpty(issue.LinkUrl))
                                     {
                                         @if (issue.LinkUrl!.StartsWith("#"))
                                         {
@@ -412,7 +457,7 @@ else
                             @if (!string.IsNullOrEmpty(issue.InvestigateUrl))
                             {
                                 <div class="issue-investigate">
-                                    <a class="isp-factor-link" href="@(issue.InvestigateUrl + WanLinkQuery())"
+                                    <a class="isp-factor-link" href="@(issue.InvestigateUrl + WanLinkQuery() + "&via=isp-health")"
                                        data-tooltip="Jump to the most recent matching loss event on the Network Performance charts" data-tooltip-hover-only>@(issue.InvestigateText ?? "Investigate on the charts")</a>
                                 </div>
                             }
@@ -434,13 +479,28 @@ else
                                                 <a class="isp-outage-ack @AckLockClass" href="javascript:void(0)"
                                                    data-tooltip="Exclude this event from ISP Health scoring"
                                                    data-tooltip-hover-only
-                                                   @onclick="() => AcknowledgeOutageAsync(start)">that was me@(issue.OutageStarts.Count > 1 ? $" ({EventTimeLabel(start)})" : "")</a>
+                                                   @onclick="() => AcknowledgeOutageAsync(start)">that was me@(issue.OutageStarts.Count > 1 ? $" ({EventTimeLabel(start, DisplayTime.Zone, DisplayTime.Format)})" : "")</a>
                                             }
                                         }
                                     </div>
                                 </SiteOperatorOnly>
                             }
                         </div>
+                        @if (issue.AckKey is { } ackKey)
+                        {
+                            <SiteAdminOnly>
+                                @if (IsAcknowledged(issue))
+                                {
+                                    <button class="btn btn-sm btn-ghost issue-action isp-finding-action" disabled="@_findingAckBusy"
+                                            @onclick="() => SetFindingAcknowledgedAsync(ackKey, false)" data-tooltip="Restore this finding">Restore</button>
+                                }
+                                else
+                                {
+                                    <button class="btn btn-sm btn-ghost issue-action isp-finding-action" disabled="@_findingAckBusy"
+                                            @onclick="() => SetFindingAcknowledgedAsync(ackKey, true)" data-tooltip="Hide this finding - still scored">Acknowledge</button>
+                                }
+                            </SiteAdminOnly>
+                        }
                     </div>
                 }
             </div>
@@ -491,10 +551,6 @@ else
                                             else
                                             {
                                                 <span class="isp-hop-name-text">@target.Name</span>
-                                            }
-                                            @if (target.IsGradedHop)
-                                            {
-                                                <span class="isp-target-badge isp-target-graded" data-tooltip="The lowest-RTT ISP hop; access-layer idle latency is measured from it">Lowest RTT</span>
                                             }
                                             @if (target.SuggestDisable)
                                             {
@@ -553,6 +609,19 @@ else
                             <p class="page-description">No ISP hop data in the window.</p>
                         }
                         <div class="isp-hop-list">
+                            @if (r.AccessFloor is { } floor)
+                            {
+                                <div class="isp-hop">
+                                    <div class="isp-hop-name">
+                                        <span class="isp-hop-name-text">Access floor</span>
+                                        <span class="tooltip-icon tooltip-icon-sm" data-tooltip="The lowest RTT across these access hops at each moment. Access-layer idle latency is measured from it, so one hop's slow replies don't count.">?</span>
+                                    </div>
+                                    <div class="isp-hop-stats">
+                                        <span class="isp-target-stat"><span class="isp-target-stat-label">RTT</span>@FormatRtt(floor.RttMs)</span>
+                                        <span class="isp-target-stat"><span class="isp-target-stat-label">P90 Jitter</span>@FormatJitter(floor.JitterMs)</span>
+                                    </div>
+                                </div>
+                            }
                             @foreach (var target in ispTargets.Take(NetworkPreviewCount))
                             {
                                 @hopRow(target)
@@ -625,6 +694,21 @@ else
                                  && !(factor.Name == "Physical Link" && r.PhysicalLinkCandidates.Count > 1))
                             {
                                 <div class="isp-factor-description">@factor.Description</div>
+                            }
+                            @if (dimension == r.TransitDimension && factor == dimension.Factors[^1] && r.PathCongestionTransitPoints > 0)
+                            {
+                                <div class="isp-factor-row isp-factor-deduction">
+                                    <div class="isp-factor-label">
+                                        <div class="isp-factor-name-row">
+                                            <a class="isp-factor-name isp-factor-link" href="javascript:void(0)" @onclick="ScrollToEventsAsync"
+                                               data-tooltip="See the episodes in Path & Congestion Events" data-tooltip-hover-only>Path Congestion</a>
+                                        </div>
+                                        <span class="isp-factor-value">@r.PathCongestion.Count @(r.PathCongestion.Count == 1 ? "episode" : "episodes")</span>
+                                    </div>
+                                    <div class="isp-factor-bar-track isp-factor-bar-track-empty"></div>
+                                    <span class="isp-factor-score isp-score-poor">-@r.PathCongestionTransitPoints</span>
+                                </div>
+                                <div class="isp-factor-description">Congestion into 2 or more networks while your connection was otherwise clean.</div>
                             }
                             @if (factor.Name == "Speed vs Plan" && !_planHintDismissed)
                             {
@@ -742,14 +826,14 @@ else
         <div class="card isp-health-card" id="isp-outages">
             <div class="card-header"><h2 class="card-title">@OutageSectionTitle(r) (@WindowLabel(r))</h2></div>
             <div class="card-body">
-                <div class="isp-outage-list">
+                <div class="isp-outage-list@(DisplayTime.Format.Clock == ClockStyle.TwelveHour ? " isp-outage-h12" : "")">
                     @foreach (var outage in r.Outages)
                     {
                         <div class="isp-outage">
                             <div class="isp-outage-head">
                                 <span class="isp-event-badge @OutageBadgeClass(outage)" data-tooltip="@OutageScoreTooltip(outage)">@OutageBadgeText(outage)</span>
                                 <span class="isp-outage-duration">@FormatDuration(outage.Duration)</span>
-                                <span class="isp-outage-window">@outage.Start.ToLocalTime().ToString("MMM d, HH:mm:ss") &ndash; @outage.End.ToLocalTime().ToString("HH:mm:ss")</span>
+                                <span class="isp-outage-window">@outage.Start.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DayTimeSeconds, DisplayFormat.Culture) &ndash; @outage.End.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.TimeSeconds, DisplayFormat.Culture)</span>
                                 <span class="isp-outage-scope" data-tooltip="@OutageScoreTooltip(outage)">@OutageScopeLabel(outage)</span>
                                 @if (outage.IsPartial)
                                 {
@@ -791,7 +875,7 @@ else
                                             <div class="isp-outage-hop-track">
                                                 <div class="isp-outage-hop-dark" style="width: @(OutageHopDarkPercent(outage, tier).ToString("0.#", System.Globalization.CultureInfo.InvariantCulture))%"></div>
                                             </div>
-                                            <span class="isp-outage-hop-status @(tier.WentDark ? "" : "isp-outage-hop-up")">@OutageHopStatus(tier)</span>
+                                            <span class="isp-outage-hop-status @(tier.WentDark ? "" : "isp-outage-hop-up")">@OutageHopStatus(tier, DisplayTime.Zone, DisplayTime.Format)</span>
                                         </div>;
                                 }
                                 else
@@ -869,11 +953,21 @@ else
                 <button class="time-btn evt-congestion @(_visibleEventCats.Contains(EventCategory.Congestion) ? "active" : "")" @onclick="e => ToggleEventFilterAsync(EventCategory.Congestion, e)">Congestion</button>
                 <button class="time-btn evt-shift @(_visibleEventCats.Contains(EventCategory.Shift) ? "active" : "")" @onclick="e => ToggleEventFilterAsync(EventCategory.Shift, e)">Path shifts</button>
                 <button class="time-btn evt-change @(_visibleEventCats.Contains(EventCategory.Change) ? "active" : "")" @onclick="e => ToggleEventFilterAsync(EventCategory.Change, e)">Path changes</button>
+                @if (AckedEpisodeIds.Count > 0 || _visibleEventCats.Contains(EventCategory.Acknowledged))
+                {
+                    <button class="time-btn evt-ack @(_visibleEventCats.Contains(EventCategory.Acknowledged) ? "active" : "")" @onclick="e => ToggleEventFilterAsync(EventCategory.Acknowledged, e)"
+                            data-tooltip="Episodes of acknowledged findings" data-tooltip-hover-only><span class="evt-label-long">Acknowledged</span><span class="evt-label-short">Ack'd</span></button>
+                }
             </div>
         </div>
         <div class="card-body">
             @{
-                var allEvents = EventTimeline(r).Where(InZoomWindow).Where(InVisibleSeries).ToList();
+                var ackedEpisodes = AckedEpisodeIds;
+                var allEvents = EventTimeline(r, _shiftFold.TraceByShift, _shiftFold.ClearedByShift)
+                    .Concat(_episodeEntries.Select(e => e.EpisodeId is int id && ackedEpisodes.Contains(id)
+                        ? e with { Category = EventCategory.Acknowledged } : e))
+                    .OrderBy(e => e.Time)
+                    .Where(InZoomWindow).Where(InVisibleSeries).ToList();
                 var timeline = allEvents.Where(CategoryVisible).ToList();
             }
             @if (timeline.Count == 0)
@@ -889,11 +983,14 @@ else
                            Tippy caches its content per node, so attribute-swapped reuse shows a stale
                            tooltip (e.g. a congestion tooltip on a Path shift badge). The index is part
                            of the key because records compare by value and duplicate keys throw. *@
-                        <div class="isp-event-item" @key="(entry, i)">
+                        @* An episode row is keyed by its episode and badge instead: its sentence changes
+                           as rounds land, and a new key each time would tear down the hop table open
+                           beneath it. The badge and its tooltip stay in the key for the reason above. *@
+                        <div class="isp-event-item" id="@(entry.EpisodeId is int rowEpisode ? $"isp-episode-{rowEpisode}" : null)" @key="@(entry.EpisodeId is int eid ? (object)(eid, entry.Badge, entry.BadgeTooltip) : (entry, i))">
                             <span class="isp-event-badge @entry.BadgeClass" data-tooltip="@entry.BadgeTooltip">@entry.Badge</span>
-                            <span class="isp-event-time">@EventTimeLabel(entry.Time)</span>
+                            <span class="isp-event-time">@EventTimeLabel(entry.Time, DisplayTime.Zone, DisplayTime.Format)</span>
                             <span class="isp-event-text">
-                                @entry.Text
+                                <TextWithCode Text="@entry.Text" />
                                 @if (entry.Members is { Count: > 0 })
                                 {
                                     var key = EventMemberKey(entry);
@@ -913,7 +1010,38 @@ else
                                         </div>
                                     }
                                 }
+                                @if (entry.EpisodeId is int episodeId)
+                                {
+                                    var episodeKey = $"episode:{episodeId}";
+                                    var episodeOpen = _expandedEvents.Contains(episodeKey);
+                                    @(" ")
+                                    <button type="button" class="isp-event-members-toggle" aria-expanded="@episodeOpen"
+                                            @onclick="() => ToggleEventMembers(episodeKey)">@(episodeOpen ? "Hide hop table" : "Show hop table")</button>
+                                }
                             </span>
+                            @if (entry.EpisodeId is int openEpisode && _expandedEvents.Contains($"episode:{openEpisode}"))
+                            {
+                                <div class="isp-event-detail">
+                                    <PathEpisodeHopTable @key="openEpisode" EpisodeId="openEpisode" UpdatedAt="@(_episodes.FirstOrDefault(e => e.Id == openEpisode)?.UpdatedAt ?? default)" WanKey="@_selectedWanKey" />
+                                    @if (TraceAckKey(openEpisode) is { } traceAck)
+                                    {
+                                        <SiteAdminOnly>
+                                            <div class="isp-trace-actions">
+                                                @if (_findingAcks.Contains(traceAck))
+                                                {
+                                                    <button class="btn btn-sm btn-ghost issue-action" disabled="@_findingAckBusy"
+                                                            @onclick="() => SetFindingAcknowledgedAsync(traceAck, false)" data-tooltip="Restore its recurring finding">Restore</button>
+                                                }
+                                                else
+                                                {
+                                                    <button class="btn btn-sm btn-ghost issue-action" disabled="@_findingAckBusy"
+                                                            @onclick="() => SetFindingAcknowledgedAsync(traceAck, true)" data-tooltip="Hide its recurring finding - still scored">Acknowledge</button>
+                                                }
+                                            </div>
+                                        </SiteAdminOnly>
+                                    }
+                                </div>
+                            }
                         </div>
                     }
                 </div>
@@ -1019,6 +1147,186 @@ else
 
     private static string EventMemberKey(TimelineEntry e) => $"{e.Time:O}|{e.Badge}|{e.Members?.Count}";
 
+    // Path Localization episodes overlapping the report's window, for the WAN it grades. Re-read when
+    // the report changes and on every auto-reload tick, so an episode that is tracing updates as its
+    // rounds land.
+    private IReadOnlyList<NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodeView> _episodes =
+        Array.Empty<NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodeView>();
+    private IspHealthReport? _episodesFor;
+    // Built once per load, not per render: the timeline keys each row by its entry, and a row rebuilt
+    // on every render never matches its last key, so an open hop table would be torn down and
+    // re-read on every 30 s tick.
+    private IReadOnlyList<TimelineEntry> _episodeEntries = Array.Empty<TimelineEntry>();
+    // Episodes the report's Path shifts explain: the shift row carries the trace instead. Keyed by the
+    // report's own shift instances, so it is rebuilt with every load.
+    private NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation.ShiftFold _shiftFold =
+        NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation.ShiftFold.None;
+    private static readonly IspHealthOptions EpisodeOptions = new();
+
+    // The banner reads the last 24 hours whatever the report window, so a 1-hour view still shows
+    // yesterday evening's verdict and a 7-day view does not hold it for a week.
+    private NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodeBanner? _episodeBanner;
+    private bool _episodeBannerDismissed = true;
+
+    // Acknowledged findings (Site Admin): hidden from Active, listed under Acknowledged, still scored.
+    private HashSet<string> _findingAcks = new(StringComparer.Ordinal);
+    private string _findingsTab = "active";
+    private bool _findingAckBusy;
+
+    private bool IsAcknowledged(IspHealthIssue issue) => issue.AckKey is { } key && _findingAcks.Contains(key);
+
+    /// <summary>Episodes filed under Acknowledged in the events feed (and on the chart, by the endpoint).</summary>
+    private HashSet<int> AckedEpisodeIds =>
+        NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation.AcknowledgedEpisodeIds(
+            _shiftFold.Unexplained(_episodes, e => e.Id).ToList(), EpisodeOptions,
+            NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation.PointsById(_report), _findingAcks);
+
+    /// <summary>The acknowledgeable recurring finding a traced episode belongs to, or null.</summary>
+    private string? TraceAckKey(int episodeId)
+    {
+        var episode = _episodes.FirstOrDefault(e => e.Id == episodeId);
+        if (episode == null || NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation.AckKeyFor(episode) is not { } key)
+            return null;
+        return EpisodeFindings.Any(f => f.AckKey == key) ? key : null;
+    }
+
+    private async Task SetFindingAcknowledgedAsync(string ackKey, bool acknowledged)
+    {
+        _findingAckBusy = true;
+        try
+        {
+            if (acknowledged) await FindingAcks.AcknowledgeAsync(ackKey);
+            else await FindingAcks.RestoreAsync(ackKey);
+            if (acknowledged) _findingAcks.Add(ackKey);
+            else _findingAcks.Remove(ackKey);
+            await LoadEpisodeBannerAsync();
+            // The chart's bands come from the endpoint, so it refetches to move them under Acknowledged.
+            if (_chartMounted)
+            {
+                try { await JS.InvokeVoidAsync("eval", "window.__ispHealthCharts?.reload?.();"); }
+                catch { /* chart not mounted yet */ }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Could not {Action} an ISP Health finding", acknowledged ? "acknowledge" : "restore");
+        }
+        finally
+        {
+            _findingAckBusy = false;
+        }
+    }
+
+    private async Task LoadEpisodeBannerAsync()
+    {
+        try
+        {
+            _findingAcks = await FindingAcks.GetAcknowledgedKeysAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Could not load acknowledged ISP Health findings");
+        }
+        try
+        {
+            var now = DateTime.UtcNow;
+            var recent = await PathEpisodes.GetEpisodesAsync(
+                now - NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation.BannerHold,
+                now, _selectedWanKey, _wanSvc == null);
+            var fold = NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation.FoldIntoShifts(recent, _report, EpisodeOptions);
+            var unexplained = fold.Unexplained(recent, e => e.Id).ToList();
+            // An acknowledged recurring finding's episodes do not announce themselves either.
+            var points = NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation.PointsById(_report);
+            // The report window's episodes too: the acknowledged finding's own episodes may be older than the banner's day.
+            var ackedTargets = NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation
+                .AcknowledgedTargetSets(recent.Concat(_episodes), _findingAcks);
+            var banner = NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation.Banner(
+                unexplained.Where(e => !NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation
+                    .IsAcknowledgedEpisode(e, _findingAcks, points, ackedTargets)).ToList(), now, DisplayTime.Zone, DisplayTime.Format);
+            // A failed read keeps it hidden, like the plan-speed hint.
+            var dismissed = banner == null || await Dismissals.IsDismissedAsync(banner.DismissKey(SiteContext.Slug));
+            _episodeBanner = banner;
+            _episodeBannerDismissed = dismissed;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Could not load the path episode banner");
+        }
+    }
+
+    private async Task DismissEpisodeBannerAsync()
+    {
+        if (_episodeBanner is not { } banner) return;
+        _episodeBannerDismissed = true;
+        try
+        {
+            await Dismissals.DismissAsync(banner.DismissKey(SiteContext.Slug));
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Could not save the path episode banner dismissal");
+        }
+    }
+
+    // Set by See the trace; OnAfterRenderAsync scrolls once the opened hop table is in the DOM.
+    private int? _scrollToEpisode;
+
+    /// <summary>Opens the episode's hop table in Path &amp; Congestion Events and scrolls to it.</summary>
+    private Task ShowEpisodeTraceAsync(int episodeId)
+    {
+        _expandedEvents.Add($"episode:{episodeId}");
+        _scrollToEpisode = episodeId;
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Scrolls to the episode's row, or the events card when a filter hides it. Aims again once the
+    /// page settles: the hop table and the cards above it change height as they load, which left the
+    /// first scroll short.
+    /// </summary>
+    private async Task ScrollToEpisodeAsync(int episodeId)
+    {
+        var js = "(() => { const go = () => (document.getElementById('isp-episode-" + episodeId
+            + "') || document.getElementById('isp-events'))?.scrollIntoView({ behavior: 'smooth', block: 'start' });"
+            + " go(); setTimeout(go, 600); })();";
+        try { await JS.InvokeVoidAsync("eval", js); }
+        catch { /* the events card is not rendered */ }
+    }
+
+    private IEnumerable<IspHealthIssue> EpisodeFindings =>
+        NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation.Findings(
+            _shiftFold.Unexplained(_episodes, e => e.Id).ToList(), EpisodeOptions, DisplayTime.Zone, DisplayTime.Format,
+            NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation.PointsById(_report));
+
+    private async Task LoadEpisodesAsync()
+    {
+        var r = _report;
+        _episodesFor = r;
+        if (r == null)
+        {
+            _episodes = Array.Empty<NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodeView>();
+            _episodeEntries = Array.Empty<TimelineEntry>();
+            _shiftFold = NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation.ShiftFold.None;
+            return;
+        }
+        try
+        {
+            // The live view runs to now, so an episode tracing since the last compute still shows.
+            var to = IsLiveWindow ? DateTime.UtcNow : r.WindowEnd;
+            _episodes = await PathEpisodes.GetEpisodesAsync(r.WindowStart, to, _selectedWanKey, _wanSvc == null);
+            _shiftFold = NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation.FoldIntoShifts(_episodes, r, EpisodeOptions);
+            _episodeEntries = NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation.Entries(
+                _shiftFold.Unexplained(_episodes, e => e.Id),
+                NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodePresentation.PointsById(r)).ToList();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Could not load path episodes");
+        }
+        await LoadEpisodeBannerAsync();
+    }
+
     private void ToggleEventMembers(string key)
     {
         if (!_expandedEvents.Remove(key)) _expandedEvents.Add(key);
@@ -1078,8 +1386,9 @@ else
     // Last report the absolved-jitter tooltips were refreshed against; a new report means their
     // data-tooltip changed and the cached Tippy content needs rebuilding.
     private IspHealthReport? _lastTooltipReport;
-    private DateTime _customFrom = DateTime.Now.AddDays(-2);
-    private DateTime _customTo = DateTime.Now;
+    // Seeded from the active window each time the popover opens.
+    private DateTime _customFrom;
+    private DateTime _customTo;
 
     private bool IsLiveWindow => !_isCustom && _followLive;
 
@@ -1384,13 +1693,12 @@ else
                 .TryGetValue("wan", out var v) ? v.ToString() : null;
             if (string.IsNullOrWhiteSpace(value)) return null;
 
-            var key = value.Trim().ToLowerInvariant();
-            // "primary" names the role rather than a WAN group, for links from somewhere that
-            // shows the primary's figures without knowing which WAN holds that role - it is a
-            // role in UniFi Network and any group can hold it, so those links cannot spell a key.
-            return string.Equals(key, Services.Monitoring.LiveWanScope.PrimaryWanToken, StringComparison.Ordinal)
-                ? _wanOptions.FirstOrDefault(w => w.IsPrimary)?.Key
-                : key;
+            // The same matching as the other tabs (MonitoringViewState.ResolveWanKeys): "primary" names the role,
+            // and a key matches by WAN index, so "wan", "wan1" and "WAN" are all WAN1. An exact match missed a
+            // link spelled another way, and the stored WAN won instead.
+            var wans = _wanOptions.Select(w => new Services.Monitoring.SiteWan(w.Key, w.IsPrimary)).ToList();
+            return Services.Monitoring.MonitoringViewState.ResolveWanKeys(value, wans).FirstOrDefault()
+                ?? value.Trim().ToLowerInvariant();
         }
         catch { return null; }
     }
@@ -1462,7 +1770,7 @@ else
                     .ToUniversalTime()).ToUnixTimeMilliseconds();
             NavigationManager.NavigateTo(NetworkOptimizer.Web.Services.Monitoring.MonitoringLinks.Analysis(
                 NetworkOptimizer.Web.Services.Monitoring.MonitoringLinks.TransitCategory,
-                at, view.SpanMs, _selectedWanKey));
+                at, view.SpanMs, _selectedWanKey) + "&via=isp-health");
         }
         catch (Exception ex)
         {
@@ -1573,6 +1881,10 @@ else
         }
         // Follow a background auto-fallback: keep the live button on the effective window.
         if (_followLive) _selectedPreset = LiveWindowHours;
+        // Cheap (one site-database read), and what keeps a tracing episode's row live.
+        if (IsLiveWindow || _episodes.Any(e => e.Tracing)) await LoadEpisodesAsync();
+        // Every window: the banner is about the last 24 hours, not the one on screen.
+        else await LoadEpisodeBannerAsync();
         StateHasChanged();
     }
 
@@ -1584,8 +1896,7 @@ else
     {
         try
         {
-            var dismissed = await SettingsService.GetGlobalAsync(SystemSettingKeys.IspPlanSpeedHintDismissed);
-            _planHintDismissed = string.Equals(dismissed, "true", StringComparison.OrdinalIgnoreCase);
+            _planHintDismissed = await Dismissals.IsDismissedAsync(SystemSettingKeys.IspPlanSpeedHintDismissed);
         }
         catch
         {
@@ -1637,13 +1948,13 @@ else
         }
     }
 
-    /// <summary>Hides the hint everywhere it appears and remembers that across sites and sessions.</summary>
+    /// <summary>Hides the hint everywhere it appears and remembers that, for this user, across sites and sessions.</summary>
     private async Task DismissPlanHintAsync()
     {
         _planHintDismissed = true;
         try
         {
-            await SettingsService.SetGlobalAsync(SystemSettingKeys.IspPlanSpeedHintDismissed, "true");
+            await Dismissals.DismissAsync(SystemSettingKeys.IspPlanSpeedHintDismissed);
         }
         catch
         {
@@ -1833,6 +2144,11 @@ else
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
+        if (_scrollToEpisode is int scrollTo)
+        {
+            _scrollToEpisode = null;
+            await ScrollToEpisodeAsync(scrollTo);
+        }
         // Interop is unavailable during prerender, so the remembered WAN can only be applied here -
         // and the report waits for it. Restoring first means one compute, for the WAN the user
         // actually left the tab on, and the toolbar stays hidden behind _loading until the right
@@ -1849,6 +2165,13 @@ else
             _scrollChartAfterRender = false;
             try { await JS.InvokeVoidAsync("__ispHealthCharts.scrollChartIntoView"); }
             catch { /* chart not mounted */ }
+        }
+        // Every path that swaps the report (refresh, window, WAN, access technology) lands here, so
+        // the episodes follow it without each of those having to remember to.
+        if (!ReferenceEquals(_report, _episodesFor))
+        {
+            await LoadEpisodesAsync();
+            StateHasChanged();
         }
         if (_report == null)
         {
@@ -1947,8 +2270,8 @@ else
         if (_showCustomPopover)
         {
             // Seed both pickers from the active window so they reflect the current filter.
-            _customTo = (_windowEnd ?? DateTime.UtcNow).ToLocalTime();
-            _customFrom = (_windowStart ?? DateTime.UtcNow.AddHours(-LiveWindowHours)).ToLocalTime();
+            _customTo = (_windowEnd ?? DateTime.UtcNow).ToLocalTime(DisplayTime);
+            _customFrom = (_windowStart ?? DateTime.UtcNow.AddHours(-LiveWindowHours)).ToLocalTime(DisplayTime);
         }
     }
 
@@ -1973,8 +2296,8 @@ else
     {
         _showCustomPopover = false;
         // datetime-local binds local wall-clock (Kind=Unspecified); treat it as local -> UTC.
-        var startUtc = _customFrom.ToUniversalTime();
-        var endUtc = _customTo.ToUniversalTime();
+        var startUtc = DisplayTime.ToUtc(_customFrom);
+        var endUtc = DisplayTime.ToUtc(_customTo);
         // A start after the end is a typo, not a request for nothing. Collapsing it onto the end
         // lets the minimum-window rule below open it back up, so the user gets the shortest real
         // window instead of a popover that closes and leaves the previous one on screen with no
@@ -2066,7 +2389,7 @@ else
 
     private string EventsWindowLabel(IspHealthReport r) =>
         IsZoomed
-            ? $"zoomed: {_zoomFrom!.Value.ToLocalTime():MMM d, HH:mm} to {_zoomTo!.Value.ToLocalTime():MMM d, HH:mm}"
+            ? $"zoomed: {_zoomFrom!.Value.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DayTime, DisplayFormat.Culture)} to {_zoomTo!.Value.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DayTime, DisplayFormat.Culture)}"
             : WindowLabel(r);
 
     private bool CategoryVisible(TimelineEntry e) => _visibleEventCats.Contains(e.Category);
@@ -2079,6 +2402,7 @@ else
         if (!_visibleEventCats.Contains(EventCategory.Congestion)) hidden.Add("'congestion'");
         if (!_visibleEventCats.Contains(EventCategory.Shift)) hidden.Add("'path-shift'");
         if (!_visibleEventCats.Contains(EventCategory.Change)) hidden.Add("'unreachable'");
+        if (!_visibleEventCats.Contains(EventCategory.Acknowledged)) hidden.Add("'acknowledged'");
         return "[" + string.Join(",", hidden) + "]";
     }
 
@@ -2092,17 +2416,29 @@ else
 
     private async Task ToggleEventFilterAsync(EventCategory cat, MouseEventArgs e)
     {
-        if (e.CtrlKey || e.MetaKey)
+        // Acknowledged is an on/off switch beside the category pills, never part of their
+        // solo/restore: it only shows or hides the episodes of acknowledged findings.
+        var showAcknowledged = _visibleEventCats.Contains(EventCategory.Acknowledged);
+        if (cat == EventCategory.Acknowledged)
+            showAcknowledged = !showAcknowledged;
+        else
         {
-            if (!_visibleEventCats.Remove(cat))
-                _visibleEventCats.Add(cat);
+            var cats = _visibleEventCats.Where(c => c != EventCategory.Acknowledged).ToHashSet();
+            if (e.CtrlKey || e.MetaKey)
+            {
+                if (!cats.Remove(cat))
+                    cats.Add(cat);
+            }
+            else if (cats.Count == AllEventCategories.Length)
+                cats = new HashSet<EventCategory> { cat };
+            else if (cats.Count == 1 && cats.Contains(cat))
+                cats = new HashSet<EventCategory>(AllEventCategories);
+            else if (!cats.Remove(cat))
+                cats.Add(cat);
+            _visibleEventCats = cats;
         }
-        else if (_visibleEventCats.Count == AllEventCategories.Length)
-            _visibleEventCats = new HashSet<EventCategory> { cat };
-        else if (_visibleEventCats.Count == 1 && _visibleEventCats.Contains(cat))
-            _visibleEventCats = new HashSet<EventCategory>(AllEventCategories);
-        else if (!_visibleEventCats.Remove(cat))
-            _visibleEventCats.Add(cat);
+        if (showAcknowledged) _visibleEventCats.Add(EventCategory.Acknowledged);
+        else _visibleEventCats.Remove(EventCategory.Acknowledged);
 
         if (_chartMounted)
         {
@@ -2134,8 +2470,8 @@ else
     /// </summary>
     private string? FactorInvestigateUrl(string factorName) => factorName switch
     {
-        "Packet Loss" => $"/monitoring?tab=performance&investigate=packet-loss{WanLinkQuery()}",
-        "Loaded Loss" => $"/monitoring?tab=performance&investigate=loaded-loss{WanLinkQuery()}",
+        "Packet Loss" => $"/monitoring?tab=performance&investigate=packet-loss{WanLinkQuery()}&via=isp-health",
+        "Loaded Loss" => $"/monitoring?tab=performance&investigate=loaded-loss{WanLinkQuery()}&via=isp-health",
         _ => null
     };
 

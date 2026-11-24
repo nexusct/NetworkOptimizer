@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text.RegularExpressions;
 using HtmlAgilityPack;
+using NetworkOptimizer.Core.Models;
 using NetworkOptimizer.Monitoring.Models;
 using NetworkOptimizer.Monitoring.Providers;
 using NetworkOptimizer.Web.Services.Monitoring;
@@ -11,8 +12,13 @@ namespace NetworkOptimizer.Web.Services.OntProviders;
 /// ONT provider for Realtek RTL960x GPON stick modules (ODI DFP-34X-2C2, V-SOL V2801F,
 /// T&amp;W TWCGPON657, etc.) that expose a web UI with form-based login and status_pon.asp
 /// for DDM data. Tries HTTP first, falls back to HTTPS with self-signed cert bypass.
+///
+/// The stick sits in a UniFi device's SFP slot (a gateway, or a switch VLAN'd back to it), so it
+/// can also be attached to that monitored module (ISfpSupplementalOntProvider): the page's PON
+/// state and ONU ID then merge into the module's sfp series, and its optics only fill gaps the
+/// device's DDM read leaves.
 /// </summary>
-public sealed class RealtekOntProvider : IOntProvider
+public sealed class RealtekOntProvider : ISfpSupplementalOntProvider
 {
     public string ProviderKey => "realtek-ont";
     public string DisplayName => "Realtek ONT Stick (HTTP)";
@@ -43,11 +49,27 @@ public sealed class RealtekOntProvider : IOntProvider
             if (!await LoginAsync(client, baseUrl, context, cancellationToken))
             {
                 _logger.LogWarning("Realtek ONT {Name}: login failed", context.Name);
-                return PollResult<OntStats>.Failed($"No stats could be read from {(context.ConfiguredHost ?? context.Host)}.");
+                return PollResult<OntStats>.Failed($"No stats could be read from {context.Host}.");
             }
 
             var ponHtml = await client.GetStringAsync($"{baseUrl}/status_pon.asp", cancellationToken);
             var stats = ParseStatusPon(ponHtml, context);
+
+            // Uptime and firmware live on the device status page. Best effort: the optics and PON
+            // state above are the poll, and a firmware without this page must not fail it.
+            if (stats.Pon != null)
+            {
+                try
+                {
+                    var statusHtml = await client.GetStringAsync($"{baseUrl}/admin/status.asp", cancellationToken);
+                    ParseStatusPage(statusHtml, stats.Pon);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Realtek ONT {Name}: status.asp not read", context.Name);
+                }
+            }
 
             try { await client.GetAsync($"{baseUrl}/admin/logout.asp", cancellationToken); }
             catch { }
@@ -62,9 +84,16 @@ public sealed class RealtekOntProvider : IOntProvider
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Error polling Realtek ONT {Name} at {Host}", context.Name, context.ConfiguredHost ?? context.Host);
-            return PollResult<OntStats>.Failed(HttpFailureSummary.Describe(ex, (context.ConfiguredHost ?? context.Host)));
+            _logger.LogWarning(ex, "Error polling Realtek ONT {Name} at {Host}", context.Name, context.Host);
+            return PollResult<OntStats>.Failed(HttpFailureSummary.Describe(ex, context.Host));
         }
+    }
+
+    public async Task<PonSupplementalStats?> PollSupplementalAsync(
+        OntPollContext context, CancellationToken cancellationToken = default)
+    {
+        var result = await PollAsync(context, cancellationToken);
+        return result.Stats?.Pon;
     }
 
     public async Task<(bool Success, string Message)> TestConnectionAsync(
@@ -93,7 +122,7 @@ public sealed class RealtekOntProvider : IOntProvider
         }
         catch (Exception ex)
         {
-            return (false, HttpFailureSummary.Describe(ex, context.ConfiguredHost ?? context.Host));
+            return (false, HttpFailureSummary.Describe(ex, context.Host));
         }
     }
 
@@ -102,7 +131,7 @@ public sealed class RealtekOntProvider : IOntProvider
     /// to the opposite scheme. All HTTPS uses self-signed cert bypass since these are
     /// local network devices.
     /// </summary>
-    private async Task<(string BaseUrl, HttpClient Client, HttpClientHandler Handler)> ResolveBaseUrlAsync(
+    private async Task<(string BaseUrl, HttpClient Client, SocketsHttpHandler Handler)> ResolveBaseUrlAsync(
         OntPollContext context, CancellationToken ct)
     {
         var port = context.Port > 0 ? context.Port : 80;
@@ -110,7 +139,7 @@ public sealed class RealtekOntProvider : IOntProvider
         var fallbackScheme = primaryScheme == "https" ? "http" : "https";
 
         var primaryUrl = BuildBaseUrl(context.Host, port, primaryScheme);
-        var (handler, client) = CreateHttpClient();
+        var (handler, client) = CreateHttpClient(context.Dialer);
 
         try
         {
@@ -134,12 +163,12 @@ public sealed class RealtekOntProvider : IOntProvider
         handler.Dispose();
 
         var fallbackUrl = BuildBaseUrl(context.Host, port, fallbackScheme);
-        var (handler2, client2) = CreateHttpClient();
+        var (handler2, client2) = CreateHttpClient(context.Dialer);
 
         try
         {
             using var probe = await client2.GetAsync(fallbackUrl, ct);
-            _logger.LogInformation("Realtek ONT {Host} reachable via {Scheme}", context.ConfiguredHost ?? context.Host, fallbackScheme.ToUpperInvariant());
+            _logger.LogInformation("Realtek ONT {Host} reachable via {Scheme}", context.Host, fallbackScheme.ToUpperInvariant());
             return (fallbackUrl, client2, handler2);
         }
         catch
@@ -150,13 +179,14 @@ public sealed class RealtekOntProvider : IOntProvider
         }
     }
 
-    private static (HttpClientHandler Handler, HttpClient Client) CreateHttpClient()
+    private static (SocketsHttpHandler Handler, HttpClient Client) CreateHttpClient(IDeviceDialer dialer)
     {
-        var handler = new HttpClientHandler
+        var handler = new SocketsHttpHandler
         {
+            ConnectCallback = DeviceHttp.Via(dialer),
             CookieContainer = new CookieContainer(),
             UseCookies = true,
-            ServerCertificateCustomValidationCallback = (_, _, _, _) => true,
+            SslOptions = { RemoteCertificateValidationCallback = (_, _, _, _) => true },
         };
         var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(TimeoutSeconds) };
         return (handler, client);
@@ -220,25 +250,19 @@ public sealed class RealtekOntProvider : IOntProvider
         var stats = new OntStats
         {
             Timestamp = DateTime.UtcNow,
-            DeviceHost = context.ConfiguredHost ?? context.Host,
+            DeviceHost = context.Host,
             DeviceName = context.Name,
             DeviceModel = "Realtek ONT",
         };
 
-        var doc = new HtmlDocument();
-        doc.LoadHtml(html);
+        var rows = LabelValueRows(html);
+        if (rows.Count == 0) return stats;
 
-        var rows = doc.DocumentNode.SelectNodes("//tr[@bgcolor='#DDDDDD']");
-        if (rows == null) return stats;
+        long? onuId = null;
+        string? registration = null, keyExchange = null;
 
-        foreach (var row in rows)
+        foreach (var (label, value) in rows)
         {
-            var cells = row.SelectNodes("td");
-            if (cells == null || cells.Count < 2) continue;
-
-            var label = cells[0].InnerText.Trim();
-            var value = cells[1].InnerText.Trim();
-
             if (label.Contains("Temperature", StringComparison.OrdinalIgnoreCase))
             {
                 stats.TemperatureC = ParseDouble(value);
@@ -262,13 +286,117 @@ public sealed class RealtekOntProvider : IOntProvider
             else if (label.Contains("ONU State", StringComparison.OrdinalIgnoreCase))
             {
                 stats.LinkState = value;
+                stats.PonLinkStatus = PonLinkStateExtensions.ParsePonLinkState(value);
+            }
+            else if (label.Contains("ONU ID", StringComparison.OrdinalIgnoreCase)
+                && long.TryParse(value, out var id))
+            {
+                onuId = id;
+            }
+            // Registered / Mackey / Olt VendorId are on the DFP-34X-2IY3 SFU firmware's page,
+            // not the 2C2's, so each is optional.
+            else if (label.Contains("Registered", StringComparison.OrdinalIgnoreCase))
+            {
+                registration = NullIfEmpty(value);
+            }
+            else if (label.Contains("Mackey", StringComparison.OrdinalIgnoreCase))
+            {
+                keyExchange = NullIfEmpty(value);
+            }
+            else if (label.Contains("VendorId", StringComparison.OrdinalIgnoreCase))
+            {
+                stats.OltVendor = NullIfEmpty(value);
             }
         }
 
         stats.PonType = "GPON";
+        stats.Pon = ToSupplemental(stats, onuId);
+        stats.Pon.RegistrationStatus = registration;
+        stats.Pon.KeyExchangeStatus = keyExchange;
 
         return stats;
     }
+
+    /// <summary>
+    /// The PON detail both modes record: standalone on the ont measurement, attached on the
+    /// module's sfp measurement. Optics ride along as the fallback the attached merge expects.
+    /// </summary>
+    private static PonSupplementalStats ToSupplemental(OntStats stats, long? onuId)
+    {
+        var known = stats.PonLinkStatus != PonLinkState.Unknown;
+        return new PonSupplementalStats
+        {
+            RxPowerDbm = stats.RxPowerDbm,
+            TxPowerDbm = stats.TxPowerDbm,
+            TemperatureC = stats.TemperatureC,
+            VoltageV = stats.VoltageV,
+            PloamStateRaw = known ? (int)stats.PonLinkStatus : null,
+            PonLinkStatus = known ? stats.PonLinkStatus.ToInfluxValue() : null,
+            OnuId = onuId,
+            OltVendorId = stats.OltVendor,
+        };
+    }
+
+    /// <summary>
+    /// The Boa pages' label/value rows: any row with two cells. Never select by the row's
+    /// bgcolor: the pages stripe #DDDDDD and #EEEEEE, and status.asp puts Firmware Version on
+    /// an #EEEEEE row. Rows inside HTML comments are not parsed as elements, so they never match.
+    /// </summary>
+    private static List<(string Label, string Value)> LabelValueRows(string html)
+    {
+        var doc = new HtmlDocument();
+        doc.LoadHtml(html);
+        var rows = doc.DocumentNode.SelectNodes("//tr");
+        var result = new List<(string, string)>();
+        if (rows == null) return result;
+        foreach (var row in rows)
+        {
+            var cells = row.SelectNodes("td");
+            if (cells == null || cells.Count < 2) continue;
+            result.Add((cells[0].InnerText.Trim(), cells[1].InnerText.Trim()));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Parses the Boa <c>admin/status.asp</c> System table onto the PON detail: Uptime (the
+    /// ONT's boot uptime, which anchors reboot detection) and Firmware Version.
+    /// </summary>
+    internal static void ParseStatusPage(string html, PonSupplementalStats pon)
+    {
+        foreach (var (label, value) in LabelValueRows(html))
+        {
+            if (label.Equals("Uptime", StringComparison.OrdinalIgnoreCase))
+                pon.SfpUptimeS = ParseUptime(value);
+            else if (label.Equals("Firmware Version", StringComparison.OrdinalIgnoreCase))
+                pon.FirmwareVersion = NullIfEmpty(value);
+        }
+    }
+
+    private static readonly Regex UptimeClock = new(@"^(?:(\d+)\s*days?,\s*)?(\d+):(\d{2})$", RegexOptions.IgnoreCase);
+    private static readonly Regex UptimeMinutes = new(@"^(?:(\d+)\s*days?,\s*)?(\d+)\s*min$", RegexOptions.IgnoreCase);
+    private static readonly Regex UptimeDays = new(@"^(\d+)\s*days?$", RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// The page's minute-resolution uptime ("4 days, 21:04", "467 days,  4:55") in seconds. Also
+    /// reads the shorter Linux uptime shapes ("21:04", "37 min", "2 days"); anything else is null
+    /// rather than a guess.
+    /// </summary>
+    internal static long? ParseUptime(string text)
+    {
+        var s = Regex.Replace(text.Trim(), @"\s+", " ");
+        if (UptimeClock.Match(s) is { Success: true } c)
+            return Days(c.Groups[1]) + long.Parse(c.Groups[2].Value) * 3600 + long.Parse(c.Groups[3].Value) * 60;
+        if (UptimeMinutes.Match(s) is { Success: true } m)
+            return Days(m.Groups[1]) + long.Parse(m.Groups[2].Value) * 60;
+        if (UptimeDays.Match(s) is { Success: true } d)
+            return long.Parse(d.Groups[1].Value) * 86400;
+        return null;
+
+        static long Days(Group g) => g.Success ? long.Parse(g.Value) * 86400 : 0;
+    }
+
+    private static string? NullIfEmpty(string value) => string.IsNullOrWhiteSpace(value) ? null : value;
 
     private static double? ParseDouble(string text)
     {

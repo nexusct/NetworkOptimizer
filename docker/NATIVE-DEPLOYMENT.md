@@ -65,10 +65,10 @@ cd NetworkOptimizer
 
 # Build for your architecture
 # Apple Silicon (M1/M2/M3):
-dotnet publish src/NetworkOptimizer.Web -c Release -r osx-arm64 --self-contained -o ~/network-optimizer
+dotnet publish src/NetworkOptimizer.Web -c Release -r osx-arm64 --self-contained -p:PublishReadyToRun=true -o ~/network-optimizer
 
 # Intel Macs:
-# dotnet publish src/NetworkOptimizer.Web -c Release -r osx-x64 --self-contained -o ~/network-optimizer
+# dotnet publish src/NetworkOptimizer.Web -c Release -r osx-x64 --self-contained -p:PublishReadyToRun=true -o ~/network-optimizer
 
 cd ~/network-optimizer
 ```
@@ -229,7 +229,7 @@ brew upgrade dotnet
 # Pull latest from main and rebuild
 cd ~/NetworkOptimizer
 git fetch origin && git checkout main && git pull
-dotnet publish src/NetworkOptimizer.Web -c Release -r osx-arm64 --self-contained -o ~/network-optimizer
+dotnet publish src/NetworkOptimizer.Web -c Release -r osx-arm64 --self-contained -p:PublishReadyToRun=true -o ~/network-optimizer
 
 # Re-sign binaries
 cd ~/network-optimizer
@@ -297,24 +297,26 @@ sudo mkdir -p /opt/network-optimizer
 sudo chown $USER:$USER /opt/network-optimizer
 
 # Build for your architecture (x64)
-dotnet publish src/NetworkOptimizer.Web -c Release -r linux-x64 --self-contained -o /opt/network-optimizer
+dotnet publish src/NetworkOptimizer.Web -c Release -r linux-x64 --self-contained -p:PublishReadyToRun=true -o /opt/network-optimizer
 
 # For ARM64 (Raspberry Pi, etc.), the protoc bundled with Grpc.Tools segfaults (exit code 139)
 # on native arm64 Linux, so build with the distro's protoc instead. It must be 3.15 or newer
 # (check with protoc --version): Debian 12, Raspberry Pi OS Bookworm, and Ubuntu 24.04 qualify;
 # older releases need a protoc from https://github.com/protocolbuffers/protobuf/releases.
 # sudo apt install -y protobuf-compiler
-# PROTOBUF_PROTOC=/usr/bin/protoc dotnet publish src/NetworkOptimizer.Web -c Release -r linux-arm64 --self-contained -o /opt/network-optimizer
+# PROTOBUF_PROTOC=/usr/bin/protoc dotnet publish src/NetworkOptimizer.Web -c Release -r linux-arm64 --self-contained -p:PublishReadyToRun=true -o /opt/network-optimizer
 
 # Make executable
 chmod +x /opt/network-optimizer/NetworkOptimizer.Web
 ```
 
-### Build Gateway Speed Test Binary (optional)
+### Build the Go Helpers
 
-The "Run Test from Gateway" WAN speed test deploys a small helper binary to your
-UniFi gateway over SSH. It is not produced by `dotnet publish`, so build it
-separately into the `tools/` directory next to the app. Requires [Go](https://go.dev/dl/).
+WAN Speed Test, WAN Steering, and AP Telemetry run small Go binaries: on this
+server, on your UniFi gateway, and on your access points. `dotnet publish` does
+not produce them, so build them into the `tools/` directory next to the app.
+Requires [Go](https://go.dev/dl/). Run this from the repository root, and run it
+again after every update (the Updating steps below include it).
 
 ```bash
 # Stamp the binaries with the version you are building, so the app can report
@@ -322,33 +324,45 @@ separately into the `tools/` directory next to the app. Requires [Go](https://go
 # the UI adds its own.
 VERSION=$(git describe --tags --always 2>/dev/null || echo "dev")
 VERSION="${VERSION#v}"
+TOOLS=/opt/network-optimizer/tools
+mkdir -p "$TOOLS"
 
-# Gateways are always ARM64 - build for linux/arm64 regardless of your host arch
+# WAN speed test: one build for this server, and one for the gateway, which is always ARM64
 cd src/uwnspeedtest
+CGO_ENABLED=0 GOOS=linux GOARCH=$(go env GOHOSTARCH) go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/uwnspeedtest-linux-$(go env GOHOSTARCH)" .
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
-    -ldflags "-s -w -X main.version=$VERSION" -o /opt/network-optimizer/tools/uwnspeedtest-linux-arm64 .
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/uwnspeedtest-linux-arm64" .
 cd ../..
 
-# Optional: WAN Steering daemon (only if you use multi-WAN steering)
+# WAN Steering daemon (runs on the gateway)
 cd src/wansteer
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
-    -ldflags "-s -w -X main.version=$VERSION" -o /opt/network-optimizer/tools/wansteer-linux-arm64 .
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/wansteer-linux-arm64" .
 cd ../..
 
-# Optional: AP Agent (only if you want on-AP Wi-Fi telemetry)
-# Access points are armv7l, not arm64, whatever your gateway or host is.
+# AP Agent (runs on access points)
+# U7-class access points are armv7l, not arm64, whatever your gateway or host is. The arm64
+# build covers UniFi OS consoles with Wi-Fi (UDR7, UX7, UCG-Industrial). The two MIPS builds
+# cover older access points (U6-Lite is little-endian, UAP-AC big-endian).
 cd src/apagent
 CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath \
-    -ldflags "-s -w -X main.version=$VERSION" -o /opt/network-optimizer/tools/apagent-linux-arm .
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/apagent-linux-arm" .
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/apagent-linux-arm64" .
+CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/apagent-linux-mipsle" .
+CGO_ENABLED=0 GOOS=linux GOARCH=mips GOMIPS=softfloat go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/apagent-linux-mips" .
 cd ../..
 ```
 
-Without this, the app runs fine but the gateway WAN speed test reports
-"Gateway speed test binary not found."
-
-Without the AP Agent binary, Settings - AP Telemetry loads but has nothing to
-deploy. Everything else keeps working on UniFi Console data, which is what the
-feature falls back to anyway.
+Without these, the rest of the app runs fine, and each feature that needs a
+missing binary says so when you use it: the WAN speed test reports "UWN speed
+test binary not found" (or "Gateway speed test binary not found" from the
+gateway), WAN Steering reports "WAN Steering binary not found", and AP Telemetry
+lists your access points but Deploy fails with "The AP Agent binary for
+&lt;arch&gt; is not included in this build."
 
 ### Create Startup Script
 
@@ -453,14 +467,38 @@ cp ~/.local/share/NetworkOptimizer/network_optimizer.db ~/network_optimizer.db.b
 # PROTOBUF_PROTOC=/usr/bin/protoc, as in Build from Source above)
 cd ~/NetworkOptimizer
 git fetch origin && git checkout main && git pull
-dotnet publish src/NetworkOptimizer.Web -c Release -r linux-x64 --self-contained -o /opt/network-optimizer
+dotnet publish src/NetworkOptimizer.Web -c Release -r linux-x64 --self-contained -p:PublishReadyToRun=true -o /opt/network-optimizer
 chmod +x /opt/network-optimizer/NetworkOptimizer.Web
+
+# Rebuild the Go helpers, every update: a release can change one or add a new target
+VERSION=$(git describe --tags --always 2>/dev/null || echo "dev")
+VERSION="${VERSION#v}"
+TOOLS=/opt/network-optimizer/tools
+mkdir -p "$TOOLS"
+cd src/uwnspeedtest
+CGO_ENABLED=0 GOOS=linux GOARCH=$(go env GOHOSTARCH) go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/uwnspeedtest-linux-$(go env GOHOSTARCH)" .
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/uwnspeedtest-linux-arm64" .
+cd ../wansteer
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/wansteer-linux-arm64" .
+cd ../apagent
+CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/apagent-linux-arm" .
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/apagent-linux-arm64" .
+CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/apagent-linux-mipsle" .
+CGO_ENABLED=0 GOOS=linux GOARCH=mips GOMIPS=softfloat go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/apagent-linux-mips" .
+cd ../..
 
 # Start service
 sudo systemctl start network-optimizer
 ```
 
-Publishing over the install directory replaces the app files only: your `start.sh`, `tools/`, and `logs/` are left in place, and your database and credential key live outside it in `~/.local/share/NetworkOptimizer/`. If you built the optional helpers (`uwnspeedtest`, `wansteer`, `apagent`), rebuild them when a release changes them.
+Publishing over the install directory replaces the app files only: your `start.sh`, `tools/`, and `logs/` are left in place, and your database and credential key live outside it in `~/.local/share/NetworkOptimizer/`. The Go helpers in `tools/` are not part of the publish, which is why the update rebuilds them.
 
 ---
 

@@ -346,6 +346,7 @@ public class SnmpPoller : ISnmpPoller
                     cache.LastMetadataPoll = now;
                     DebugLog($"Slow tier: refreshed metadata for {ip} ({metadata.DescrByIdx.Count} interfaces)");
                 }
+                cache.HighSpeedByIdx = cache.Metadata.HighSpeedByIdx;
             }
 
             var meta = cache.Metadata;
@@ -370,6 +371,12 @@ public class SnmpPoller : ISnmpPoller
                 cache.OutErrorsByIdx = IndexByIfIndex(outErrors, UniFiOids.IfOutErrors);
                 cache.InDiscardsByIdx = IndexByIfIndex(inDiscards, UniFiOids.IfInDiscards);
                 cache.OutDiscardsByIdx = IndexByIfIndex(outDiscards, UniFiOids.IfOutDiscards);
+
+                // ifXTable, so rebased like the counters. A failed walk keeps the last reading.
+                var highSpeedWalk = await BulkWalkAsync(ip, UniFiOids.IfHighSpeed);
+                if (highSpeedWalk.Count > 0)
+                    cache.HighSpeedByIdx = RebaseByOffset(
+                        IndexByIfIndex(highSpeedWalk, UniFiOids.IfHighSpeed), meta.IfXTableIndexOffset);
 
                 cache.LastOperPoll = now;
                 DebugLog($"Medium tier: refreshed oper/error counters for {ip}");
@@ -424,8 +431,8 @@ public class SnmpPoller : ISnmpPoller
             {
                 if (!int.TryParse(idx, out var index)) continue;
 
-                var speed = ParseLong(meta.SpeedByIdx, idx);
-                var highSpeed = ParseLong(meta.HighSpeedByIdx, idx);
+                var (speed, highSpeed) = ResolveSpeed(
+                    ParseLong(meta.SpeedByIdx, idx), ParseLong(meta.HighSpeedByIdx, idx), ParseLong(cache.HighSpeedByIdx, idx));
                 var useHC = _config.UseHighCapacityCounters && !needFallback &&
                            (highSpeed >= _config.HighCapacityThresholdMbps || (speed / 1_000_000) >= _config.HighCapacityThresholdMbps);
 
@@ -568,6 +575,9 @@ public class SnmpPoller : ISnmpPoller
             else if (oid == UniFiOids.SysDescr) metrics.Description = v.Data.ToString();
             else if (oid == UniFiOids.SysLocation) metrics.Location = v.Data.ToString();
             else if (oid == UniFiOids.SysContact) metrics.Contact = v.Data.ToString();
+            // The SNMP service's uptime, not the OS's (see UniFiOids.SysUpTime): it feeds reboot
+            // detection, which confirms each reset on the device. Do not swap in the console's uptime
+            // field to "fix" it: the two disagree by weeks on some devices.
             else if (oid == UniFiOids.SysUpTime) metrics.Uptime = ConvertSnmpValue<long>(v.Data);
             else if (oid == UniFiOids.SysObjectID) metrics.ObjectId = v.Data.ToString();
         }
@@ -728,6 +738,19 @@ public class SnmpPoller : ISnmpPoller
             IfXTableIndexOffset = ifXOffset,
             NamingIncomplete = !nameOk || !aliasOk,
         };
+    }
+
+    /// <summary>
+    /// A port's (ifSpeed, ifHighSpeed): the medium tier's ifHighSpeed when it reads nonzero, else
+    /// the metadata walk's pair.
+    /// </summary>
+    internal static (long Speed, long HighSpeed) ResolveSpeed(long metaSpeed, long metaHighSpeed, long freshHighSpeed)
+    {
+        // Only a nonzero reading replaces the metadata's: some devices report ifHighSpeed 0 and
+        // carry their speed in ifSpeed alone. ifSpeed is derived so the two agree on the HC
+        // threshold and the resolved speed; it is a 32-bit gauge, so it saturates.
+        if (freshHighSpeed <= 0 || freshHighSpeed == metaHighSpeed) return (metaSpeed, metaHighSpeed);
+        return (Math.Min(freshHighSpeed * 1_000_000L, uint.MaxValue), freshHighSpeed);
     }
 
     /// <summary>
@@ -1134,7 +1157,7 @@ public class SnmpPoller : ISnmpPoller
 
             if (targetType == typeof(double))
             {
-                if (double.TryParse(dataString, out var doubleValue))
+                if (double.TryParse(dataString, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var doubleValue))
                     return (T)(object)doubleValue;
             }
         }
@@ -1176,6 +1199,9 @@ internal sealed class DevicePollerCache
     public Dictionary<string, string> OutErrorsByIdx { get; set; } = new();
     public Dictionary<string, string> InDiscardsByIdx { get; set; } = new();
     public Dictionary<string, string> OutDiscardsByIdx { get; set; } = new();
+    // ifHighSpeed, rebased: a port renegotiates without a label change, so speed follows the
+    // medium tier instead of the metadata walk. Reset to the metadata's on every slow refresh.
+    public Dictionary<string, string> HighSpeedByIdx { get; set; } = new();
 }
 
 internal sealed class InterfaceMetadataCache

@@ -29,6 +29,8 @@ namespace NetworkOptimizer.Web.Services.Monitoring;
 /// </summary>
 public class MonitoringAlertEvaluator
 {
+    private const string OfflineEventType = "monitoring.target_offline";
+    private const string RecoveredEventType = "monitoring.target_recovered";
     private const int FailuresToDeclareOffline = 3;
     private const int SuccessesToDeclareRecovered = 3;
     private const double SustainedLossThresholdPercent = 30.0;
@@ -41,8 +43,11 @@ public class MonitoringAlertEvaluator
     private readonly DeviceOfflineDeduplicator _dedup;
     private readonly Firmware.RolloutSuppressionRegistry? _rolloutWindows;
     private readonly ConcurrentDictionary<string, TargetAlertState> _states = new();
+    // Latest fabric probe per device, by normalized MAC, from either vantage (server or agent).
+    private readonly ConcurrentDictionary<string, (DateTime At, bool Success)> _fabricByMac = new();
     private readonly string _siteSuffix;
     private readonly string _siteSlug;
+    private readonly OpenAlertSeed _openAtStart;
 
     /// <param name="siteSlug">
     /// Site this instance evaluates for (one instance per site, owned by
@@ -50,12 +55,16 @@ public class MonitoringAlertEvaluator
     /// state must not be shared). Non-default sites get their slug appended to
     /// alert titles; the default site reads exactly as before.
     /// </param>
+    /// <param name="scopeFactory">Reads targets still offline before a restart, so their recovery is published.</param>
     public MonitoringAlertEvaluator(IAlertEventBus eventBus, ILogger<MonitoringAlertEvaluator> logger,
         DeviceTransitionTracker transitions, WanOutageEvaluator wanOutages,
         DeviceOfflineDeduplicator dedup,
         string siteSlug = SiteManagementService.DefaultSiteSlug,
-        Firmware.RolloutSuppressionRegistry? rolloutWindows = null)
+        Firmware.RolloutSuppressionRegistry? rolloutWindows = null,
+        IServiceScopeFactory? scopeFactory = null)
     {
+        _openAtStart = new OpenAlertSeed(scopeFactory, siteSlug ?? SiteManagementService.DefaultSiteSlug,
+            [OfflineEventType], a => OpenAlertSeed.Context(a, "target_id"), logger);
         _eventBus = eventBus;
         _logger = logger;
         _transitions = transitions;
@@ -67,10 +76,27 @@ public class MonitoringAlertEvaluator
             ? "" : $" (site {siteSlug})";
     }
 
+    /// <summary>
+    /// Whether the device's fabric target answered its latest probe, or null when it has no enabled
+    /// fabric target or the latest result is older than <paramref name="maxAge"/>.
+    /// </summary>
+    public bool? FabricReachable(string deviceMac, TimeSpan maxAge, DateTime now) =>
+        _fabricByMac.TryGetValue(DeviceOfflineDeduplicator.NormalizeMac(deviceMac), out var latest) && now - latest.At <= maxAge
+            ? latest.Success
+            : null;
+
+    /// <summary>Whether a WAN's outage is open or confirming; null names the primary (see <see cref="WanOutageEvaluator.IsOutageOpen"/>).</summary>
+    public bool IsWanOutageOpen(string? wanKey) => _wanOutages.IsOutageOpen(wanKey);
+
     public async ValueTask EvaluateAsync(MonitoringTarget target, PingProbeResult result, CancellationToken ct = default)
     {
-        var state = _states.GetOrAdd(target.TargetId, _ => new TargetAlertState());
-        var publishPerTarget = !WanOutageEvaluator.CoversTargetType(target.TargetType);
+        if (target.TargetType == MonitoringTargetType.Fabric && !string.IsNullOrWhiteSpace(target.DeviceMac))
+            _fabricByMac[DeviceOfflineDeduplicator.NormalizeMac(target.DeviceMac)] = (DateTime.UtcNow, result.Success);
+
+        var open = await _openAtStart.OpenAsync();
+        // A target still offline before a restart starts offline, so its recovery is published.
+        var state = _states.GetOrAdd(target.TargetId, id => new TargetAlertState { IsOffline = open.Take(OfflineEventType, id) != null });
+        var publishPerTarget = !WanOutageEvaluator.Covers(target);
 
         await EvaluatePerTargetAsync(target, result, state, publishPerTarget, ct);
 
@@ -185,9 +211,10 @@ public class MonitoringAlertEvaluator
 
     private AlertEvent BuildOfflineEvent(MonitoringTarget target) => new()
     {
-        EventType = "monitoring.target_offline",
+        EventType = OfflineEventType,
         Source = "monitoring",
-        Severity = TargetSeverity(target.TargetType, isOffline: true),
+        // A far transit hop going dark is a path event past the near transit, not something to act on.
+        Severity = target.IsFarTransit ? AlertSeverity.Info : TargetSeverity(target.TargetType, isOffline: true),
         Title = $"{target.Name} is offline{_siteSuffix}",
         Message = $"Monitoring target {target.Name} ({target.Address}) failed {FailuresToDeclareOffline} consecutive {target.ProbeMode.ToString().ToUpperInvariant()} probes.",
         DeviceId = target.DeviceMac,
@@ -205,7 +232,7 @@ public class MonitoringAlertEvaluator
 
     private AlertEvent BuildRecoveredEvent(MonitoringTarget target, PingProbeResult result) => new()
     {
-        EventType = "monitoring.target_recovered",
+        EventType = RecoveredEventType,
         Source = "monitoring",
         Severity = AlertSeverity.Info,
         Title = $"{target.Name} is back online{_siteSuffix}",
@@ -252,17 +279,7 @@ public class MonitoringAlertEvaluator
     /// </summary>
     private static string TargetSourceUrl(MonitoringTarget target, DateTime firedAt)
     {
-        var category = target.TargetType switch
-        {
-            MonitoringTargetType.Fabric => MonitoringLinks.FabricCategory,
-            MonitoringTargetType.AccessIsp => MonitoringLinks.AccessIspCategory,
-            MonitoringTargetType.Transit => MonitoringLinks.TransitCategory,
-            // Both name the WAN's own service. Falling through to Custom sent an outage on the
-            // service being monitored to the chart for user-added targets.
-            MonitoringTargetType.InternetService or MonitoringTargetType.Wan
-                => MonitoringLinks.InternetServiceCategory,
-            _ => MonitoringLinks.CustomCategory
-        };
+        var category = MonitoringLinks.CategoryFor(target.TargetType);
         var at = new DateTimeOffset(DateTime.SpecifyKind(firedAt, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
         var url = $"/monitoring?tab=performance&category={category}&at={at}";
         // A LAN target is not reached over any one WAN, so it asks for all of them rather than

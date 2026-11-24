@@ -71,6 +71,15 @@ public class UniFiClientResponse
     [JsonPropertyName("fixed_ip")]
     public string? FixedIp { get; set; }
 
+    [JsonPropertyName("local_dns_record_enabled")]
+    public bool LocalDnsRecordEnabled { get; set; }
+
+    [JsonPropertyName("local_dns_record")]
+    public string? LocalDnsRecord { get; set; }
+
+    [JsonPropertyName("network_members_group_ids")]
+    public List<string>? NetworkMembersGroupIds { get; set; }
+
     [JsonPropertyName("last_ip")]
     public string? LastIp { get; set; }
 
@@ -214,6 +223,19 @@ public class UniFiClientResponse
     [JsonConverter(typeof(FlexibleIntConverter))]
     public int? DevCat { get; set; }
 
+    /// <summary>The fingerprinted device id; <see cref="DevIdOverride"/> wins when the user picked a device.</summary>
+    [JsonPropertyName("dev_id")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? DevId { get; set; }
+
+    /// <summary>Icon GUID of a Ubiquiti product seen as a client (a Protect camera, an AI Key).</summary>
+    [JsonPropertyName("icon_filename")]
+    public string? IconFilename { get; set; }
+
+    /// <summary>The custom icon the user set for this client in UniFi Network, if any.</summary>
+    [JsonPropertyName("ai_icon")]
+    public UniFiAiIcon? AiIcon { get; set; }
+
     [JsonPropertyName("dev_family")]
     [JsonConverter(typeof(FlexibleIntConverter))]
     public int? DevFamily { get; set; }
@@ -308,6 +330,12 @@ public class UniFiClientResponse
     /// Whether this client is a UniFi device (owned by a UniFi app) rather than an ordinary client.
     /// </summary>
     public bool IsUniFiDevice => UniFiProductLine != null;
+
+    /// <summary>
+    /// A UniFi Protect device (camera, AI Key, SuperLink). UniFi Protect owns its name, so it is never
+    /// renamed through UniFi Network. Some consoles mark it on the client, others only in the ucore block.
+    /// </summary>
+    public bool IsProtectDevice => UniFiProductLine == "protect";
 }
 
 /// <summary>
@@ -329,6 +357,13 @@ public class UniFiUcoreDeviceInfo
     /// <summary>Short product/model name, e.g. "UVC G6 Pro Bullet".</summary>
     [JsonPropertyName("product_shortname")]
     public string? ProductShortname { get; set; }
+
+    /// <summary>
+    /// The product's icon GUID. Some consoles also copy it to the client's top-level
+    /// <c>icon_filename</c>; others set it only here.
+    /// </summary>
+    [JsonPropertyName("icon_filename")]
+    public string? IconFilename { get; set; }
 }
 
 /// <summary>

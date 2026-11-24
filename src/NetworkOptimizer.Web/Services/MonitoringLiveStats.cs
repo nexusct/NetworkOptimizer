@@ -4,6 +4,7 @@ using NetworkOptimizer.Storage.Models;
 using NetworkOptimizer.Storage.Services;
 using NetworkOptimizer.UniFi;
 using NetworkOptimizer.Web.Services.Monitoring;
+using NetworkOptimizer.Web.Services.Monitoring.IspHealth;
 
 namespace NetworkOptimizer.Web.Services;
 
@@ -259,14 +260,27 @@ public class MonitoringLiveStats
     // When each port's rate was last computed rather than carried, for the hold above.
     private readonly ConcurrentDictionary<(string DeviceMac, string IfName), DateTime> _portRateAt = new();
 
+    /// <summary>
+    /// How recent inbound traffic on a port has to be to outweigh an ifOperStatus that says down.
+    /// Only the host behind a port can send into it, so inbound bytes prove the link is up; the
+    /// poller reads ifOperStatus every 30 s, while the counters behind the rate are read every poll.
+    /// </summary>
+    public static readonly TimeSpan InboundProvesLink = TimeSpan.FromSeconds(15);
+
+    // When each port last computed a nonzero inbound rate, recorded before a down link zeroes it.
+    private readonly ConcurrentDictionary<(string DeviceMac, string IfName), DateTime> _portInboundAt = new();
+
     public void RecordPortStats(MonitoringInfluxClient.PortStatsPoint point)
     {
         if (string.IsNullOrEmpty(point.DeviceMac) || string.IsNullOrEmpty(point.IfName)) return;
         var key = (Normalize(point.DeviceMac), point.IfName);
         if (point.RateInBps.HasValue || point.RateOutBps.HasValue) _portRateAt[key] = point.Time;
+        var inbound = point.RateInBps is > 0;
+        if (inbound) _portInboundAt[key] = point.Time;
         // A down link carries nothing, and a rate held past its window is a port that went quiet,
-        // not one whose device has yet to refresh its counters.
-        var linkDown = point.OperStatus is { } oper && oper != 1;
+        // not one whose device has yet to refresh its counters. A sample that moved inbound bytes is
+        // not a down link, whatever the cached ifOperStatus says.
+        var linkDown = point.OperStatus is { } oper && oper != 1 && !inbound;
         var heldTooLong = !point.RateInBps.HasValue && !point.RateOutBps.HasValue
             && (!_portRateAt.TryGetValue(key, out var rateAt) || point.Time - rateAt > PortRateHold);
         if (linkDown || heldTooLong)
@@ -321,14 +335,19 @@ public class MonitoringLiveStats
     /// <summary>
     /// <see cref="IsPortLinkDown"/> with the sample it was read from. Down is ifOperStatus 2 (down)
     /// or 7 (lowerLayerDown) only; testing, unknown, dormant, and notPresent say nothing either way.
+    /// Inbound traffic within <see cref="InboundProvesLink"/> of the sample reads as up regardless.
     /// </summary>
     public PortLinkSample? PortLinkState(string deviceMac, string ifName, DateTime now, TimeSpan maxAge, DateTime? notBefore = null)
     {
         if (string.IsNullOrEmpty(deviceMac) || string.IsNullOrEmpty(ifName)) return null;
-        if (!_portStats.TryGetValue((Normalize(deviceMac), ifName), out var row)) return null;
+        var key = (Normalize(deviceMac), ifName);
+        if (!_portStats.TryGetValue(key, out var row)) return null;
         if (row.OperStatus is not { } oper || now - row.Time > maxAge) return null;
         if (notBefore is { } floor && row.Time <= floor) return null;
-        return LinkDownFromOperStatus(oper) is { } down ? new PortLinkSample(down, oper, row.Time) : null;
+        if (LinkDownFromOperStatus(oper) is not { } down) return null;
+        if (down && _portInboundAt.TryGetValue(key, out var inboundAt) && row.Time - inboundAt <= InboundProvesLink)
+            down = false;
+        return new PortLinkSample(down, oper, row.Time);
     }
 
     /// <summary>
@@ -477,9 +496,128 @@ public class MonitoringLiveStats
             Success = success,
             LastUpdate = timestamp
         };
+        if (rttAvgMs is double rtt)
+        {
+            var history = _targetRttHistory.GetOrAdd(targetId, _ => new Queue<(DateTime, double)>());
+            lock (history)
+            {
+                history.Enqueue((timestamp, rtt));
+                var cutoff = timestamp - MedianWindow;
+                while (history.Count > 0 && history.Peek().Item1 < cutoff) history.Dequeue();
+            }
+        }
     }
 
-    /// <summary>Cached list of enabled ISP+Transit monitoring targets. Refreshed every 30s.</summary>
+    /// <summary>How far back a hop's RTT counts toward its median, for picking the access floor's loss hop.</summary>
+    public static readonly TimeSpan MedianWindow = TimeSpan.FromHours(1);
+
+    // Each target's RTT probes over the last MedianWindow; a few hundred values per target at most.
+    private readonly ConcurrentDictionary<string, Queue<(DateTime At, double Rtt)>> _targetRttHistory = new();
+    private readonly ConcurrentDictionary<string, byte> _seededRttHistory = new();
+
+    /// <summary>
+    /// Fills a target's RTT history with stored readings older than any it holds, once per process.
+    /// The history starts empty at every restart, and the Transit tile's baselines need the hour.
+    /// </summary>
+    public void SeedRttHistory(string targetId, IReadOnlyList<(DateTime Time, double Value)> stored)
+    {
+        if (string.IsNullOrEmpty(targetId) || stored.Count == 0 || !_seededRttHistory.TryAdd(targetId, 0)) return;
+        var history = _targetRttHistory.GetOrAdd(targetId, _ => new Queue<(DateTime, double)>());
+        lock (history)
+        {
+            var before = history.Count > 0 ? history.Peek().Item1 : DateTime.MaxValue;
+            var cutoff = DateTime.UtcNow - MedianWindow;
+            var merged = stored.Where(p => p.Time >= cutoff && p.Time < before)
+                .OrderBy(p => p.Time)
+                .Select(p => (p.Time, p.Value))
+                .Concat(history)
+                .ToList();
+            history.Clear();
+            foreach (var p in merged) history.Enqueue(p);
+        }
+    }
+
+    /// <summary>
+    /// Of <paramref name="targetIds"/>, the one with the lowest median RTT over the last hour, or
+    /// null with no history yet. The access floor's fallback hop and the source of its loss, as in
+    /// ISP Health.
+    /// </summary>
+    public string? LowestMedianTarget(IEnumerable<string> targetIds)
+    {
+        var cutoff = DateTime.UtcNow - MedianWindow;
+        string? best = null;
+        var bestMedian = double.MaxValue;
+        foreach (var id in targetIds)
+        {
+            if (!_targetRttHistory.TryGetValue(id, out var history)) continue;
+            List<double> rtts;
+            lock (history) rtts = history.Where(h => h.At >= cutoff).Select(h => h.Rtt).ToList();
+            if (rtts.Count == 0) continue;
+            rtts.Sort();
+            var median = rtts.Count % 2 == 1 ? rtts[rtts.Count / 2] : (rtts[rtts.Count / 2 - 1] + rtts[rtts.Count / 2]) / 2;
+            if (median < bestMedian) (best, bestMedian) = (id, median);
+        }
+        return best;
+    }
+
+    /// <summary>
+    /// The ISP access layer right now, read as ISP Health reads it (<see cref="AccessFloor.Live"/>):
+    /// the lowest RTT across the fresh access hops, with loss from the lowest-median hop. Null RTT and
+    /// loss with no fresh hop.
+    /// </summary>
+    public (double? RttAvgMs, double? LossPercent) GetIspAccessFloorLive(IEnumerable<string> ispTargetIds)
+    {
+        var ids = ispTargetIds as IReadOnlyCollection<string> ?? ispTargetIds.ToList();
+        var stale = DateTime.UtcNow - LiveReadingMaxAge;
+        var fresh = new List<(string, double?, double)>();
+        foreach (var id in ids)
+        {
+            var st = GetTargetStats(id);
+            if (st == null || st.LastUpdate < stale) continue;
+            fresh.Add((id, st.RttAvgMs, st.LossPercent));
+        }
+        return AccessFloor.Live(fresh, LowestMedianTarget(ids));
+    }
+
+    /// <summary>
+    /// An ISP or Transit tile's live RTT and loss for <paramref name="targetIds"/>, shared by the
+    /// Monitoring page and the Dashboard's Live View. ISP reads as the access floor
+    /// (<see cref="GetIspAccessFloorLive"/>), as ISP Health does. Transit reads as
+    /// <see cref="HopLatencyBlend"/> over the fresh hops, with their mean loss. Null RTT and zero
+    /// loss with no fresh hop.
+    /// </summary>
+    public (double? RttAvgMs, double LossPercent) GetTileLatencyLive(MonitoringTargetType type, IEnumerable<string> targetIds)
+    {
+        var ids = targetIds as IReadOnlyCollection<string> ?? targetIds.ToList();
+        if (ids.Count == 0) return (null, 0);
+        if (type == MonitoringTargetType.AccessIsp)
+        {
+            var (floorRtt, floorLoss) = GetIspAccessFloorLive(ids);
+            return (floorRtt, floorLoss ?? 0);
+        }
+        var stale = DateTime.UtcNow - LiveReadingMaxAge;
+        var hops = new List<IReadOnlyList<double>>();
+        var losses = new List<double>();
+        foreach (var id in ids)
+        {
+            var st = GetTargetStats(id);
+            if (st == null || st.LastUpdate < stale) continue;
+            losses.Add(st.LossPercent);
+            if (st.RttAvgMs is not double rtt) continue;
+            // The history ends with the current reading (RecordTargetProbe appends it).
+            var history = RttHistory(id);
+            hops.Add(history.Count > 0 ? history : [rtt]);
+        }
+        return (HopLatencyBlend.Live(hops), losses.Count > 0 ? losses.Average() : 0);
+    }
+
+    private List<double> RttHistory(string targetId)
+    {
+        if (!_targetRttHistory.TryGetValue(targetId, out var history)) return [];
+        lock (history) return history.Select(h => h.Rtt).ToList();
+    }
+
+    /// <summary>Cached list of enabled ISP+Transit monitoring targets, far transit left out. Refreshed every 30s.</summary>
     public async Task<List<(string TargetId, MonitoringTargetType TargetType, string? WanInterface)>> GetIspTransitTargetsAsync(
         CancellationToken ct = default)
     {
@@ -494,7 +632,9 @@ public class MonitoringLiveStats
             .Where(t => t.Enabled
                 && (t.TargetType == MonitoringTargetType.AccessIsp
                     || t.TargetType == MonitoringTargetType.Transit)
-                && (t.AsnNumber == null || !WellKnownAsns.NonTransitInfrastructure.Contains(t.AsnNumber.Value)))
+                && (t.AsnNumber == null || !WellKnownAsns.NonTransitInfrastructure.Contains(t.AsnNumber.Value))
+                // A far transit hop would lift the chart's mean by its distance alone.
+                && (t.TargetType != MonitoringTargetType.Transit || t.FarTransitAt == null))
             .Select(t => new { t.TargetId, t.TargetType, t.WanInterface })
             .ToListAsync(ct);
 
@@ -508,10 +648,10 @@ public class MonitoringLiveStats
     }
 
     /// <summary>
-    /// Combined ISP+Transit live latency as plotted by the WAN live chart: RTT and
-    /// loss averaged per target type, then the mean of the two types. Loss is
+    /// Combined ISP+Transit live latency as plotted by the WAN live chart: the ISP access floor
+    /// (<see cref="GetIspAccessFloorLive"/>) and the Transit mean, then the mean of the two. Loss is
     /// combined over the types that have loss samples, independent of RTT presence,
-    /// mirroring the historic series (QueryMeanIspTransitLatencyAsync) - during a
+    /// mirroring the historic series (WanLatencySeries) - during a
     /// full outage RTT goes null while loss pegs at 100, and gating loss on RTT
     /// blanked the chart exactly when loss mattered most. Shared by the live-stats
     /// endpoint and the LAN flow map WAN globes so both always show the same number.
@@ -544,8 +684,6 @@ public class MonitoringLiveStats
                 StringComparison.OrdinalIgnoreCase))
             .ToList();
 
-        var ispRtts = new List<double>();
-        var ispLosses = new List<double>();
         var transitRtts = new List<double>();
         var transitLosses = new List<double>();
 
@@ -562,20 +700,17 @@ public class MonitoringLiveStats
             var st = GetTargetStats(t.TargetId);
             if (st == null || st.LastUpdate < stale) continue;
 
-            if (t.TargetType == MonitoringTargetType.AccessIsp)
-            {
-                if (st.RttAvgMs != null) ispRtts.Add(st.RttAvgMs.Value);
-                ispLosses.Add(st.LossPercent);
-            }
-            else
+            if (t.TargetType != MonitoringTargetType.AccessIsp)
             {
                 if (st.RttAvgMs != null) transitRtts.Add(st.RttAvgMs.Value);
                 transitLosses.Add(st.LossPercent);
             }
         }
 
-        var ispRtt = ispRtts.Count > 0 ? ispRtts.Average() : (double?)null;
-        var ispLoss = ispLosses.Count > 0 ? ispLosses.Average() : (double?)null;
+        // The ISP half is the access floor, as ISP Health reads the access layer: one hop's slow
+        // control-plane replies no longer lift it. It still carries half the weight, as the mean did.
+        var (ispRtt, ispLoss) = GetIspAccessFloorLive(
+            targets.Where(t => t.TargetType == MonitoringTargetType.AccessIsp).Select(t => t.TargetId));
         var transitRtt = transitRtts.Count > 0 ? transitRtts.Average() : (double?)null;
         var transitLoss = transitLosses.Count > 0 ? transitLosses.Average() : (double?)null;
 
@@ -670,11 +805,15 @@ public class MonitoringLiveStats
     /// </summary>
     public void RecordSfpPon(string deviceMac, string portName, string? ponLinkStatus,
         long? bipErrors, long? fecErrors, long? hecUncorrected, bool? fecEnabled,
-        long? gemRxDropped, DateTime timestamp)
+        long? gemRxDropped, DateTime timestamp,
+        string? registrationStatus = null, string? keyExchangeStatus = null, double? ontTemperatureC = null,
+        string? oltVendorId = null, string? oltModel = null)
     {
         if (string.IsNullOrEmpty(deviceMac) || string.IsNullOrEmpty(portName)) return;
         if (string.IsNullOrEmpty(ponLinkStatus) && !bipErrors.HasValue && !fecErrors.HasValue
-            && !hecUncorrected.HasValue && !gemRxDropped.HasValue)
+            && !hecUncorrected.HasValue && !gemRxDropped.HasValue
+            && string.IsNullOrEmpty(registrationStatus) && !ontTemperatureC.HasValue
+            && string.IsNullOrEmpty(oltVendorId))
             return;
 
         var key = (Normalize(deviceMac), portName);
@@ -688,6 +827,11 @@ public class MonitoringLiveStats
                 HecUncorrected = hecUncorrected,
                 FecEnabled = fecEnabled,
                 GemRxDropped = gemRxDropped,
+                RegistrationStatus = registrationStatus,
+                KeyExchangeStatus = keyExchangeStatus,
+                OntTemperatureC = ontTemperatureC,
+                OltVendorId = oltVendorId,
+                OltModel = oltModel,
                 LastUpdate = timestamp
             },
             (_, prior) => prior with
@@ -698,6 +842,11 @@ public class MonitoringLiveStats
                 HecUncorrected = hecUncorrected ?? prior.HecUncorrected,
                 FecEnabled = fecEnabled ?? prior.FecEnabled,
                 GemRxDropped = gemRxDropped ?? prior.GemRxDropped,
+                RegistrationStatus = registrationStatus ?? prior.RegistrationStatus,
+                KeyExchangeStatus = keyExchangeStatus ?? prior.KeyExchangeStatus,
+                OntTemperatureC = ontTemperatureC ?? prior.OntTemperatureC,
+                OltVendorId = oltVendorId ?? prior.OltVendorId,
+                OltModel = oltModel ?? prior.OltModel,
             });
     }
 
@@ -1247,6 +1396,26 @@ public record SfpLiveStats
     public bool? FecEnabled { get; init; }
     /// <summary>Absolute (cumulative) dropped GEM frames from the PON supplement.</summary>
     public long? GemRxDropped { get; init; }
+    /// <summary>ONT registration with the OLT, as the attached provider words it.</summary>
+    public string? RegistrationStatus { get; init; }
+    /// <summary>OLT key exchange result, as the attached provider words it.</summary>
+    public string? KeyExchangeStatus { get; init; }
+    /// <summary>The ONT's own temperature sensor. Set only when the host device's DDM read its own
+    /// <see cref="TemperatureC"/> too; otherwise that field already holds this reading.</summary>
+    public double? OntTemperatureC { get; init; }
+    /// <summary>
+    /// <see cref="OntTemperatureC"/> when it is a second reading, or null when it matches
+    /// <see cref="TemperatureC"/> at display precision. A stick ONT is its own SFP module, so DDM and
+    /// its web UI read the same sensor. For display only: Influx keeps both fields.
+    /// </summary>
+    public double? DistinctOntTemperatureC =>
+        OntTemperatureC is double ont && !(TemperatureC is double ddm && Math.Round(ddm, 2) == Math.Round(ont, 2))
+            ? ont
+            : null;
+    /// <summary>OLT vendor ID the attached ONT reports (e.g. "CALX"), raw.</summary>
+    public string? OltVendorId { get; init; }
+    /// <summary>OLT model the attached ONT reports (e.g. "E7").</summary>
+    public string? OltModel { get; init; }
 }
 
 public record PortLiveRate

@@ -74,14 +74,15 @@ public class IspHealthScorer
         {
             _logger?.LogDebug("ISP Health: excluding {Count} SQM probe and learning sample windows", inputs.LoadExclusionWindows.Count);
         }
-        var loadWindows = LoadClassifier.Classify(inputs.WanRates, inputs.ExpectedDownloadMbps, inputs.ExpectedUploadMbps, _options, inputs.LoadExclusionWindows, _logger);
+        var loadWindows = LoadClassifier.Classify(inputs.WanRates, inputs.ExpectedDownloadMbps, inputs.ExpectedUploadMbps, _options, inputs.LoadExclusionWindows, _logger,
+            inputs.WanSpeedTests.Select(t => t.Time).ToList());
         var hasExpectedSpeeds = inputs.ExpectedDownloadMbps.HasValue || inputs.ExpectedUploadMbps.HasValue;
 
         var idleBaseline = ComputeIdleBaseline(inputs.FirstHopSeries, loadWindows);
         var avgLoad = ComputeAverageLoad(inputs);
         var (speedVsPlan, bestSpeedTest, typicalDownMbps, typicalUpMbps) = ScoreSpeedVsPlan(inputs);
         var idleLatency = ScoreIdleLatency(idleBaseline, profile);
-        var packetLoss = ScorePacketLoss(inputs.LossPoolSeries, profile, avgLoad);
+        var packetLoss = ScorePacketLoss(inputs, profile, avgLoad);
         var loadedDeltas = ResolveLoadedDeltas(inputs, loadWindows);
 
         // The path jitter floor: the quietest median jitter measured anywhere along the
@@ -201,14 +202,19 @@ public class IspHealthScorer
         // absolved per-hop and routes-through-gated (a transit ASN or deeper ISP hop only
         // absolves a hop it is proven downstream of), so a divergent clean transit can't
         // clear a congested hop it never traverses. Hops further out on the same ISP also
-        // get a soft intra-ASN reach ceiling. Access layer idle latency still uses FirstHopSeries.
+        // get a soft intra-ASN reach ceiling. Access layer idle latency uses the access floor (FirstHopSeries).
         var ispHopGrades = GradeIspHops(inputs.IspAsnSeries, inputs.TransitAsnSeries, transitAsns, witnessDestinations, inputs.CongestionEvents, jitterFloor, inputs.HopOrderKnown, accessMedianRtt, inputs.InternetMedianDeltaMs);
         // Collapse the per-hop grades to one entry per ASN for the Networks on Your Path card.
         var ispAsns = AggregateIspAsns(ispHopGrades, inputs.CongestionEvents, _options.JitterAssimilationMinDeltaMs);
         var transitDimension = BuildAsnDimension("Transit Health", _options.TransitWeight, transitAsns);
         var ispAsnDimension = BuildIspDimension(_options.IspAsnWeight, ispHopGrades);
 
+        var transitBeforePathCongestion = transitDimension;
+        transitDimension = ApplyPathCongestion(inputs, transitDimension);
+        var pathCongestionTransitPoints = (transitBeforePathCongestion.Score ?? 0) - (transitDimension.Score ?? 0);
         var overall = CombineDimensions(accessDimension, transitDimension, ispAsnDimension);
+        AttributePathCongestion(inputs.PathCongestion,
+            CombineDimensions(accessDimension, transitBeforePathCongestion, ispAsnDimension) - overall);
         // Outages are scored once, here at the top level (not inside a factor, where the dimension
         // weights would dilute a multi-hour outage to a couple of points), as TWO components:
         //   - DURATION: the GREATER of (a) the summed effective downtime as a PERCENT OF THE WINDOW,
@@ -365,9 +371,12 @@ public class IspHealthScorer
             TransitAsns = transitAsns,
             IspAsns = ispAsns,
             IspTargets = inputs.IspTargetSeries.Select(s => BuildIspTargetHealth(s, inputs.FirstHopTargetId, ispHopGrades, _options.RttWinsorPercentile, inputs.NotTracedTargetIds, inputs.TargetAddresses)).ToList(),
+            AccessFloor = BuildAccessFloorHealth(inputs),
             CongestionEvents = inputs.CongestionEvents,
             PathShifts = inputs.PathShifts,
             Outages = inputs.Outages,
+            PathCongestion = inputs.PathCongestion,
+            PathCongestionTransitPoints = pathCongestionTransitPoints,
             TargetAddresses = inputs.TargetAddresses,
             HasExpectedSpeeds = hasExpectedSpeeds,
             HasUpstreamTraceMap = inputs.HopOrderKnown,
@@ -515,27 +524,25 @@ public class IspHealthScorer
     /// </para>
     /// </summary>
     /// <summary>
-    /// Raises one episode's delta to a WAN speed test's own loaded-vs-idle figure when a test ran
-    /// during it and read higher, in the SAME direction.
+    /// Every WAN speed test in the window that measured this direction under load, as its own
+    /// loaded-vs-idle delta.
     /// <para>
     /// A test carries its own idle reference (<see cref="SpeedTestSample.PingMs"/>) taken by the
     /// same probe against the same endpoint seconds apart, so the difference needs no baseline of
     /// ours and inherits none of its blind spots.
     /// </para>
     /// <para>
-    /// Deliberately one-directional, and deliberately per-episode. Taking the larger of two
-    /// estimates biases upward wherever both are about right, so it is confined to the episodes a
-    /// test actually overlapped rather than allowed to lift the whole factor.
+    /// Not limited to tests that overlapped a passive load episode. Whether the rate series
+    /// classified a test's few seconds as loaded says nothing about the test, and that limit kept
+    /// an outlier in the pool while dropping the clean test that would have outvoted it.
     /// </para>
     /// </summary>
-    private List<(DateTime Time, double Value)> QualifyingTests(
-        DateTime start, DateTime end, IspHealthInputs inputs, bool upstream)
+    private List<(DateTime Time, double Value)> QualifyingTests(IspHealthInputs inputs, bool upstream)
     {
-        var tolerance = TimeSpan.FromSeconds(Math.Max(0, _options.LoadedLatencySpeedTestMatchSeconds));
         var found = new List<(DateTime Time, double Value)>();
         foreach (var test in inputs.WanSpeedTests)
         {
-            if (test.Time < start - tolerance || test.Time > end + tolerance) continue;
+            if (test.Time < inputs.WindowStart || test.Time > inputs.WindowEnd) continue;
             var underLoad = upstream ? test.UploadLatencyMs : test.DownloadLatencyMs;
             if (!underLoad.HasValue || !test.PingMs.HasValue) continue;
 
@@ -865,7 +872,7 @@ public class IspHealthScorer
         };
     }
 
-    private IspScoreFactor ScorePacketLoss(List<List<LatencySample>> lossPool, AccessProfile profile, double avgLoad)
+    private IspScoreFactor ScorePacketLoss(IspHealthInputs inputs, AccessProfile profile, double avgLoad)
     {
         // Steady loss is graded on samples OUTSIDE any outage span, so the number reflects
         // true physical-layer loss rather than a discrete internet-down event. Outages are
@@ -874,9 +881,12 @@ public class IspHealthScorer
         // selects a genuinely idle baseline) - the load-calibrated ceiling below compensates
         // for load-driven loss instead. Loaded Loss then re-grades just the loaded subset
         // against the profile's loaded band.
-        var losses = lossPool.SelectMany(series => series)
+        // WAN speed tests' idle phases join the pool weighted by their probe count.
+        var bursts = SpeedTestLossBursts(inputs, upstream: null);
+        var losses = inputs.LossPoolSeries.SelectMany(series => series)
             .Where(s => s.LossPercent.HasValue && !InOutage(s.Time))
-            .Select(s => _gatewayFloor.Apply(s.LossPercent!.Value, s.Time))
+            .Select(s => (Value: _gatewayFloor.Apply(s.LossPercent!.Value, s.Time), Weight: 1.0))
+            .Concat(bursts.Select(b => (b.Value, Weight: SamplesWorth(b.Probes))))
             .ToList();
         if (losses.Count == 0)
         {
@@ -888,7 +898,7 @@ public class IspHealthScorer
             };
         }
 
-        var meanLoss = losses.Average();
+        var meanLoss = SeriesStats.WeightedMean(losses) ?? 0;
         // Calibrate the acceptable loss ceiling to the average load over the window. An idle
         // line should drop ~nothing; loss only climbs as utilization approaches saturation,
         // so the ceiling rises QUADRATICALLY in load - staying near the idle threshold at low
@@ -911,7 +921,7 @@ public class IspHealthScorer
             Score = (int)Math.Round(score),
             Weight = _options.PacketLossWeight,
             ValueText = FormatPct(meanLoss),
-            Description = $"Average loss across ISP, transit, and anycast DNS targets vs the {FormatPct(acceptable)} ceiling for {profile.DisplayName} at {avgLoad.ToString("0%", CultureInfo.InvariantCulture)} average load."
+            Description = $"Average loss across ISP, transit, and anycast DNS targets{(bursts.Count > 0 ? ", and WAN speed tests" : "")} vs the {FormatPct(acceptable)} ceiling for {profile.DisplayName} at {avgLoad.ToString("0%", CultureInfo.InvariantCulture)} average load."
         };
     }
 
@@ -1088,39 +1098,44 @@ public class IspHealthScorer
         // their newest, and always-clean lines have no elevated episodes to go stale.
         if (episodes.Count == 0 || pooled.Count < _options.MinLoadedSamples) return null;
 
-        // Where a WAN speed test ran during an episode, it measured the same event on purpose and
-        // at full saturation, while these probes only sampled it on their own cadence - so a short
-        // event's peak queue can build and drain between two probes and never be seen. Taken only
-        // when it reads HIGHER: that is the direction passive sampling fails in. When the test
-        // reads lower, the series saw something the test's own window did not cover, and the
-        // measurement stands.
-        var episodeEnds = episodeStarts
-            .GroupBy(kv => kv.Value)
-            .ToDictionary(g => g.Key, g => g.Max(kv => kv.Key)
-                .AddSeconds(Math.Max(1, _options.LoadWindowSeconds)));
-        // What a speed test measured during each episode, where one qualified. Applied to the
-        // FINAL figure rather than to the episode it came from, because the figure is a median
-        // across episodes and a median cannot be moved by one member however it is weighted -
-        // lifting per-episode left the better instrument unable to change a reported number even
-        // once. But applied only over the episodes the answer is actually being drawn from: a
-        // test is evidence about the line AS IT WAS THEN, and a window-wide maximum would let a
-        // test from before a fix override the clean run that proves the fix.
-        var testsByEpisode = episodes.ToDictionary(
-            e => e.Time,
-            e => QualifyingTests(
-                e.Time, episodeEnds.TryGetValue(e.Time, out var end) ? end : e.Time,
-                inputs, upstream));
+        // A WAN speed test measures the line on purpose and at full saturation, while these probes
+        // only sample on their own cadence - so a short event's peak queue can build and drain
+        // between two probes and never be seen. The tests' figure is taken only when it reads
+        // HIGHER: that is the direction passive sampling fails in.
+        //
+        // That reasoning holds only where the probes MISSED the test. Where enough of the cohort
+        // sampled its loaded seconds in this direction and agreed the link was clean, the probes
+        // did not miss anything, and the test is the outlier. It is dropped rather than outvoting
+        // them, and a test the probes never covered stands as it is.
+        var tolerance = TimeSpan.FromSeconds(Math.Max(0, _options.LoadedLatencySpeedTestMatchSeconds));
+        bool ContradictedByProbes((DateTime Time, double Value) test)
+        {
+            if (test.Value < LoadedLatencyRegimeFloorMs) return false;
+            var from = test.Time - tolerance;
+            var to = test.Time + tolerance;
+            var reporting = perHop
+                .Where(p => p.Time >= from && p.Time <= to)
+                .Select(p => p.Series)
+                .Distinct()
+                .Count();
+            if (reporting < _options.LoadedLatencyAgreementMinCohort) return false;
+            var seen = pooled.Where(p => p.Time >= from && p.Time <= to).Select(p => p.Value).ToList();
+            return SeriesStats.Median(seen) is { } median && median < LoadedLatencyRegimeFloorMs;
+        }
+
+        var tests = QualifyingTests(inputs, upstream)
+            .Where(t => !ContradictedByProbes(t))
+            .ToList();
 
         // Judged the same way the speed-test fallback judges its own pool: a recent run of clean
         // tests is read as the line having been FIXED and the older ones as describing a
         // connection that no longer exists, otherwise recency-weighted. A plain maximum threw all
         // of that away - the worst test in the window won outright, so a line whose recent tests
         // are all clean kept reporting its worst day from a week ago.
-        double SpeedTestOver(IEnumerable<(DateTime Time, double Value)> over)
+        double SpeedTestFrom(DateTime since)
         {
-            var deltas = over
-                .SelectMany(e => testsByEpisode.TryGetValue(e.Time, out var t) ? t : [])
-                .DistinctBy(t => t.Time)
+            var deltas = tests
+                .Where(t => t.Time >= since)
                 .OrderByDescending(t => t.Time)
                 .ToList();
             if (deltas.Count == 0) return double.NegativeInfinity;
@@ -1168,14 +1183,14 @@ public class IspHealthScorer
 
         // The line was fixed: the elevated episodes describe a connection that no longer exists,
         // so only the clean run since speaks for it.
-        // Only tests taken DURING the clean run speak for a line that was fixed. The elevated
+        // Only tests taken since the clean run began speak for a line that was fixed. The elevated
         // episodes describe a connection that no longer exists, and so do the tests that ran in
         // them - letting those back in through the lift would re-assert the very finding the
         // clean run just cleared.
         if (verdict is { ElevationIsOver: true })
             return Math.Max(0, Math.Max(
                 SeriesStats.Median(verdict.CleanRun.Select(e => e.Value).ToList())!.Value,
-                SpeedTestOver(verdict.CleanRun)));
+                SpeedTestFrom(verdict.CleanRun.Min(e => e.Time) - tolerance)));
 
         // The reported figure is the median ACROSS EPISODES - what this line typically does under
         // load - weighted by recency and by how credible each episode's load was.
@@ -1187,8 +1202,38 @@ public class IspHealthScorer
         // verdict above - it is not a filter on what gets reported.
         return Math.Max(0, Math.Max(
             RecencyWeightedDelta(episodes, inputs.WindowEnd, loadWeight) ?? 0,
-            SpeedTestOver(episodes)));
+            SpeedTestFrom(DateTime.MinValue)));
     }
+
+    /// <summary>
+    /// One phase's packet loss from each WAN speed test in the window: idle when
+    /// <paramref name="upstream"/> is null, otherwise the loaded phase in that direction. A loaded
+    /// phase counts only when the test filled the pipe, the gate loaded latency applies. Floored by
+    /// gateway loss like a monitoring sample.
+    /// </summary>
+    private List<(DateTime Time, double Value, int Probes, int Lost)> SpeedTestLossBursts(IspHealthInputs inputs, bool? upstream)
+    {
+        var found = new List<(DateTime Time, double Value, int Probes, int Lost)>();
+        foreach (var test in inputs.WanSpeedTests)
+        {
+            if (test.Time < inputs.WindowStart || test.Time > inputs.WindowEnd || InOutage(test.Time)) continue;
+            var loss = upstream switch { null => test.IdleLoss, true => test.UploadLoss, false => test.DownloadLoss };
+            if (loss == null || loss.Probes < _options.SpeedTestLossMinProbes) continue;
+
+            if (upstream is bool up)
+            {
+                var achieved = up ? test.UploadMbps : test.DownloadMbps;
+                var expected = up ? inputs.ExpectedUploadMbps : inputs.ExpectedDownloadMbps;
+                if (!(expected > 0) || achieved < expected * _options.LoadedLatencySpeedTestMinPlanFraction)
+                    continue;
+            }
+            found.Add((test.Time, _gatewayFloor.Apply(loss.Percent, test.Time), loss.Probes, loss.Lost));
+        }
+        return found;
+    }
+
+    /// <summary>How many monitoring loss samples a speed test burst of this many probes is worth.</summary>
+    private double SamplesWorth(int probes) => (double)probes / Math.Max(1, _options.LossSamplePings);
 
     private (IspScoreFactor Factor, bool HasData) ScoreLoadedLoss(
         IspHealthInputs inputs,
@@ -1196,7 +1241,9 @@ public class IspHealthScorer
         Dictionary<DateTime, LoadWindow> loadWindows,
         AccessProfile profile)
     {
-        if (loadWindows.Count == 0)
+        if (loadWindows.Count == 0
+            && SpeedTestLossBursts(inputs, upstream: false).Count == 0
+            && SpeedTestLossBursts(inputs, upstream: true).Count == 0)
         {
             return (new IspScoreFactor
             {
@@ -1324,15 +1371,24 @@ public class IspHealthScorer
                 Weight: SeriesStats.RecencyWeight(inputs.WindowEnd - s.Time, _options.LoadedLatencyRecencyHalfLifeHours)
                     * loadWeight(s.Key) * s.Coverage))
             .ToList();
+
+        // WAN speed tests: each is a saturated episode by definition (no load weighting), worth its
+        // probes in monitoring samples. They fill in where passive load episodes are rare.
+        var bursts = SpeedTestLossBursts(inputs, upstream);
+        foreach (var b in bursts)
+            weighted.Add((b.Value,
+                SeriesStats.RecencyWeight(inputs.WindowEnd - b.Time, _options.LoadedLatencyRecencyHalfLifeHours)
+                    * SamplesWorth(b.Probes)));
         var weightedMean = SeriesStats.WeightedMean(weighted);
 
-        var lossy = losses.Count(l => l > 0);
+        var lossy = losses.Count(l => l > 0) + bursts.Sum(b => b.Lost);
         // Counted at the RATE series' own spacing, not LoadWindowSeconds. On a long window the rates
         // are aggregated coarser than the window, so loaded keys are never adjacent and one six-hour
         // saturation counts as hundreds of episodes.
         var episodes = SeriesStats
             .LoadEpisodeStarts(loaded.Keys, EpisodeGroupSeconds(inputs))
-            .Values.Distinct().Count();
+            .Values.Distinct().Count() + bursts.Count;
+        var sampleCount = losses.Count + bursts.Sum(b => SamplesWorth(b.Probes));
         // Both means, because the reported one is the WEIGHTED one: the raw mean alone read 0.63%
         // for a figure the panel showed as 2.1%. The heaviest sample's weight share explains that
         // gap - it says when the credibility weighting handed one sample the whole answer.
@@ -1348,15 +1404,15 @@ public class IspHealthScorer
             }
             _logger.LogDebug(
                 "ISP Health: loaded loss {Direction} pool {Count} sample(s) from {Windows} loaded window key(s) over "
-                + "{Episodes} episode(s), {Lossy} with loss, {Dark} at/above 99%; {Mean}% raw mean -> {Weighted}% "
-                + "weighted, heaviest sample holds {Share}% of the weight",
-                direction, losses.Count, loaded.Keys.Count, episodes, lossy, losses.Count(l => l >= 99.0),
+                + "{Episodes} episode(s) incl. {Tests} WAN speed test(s), {Lossy} with loss, {Dark} at/above 99%; "
+                + "{Mean}% raw mean -> {Weighted}% weighted, heaviest sample holds {Share}% of the weight",
+                direction, losses.Count, loaded.Keys.Count, episodes, bursts.Count, lossy, losses.Count(l => l >= 99.0),
                 losses.Count > 0 ? losses.Average().ToString("0.##", CultureInfo.InvariantCulture) : "n/a",
                 weightedMean?.ToString("0.##", CultureInfo.InvariantCulture) ?? "n/a",
                 (totalWeight > 0 ? topWeight / totalWeight * 100 : 0).ToString("0.#", CultureInfo.InvariantCulture));
         }
 
-        if (losses.Count < _options.MinLoadedSamples) return null;
+        if (sampleCount < _options.MinLoadedSamples) return null;
 
         // A rate needs more than one observation. A five-ping probe quantizes to 20% steps, so one
         // dropped ping in one scheduled speed test can otherwise be the entire figure - and the
@@ -1372,7 +1428,7 @@ public class IspHealthScorer
             return null;
         }
 
-        return weightedMean ?? losses.Average();
+        return weightedMean ?? losses.Concat(bursts.Select(b => b.Value)).Average();
     }
 
     // Loaded window keys per direction for the current report. Both lists are filled on the first
@@ -1409,7 +1465,8 @@ public class IspHealthScorer
     /// Two reach modes: <paramref name="accessBaselineRtt"/> + <paramref name="internetMedianDeltaMs"/>
     /// is the transit ceiling (distance normalized against the measured internet
     /// context); <paramref name="intraAsnFloorRttMs"/> is the ISP intra-ASN ceiling (a
-    /// soft penalty for hops sitting further out than this ISP's nearest hop). Quality
+    /// soft penalty for hops sitting further out than this ISP's nearest hop), eased past
+    /// <paramref name="egressRttMs"/> (the nearest transit cluster's median RTT). Quality
     /// deficits subtract below the ceiling, so congestion and jitter always count.
     /// </summary>
     private IspAsnHealth GradeAsn(
@@ -1420,7 +1477,8 @@ public class IspHealthScorer
         double? internetMedianDeltaMs,
         double? intraAsnFloorRttMs = null,
         double? jitterOverrideMs = null,
-        double? stabilityMadOverrideMs = null)
+        double? stabilityMadOverrideMs = null,
+        double? egressRttMs = null)
     {
         var rtts = series.Samples.Where(s => s.RttAvgMs.HasValue).Select(s => s.RttAvgMs!.Value).ToList();
         var losses = series.Samples.Where(s => s.LossPercent.HasValue && !InOutage(s.Time))
@@ -1493,21 +1551,16 @@ public class IspHealthScorer
             // couple ms out is two sites a real distance apart - nominal, not a fault -
             // so it tops out short of perfect rather than getting dinged hard.
             reachDelta = Math.Max(0, medianRtt.Value - intraAsnFloorRttMs.Value);
-            var cIntra = ScoreCurve.Interpolate(reachDelta.Value,
-                (0, 100), (1, 93), (2, 85), (4, 70), (8, 50), (16, 35));
+            var ceiling = IntraAsnReachCeiling(medianRtt.Value, intraAsnFloorRttMs.Value, accessBaselineRtt, internetMedianDeltaMs);
 
-            // Item D: lift-only blend toward the internet-relative ceiling. Keeps the intra-ASN
-            // distance truth as the floor, but absolves a hop that's modest relative to where the
-            // internet actually sits, so a geographically large access network isn't punished for
-            // normal in-region distance. Never lowers; partial so genuine distance always shows.
-            var ceiling = cIntra;
-            if (accessBaselineRtt.HasValue && internetMedianDeltaMs is > 0)
+            // A hop farther out than where this ISP already hands traffic to transit is a second
+            // route, not the haul to the internet: charge it as if at the egress, plus a fraction of
+            // the rest. Lift-only, since the ceiling never rises with distance.
+            if (egressRttMs.HasValue && medianRtt.Value > egressRttMs.Value)
             {
-                var netDelta = Math.Max(0, medianRtt.Value - accessBaselineRtt.Value);
-                var ratio = netDelta / Math.Max(internetMedianDeltaMs.Value, 2.0);
-                var cNet = ScoreCurve.Interpolate(ratio,
-                    (0.5, 100), (1.0, 93), (1.5, 90), (2.0, 85), (3.0, 65), (5.0, 40));
-                ceiling = cIntra + _options.AccessReachInternetBlendAlpha * Math.Max(0, cNet - cIntra);
+                var atEgress = IntraAsnReachCeiling(Math.Max(egressRttMs.Value, intraAsnFloorRttMs.Value),
+                    intraAsnFloorRttMs.Value, accessBaselineRtt, internetMedianDeltaMs);
+                ceiling = Math.Max(ceiling, atEgress + _options.AccessReachBeyondEgressBeta * (ceiling - atEgress));
             }
             reachCeiling = (int)Math.Round(ceiling);
         }
@@ -1621,6 +1674,30 @@ public class IspHealthScorer
             JitterAssimilated = jitterAssimilated,
             RawJitterMs = nearJitter
         };
+    }
+
+    /// <summary>
+    /// The ISP intra-ASN reach ceiling for a hop at <paramref name="rttMs"/>: distance from this ISP's
+    /// nearest hop, lifted by the Item D internet-relative blend.
+    /// </summary>
+    private double IntraAsnReachCeiling(double rttMs, double intraAsnFloorRttMs, double? accessBaselineRtt, double? internetMedianDeltaMs)
+    {
+        // A second POP a couple ms out is two sites a real distance apart - nominal, not a
+        // fault - so it tops out short of perfect rather than getting dinged hard.
+        var cIntra = ScoreCurve.Interpolate(Math.Max(0, rttMs - intraAsnFloorRttMs),
+            (0, 100), (1, 93), (2, 85), (4, 70), (8, 50), (16, 35));
+        if (!accessBaselineRtt.HasValue || internetMedianDeltaMs is not > 0)
+            return cIntra;
+
+        // Item D: lift-only blend toward the internet-relative ceiling. Keeps the intra-ASN
+        // distance truth as the floor, but absolves a hop that's modest relative to where the
+        // internet actually sits, so a geographically large access network isn't punished for
+        // normal in-region distance. Never lowers; partial so genuine distance always shows.
+        var netDelta = Math.Max(0, rttMs - accessBaselineRtt.Value);
+        var ratio = netDelta / Math.Max(internetMedianDeltaMs.Value, 2.0);
+        var cNet = ScoreCurve.Interpolate(ratio,
+            (0.5, 100), (1.0, 93), (1.5, 90), (2.0, 85), (3.0, 65), (5.0, 40));
+        return cIntra + _options.AccessReachInternetBlendAlpha * Math.Max(0, cNet - cIntra);
     }
 
     /// <summary>The path jitter floor: the lowest scoring (P90) jitter across all ISP hops
@@ -2028,6 +2105,19 @@ public class IspHealthScorer
             .Select(s => (Series: s, Mad: RttMadOf(s.Samples)))
             .ToList();
 
+        // This WAN's traced ISP hops. A witness whose ancestry holds any of them left through this
+        // WAN's ISP, so it crossed the WAN's L2 neighbor first.
+        var tracedIspHopIps = ispHopSeries.Where(s => !s.IsL2Neighbor).SelectMany(s => s.HopIps).ToList();
+
+        // Where this ISP hands traffic to transit: the nearest transit cluster's median RTT.
+        // Transit hops only - an on-net CDN cache would pass for an egress it is not.
+        var transitMedians = transitSeries
+            .Select(s => SeriesStats.Median(s.Samples.Where(x => x.RttAvgMs.HasValue).Select(x => x.RttAvgMs!.Value).ToList()))
+            .Where(m => m.HasValue)
+            .Select(m => m!.Value)
+            .ToList();
+        double? egressRtt = transitMedians.Count > 0 ? transitMedians.Min() : null;
+
         var grades = new List<IspAsnHealth>();
         foreach (var asnGroup in ispHopSeries.GroupBy(s => s.AsnNumber))
         {
@@ -2042,19 +2132,29 @@ public class IspHealthScorer
             foreach (var hop in hops)
             {
                 var measured = ScoringJitterOf(hop.Samples);
+                // The L2 neighbor is on no trace, so no witness can list it as an ancestor. It is
+                // crossed by any witness proven to leave through this WAN's ISP, and by every
+                // other ISP hop on this WAN.
+                bool Crosses(List<string> ancestors) =>
+                    RoutesThrough(ancestors, hop.HopIps)
+                    || (hop.IsL2Neighbor && RoutesThrough(ancestors, tracedIspHopIps));
+                bool SiblingCrosses(AsnSeries sibling) =>
+                    hop.IsL2Neighbor
+                        ? !sibling.IsL2Neighbor
+                        : hopOrderKnown && RoutesThrough(sibling.AncestorIps, hop.HopIps);
+
                 // Transit is always downstream of the ISP: with ancestor data we require a
                 // proven routes-through (this hop is in the transit's ancestor set), without
                 // it the gate is open. ISP siblings are strict either way - a sibling absolves
                 // only a hop in its ancestor set, never on faith.
                 var witnesses = transitWitnesses
-                    .Where(w => !hopOrderKnown || RoutesThrough(w.Ancestors, hop.HopIps))
+                    .Where(w => !hopOrderKnown || Crosses(w.Ancestors))
                     .Select(w => w.Jitter)
                     .Concat(ispHopJitter
-                        .Where(h => hopOrderKnown && !ReferenceEquals(h.Series, hop) && h.Jitter.HasValue
-                            && RoutesThrough(h.Series.AncestorIps, hop.HopIps))
+                        .Where(h => !ReferenceEquals(h.Series, hop) && h.Jitter.HasValue && SiblingCrosses(h.Series))
                         .Select(h => h.Jitter!.Value))
                     .Concat(destinationWitnesses
-                        .Where(w => hopOrderKnown && RoutesThrough(w.AncestorIps, hop.HopIps))
+                        .Where(w => hopOrderKnown && Crosses(w.AncestorIps))
                         .Select(w => w.Jitter))
                     .ToList();
                 double? effective = measured;
@@ -2063,20 +2163,20 @@ public class IspHealthScorer
 
                 // Same routes-through gate, in absolute RTT MAD, for the hop's stability.
                 var stabWitnesses = transitMadWitnesses
-                    .Where(w => !hopOrderKnown || RoutesThrough(w.Ancestors, hop.HopIps))
+                    .Where(w => !hopOrderKnown || Crosses(w.Ancestors))
                     .Select(w => w.Mad)
                     .Concat(ispHopMad
-                        .Where(h => hopOrderKnown && !ReferenceEquals(h.Series, hop) && h.Mad.HasValue
-                            && RoutesThrough(h.Series.AncestorIps, hop.HopIps))
+                        .Where(h => !ReferenceEquals(h.Series, hop) && h.Mad.HasValue && SiblingCrosses(h.Series))
                         .Select(h => h.Mad!.Value))
                     .Concat(destinationMadWitnesses
-                        .Where(w => hopOrderKnown && RoutesThrough(w.AncestorIps, hop.HopIps))
+                        .Where(w => hopOrderKnown && Crosses(w.AncestorIps))
                         .Select(w => w.Mad))
                     .ToList();
                 double? stabOverride = stabWitnesses.Count > 0 ? stabWitnesses.Min() : (double?)null;
 
                 var grade = GradeAsn(hop, congestionEvents, jitterFloorMs, accessBaselineRtt, internetMedianDeltaMs,
-                    intraAsnFloorRttMs: intraFloor, jitterOverrideMs: effective, stabilityMadOverrideMs: stabOverride);
+                    intraAsnFloorRttMs: intraFloor, jitterOverrideMs: effective, stabilityMadOverrideMs: stabOverride,
+                    egressRttMs: egressRtt);
                 // Log the graded effective (post sub-0.05 ms assimilation snap in GradeAsn), not the
                 // raw witness min, so the log matches what the hop is actually scored on. Stability is
                 // logged alongside jitter: its own measured RTT MAD, the witness-floor it was absolved
@@ -2177,6 +2277,21 @@ public class IspHealthScorer
     /// real deficit, not noise. Combined with "off the traced path" to avoid nagging on clean hops.
     /// </summary>
     private const int DisableSuggestMaxJitterScore = 70;
+
+    /// <summary>The access floor's RTT and jitter, read as the hop rows read theirs; null below two access hops.</summary>
+    private AccessFloorHealth? BuildAccessFloorHealth(IspHealthInputs inputs)
+    {
+        var hops = inputs.AccessHopSeries.Count(s => s.Any(x => x.RttAvgMs.HasValue));
+        if (hops < AccessFloor.MinTargets) return null;
+        var rtts = inputs.FirstHopSeries.Where(s => s.RttAvgMs.HasValue).Select(s => s.RttAvgMs!.Value).ToList();
+        var jitters = inputs.FirstHopSeries.Where(s => s.JitterMs.HasValue).Select(s => s.JitterMs!.Value).ToList();
+        return new AccessFloorHealth
+        {
+            RttMs = SeriesStats.WinsorizedMean(rtts, _options.RttWinsorPercentile),
+            JitterMs = SeriesStats.Percentile(jitters, _options.AsnJitterScoringPercentile),
+            HopCount = hops
+        };
+    }
 
     private IspTargetHealth BuildIspTargetHealth(AsnSeries series, string? firstHopTargetId, List<IspAsnHealth> hopGrades, double winsorPercentile, IReadOnlySet<string> notTracedTargetIds, IReadOnlyDictionary<string, string> targetAddresses)
     {
@@ -2298,6 +2413,63 @@ public class IspHealthScorer
                 : (int)Math.Round(scored.Average(a => a.OverallScore!.Value));
         }
         return new IspScoreDimension { Name = name, Score = score, Weight = weight, Factors = factors };
+    }
+
+    /// <summary>
+    /// Path congestion's impact on one episode, 0..1 per minute: the share of your destination
+    /// networks it reached, how deep it went, and how heavily the line is used at that hour.
+    /// </summary>
+    internal double PathCongestionSeverity(PathCongestionEpisode e)
+    {
+        var breadth = e.DestinationAsns > 0 ? Math.Clamp((double)e.DegradedAsns / e.DestinationAsns, 0, 1) : 1.0;
+        var depth = Math.Clamp(Math.Max(
+            e.PeakLossPct / _options.PathCongestionFullLossPct,
+            e.RttRiseMs / _options.PathCongestionFullRttRiseMs), 0, 1);
+        return breadth * depth * e.UsageWeight;
+    }
+
+    /// <summary>
+    /// Takes path congestion off Transit Health, the way outages come off the overall score: the
+    /// percent of the window the Internet was congested (minutes x severity) plus a daily recurrence
+    /// rate. Both are rates, so a nightly pattern costs the same on a day's report as on a week's.
+    /// A deduction rather than an entry in the dimension's average, which would dilute it away.
+    /// </summary>
+    private IspScoreDimension ApplyPathCongestion(IspHealthInputs inputs, IspScoreDimension transit)
+    {
+        if (inputs.PathCongestion.Count == 0 || transit.Score is not int score) return transit;
+        var windowMinutes = (inputs.WindowEnd - inputs.WindowStart).TotalMinutes;
+        if (windowMinutes <= 0) return transit;
+
+        double InWindowMinutes(PathCongestionEpisode e)
+        {
+            var start = e.Start > inputs.WindowStart ? e.Start : inputs.WindowStart;
+            var end = e.End < inputs.WindowEnd ? e.End : inputs.WindowEnd;
+            return end > start ? (end - start).TotalMinutes : 0.0;
+        }
+        var effectiveMinutes = inputs.PathCongestion.Sum(e => InWindowMinutes(e) * PathCongestionSeverity(e));
+        var share = 100.0 * effectiveMinutes / windowMinutes;
+        // Recurrence starts at the second episode, as for outages: one episode is an incident, and
+        // its cost belongs to the share term alone.
+        var severities = inputs.PathCongestion.Select(PathCongestionSeverity).ToList();
+        var perDay = (severities.Sum() - severities.Max()) / (windowMinutes / 1440.0);
+        var penalty = ScoreCurve.Interpolate(share, _options.PathCongestionShareCurve)
+            + ScoreCurve.Interpolate(perDay, _options.PathCongestionRateCurve);
+        var adjusted = (int)Math.Max(0, Math.Round(score - penalty));
+        _logger?.LogDebug(
+            "ISP Health: path congestion {Penalty} pts off Transit Health ({Share}% of window over {N} episode(s), {Rate}/day) ({Before} -> {After})",
+            penalty.ToString("0.#", CultureInfo.InvariantCulture), share.ToString("0.##", CultureInfo.InvariantCulture),
+            inputs.PathCongestion.Count, perDay.ToString("0.##", CultureInfo.InvariantCulture), score, adjusted);
+        return new IspScoreDimension { Name = transit.Name, Score = adjusted, Weight = transit.Weight, Factors = transit.Factors };
+    }
+
+    /// <summary>Splits the overall points path congestion cost across its episodes by impact, so each row shows its own.</summary>
+    private void AttributePathCongestion(List<PathCongestionEpisode> episodes, int overallPoints)
+    {
+        var total = episodes.Sum(e => (e.End - e.Start).TotalMinutes * PathCongestionSeverity(e));
+        foreach (var e in episodes)
+            e.ScorePenaltyPoints = total > 0 && overallPoints > 0
+                ? (int)Math.Round(overallPoints * (e.End - e.Start).TotalMinutes * PathCongestionSeverity(e) / total)
+                : 0;
     }
 
     private int CombineDimensions(params IspScoreDimension[] dimensions)

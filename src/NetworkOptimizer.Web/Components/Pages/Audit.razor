@@ -7,6 +7,7 @@
 @using NetworkOptimizer.Web.Components.Shared
 @using AuditSeverity = NetworkOptimizer.Audit.Models.AuditSeverity
 @inject AuditService AuditService
+@inject NetworkOptimizer.Web.Services.ChangeControl.IChangeControlService ChangeControl
 @inject IAuditScanService AuditScan
 @inject UniFiConnectionService ConnectionService
 @inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
@@ -19,10 +20,12 @@
 @inject Microsoft.AspNetCore.Components.Authorization.AuthenticationStateProvider AuthState
 @implements IDisposable
 @rendermode InteractiveServer
+@inject IDisplayTimeZone DisplayTime
 
 <PageTitle>Security Audit - Network Optimizer</PageTitle>
 
 <div class="page-header">
+    <PageBackButton />
     <h1>Security Audit</h1>
     <p class="page-description">Comprehensive network security analysis</p>
 </div>
@@ -33,7 +36,7 @@
 {
     <div class="connection-banner @(!string.IsNullOrEmpty(ConnectionService.LastError) ? "connection-error" : "")">
         <div class="banner-content">
-            <span class="banner-icon">!</span>
+            <span class="banner-icon"><GatewayIcon /></span>
             <div class="banner-text">
                 @if (!string.IsNullOrEmpty(ConnectionService.LastError))
                 {
@@ -76,7 +79,7 @@
                 }
                 else if (hasResults)
                 {
-                    <a href="/api/reports/latest/pdf" class="btn btn-secondary" download>
+                    <a href="@LatestPdfUrl" class="btn btn-secondary" download>
                         Download PDF
                     </a>
                 }
@@ -142,6 +145,7 @@
                 <div class="results-summary">
                     <div class="summary-score">
                         <div class="score-circle score-@scoreClass">
+                            <ScoreRing Score="@securityScore" />
                             <span class="score-value">@securityScore</span>
                             <span class="score-max">/100</span>
                         </div>
@@ -292,12 +296,30 @@
                                                     </span>
                                                 </span>
                                             }
+                                            @if (ZoneFixTypes.Contains(issue.Type))
+                                            {
+                                                <SiteOperatorOnly><a class="btn btn-sm btn-primary issue-action" title="Review a Set Up Zones plan for this network isolation finding" href="@SiteContextService.WithSiteParam("/change-control/migrate?task=zones", SiteContext.Slug)" @onclick:stopPropagation="true">Fix with zones</a></SiteOperatorOnly>
+                                            }
+                                            @if (NetworkOptimizer.Web.Services.ChangeControl.DnsFixes.Types.Contains(issue.Type))
+                                            {
+                                                <SiteOperatorOnly><button class="btn btn-sm btn-primary issue-action" disabled="@(_fixing != null)" @onclick="() => FixForMeAsync(issue.Type)" @onclick:stopPropagation="true">
+                                                    @if (_fixing == issue.Type)
+                                                    {
+                                                        <span class="spinner spinner-sm"></span>
+                                                    }
+                                                    Fix it for me
+                                                </button></SiteOperatorOnly>
+                                            }
                                             <SiteAdminOnly><button class="btn btn-sm btn-ghost issue-action" @onclick="() => DismissIssue(issue)" @onclick:stopPropagation="true" title="Hide this issue - still scored">
                                                 Acknowledge
                                             </button></SiteAdminOnly>
                                         </div>
                                         <div class="issue-title">@issue.Title</div>
                                         <div class="issue-description">@FormatIssueText(issue.Description)</div>
+                                        @if (_fixError is { } fixError && fixError.Type == issue.Type)
+                                        {
+                                            <div class="alert alert-danger issue-fix-error">@fixError.Message</div>
+                                        }
 
                                         @if (!string.IsNullOrEmpty(issue.DeviceName) || !string.IsNullOrEmpty(issue.PortName))
                                         {
@@ -338,6 +360,10 @@
                                         {
                                             <div class="issue-recommendation">
                                                 <strong>Recommendation:</strong> @FormatIssueText(issue.Recommendation)
+                                                @if (!string.IsNullOrEmpty(issue.ActionHref))
+                                                {
+                                                    <a class="btn btn-sm btn-primary issue-action-link" href="@issue.ActionHref">@issue.ActionLabel</a>
+                                                }
                                             </div>
                                         }
                                     </div>
@@ -462,6 +488,10 @@
                                             {
                                                 <div class="issue-type-recommendation">
                                                     <strong>Recommendation:</strong> @FormatIssueText(firstIssue.Recommendation)
+                                                @if (!string.IsNullOrEmpty(firstIssue.ActionHref))
+                                                {
+                                                    <a class="btn btn-sm btn-primary issue-action-link" href="@firstIssue.ActionHref" @onclick:stopPropagation="true">@firstIssue.ActionLabel</a>
+                                                }
                                                 </div>
                                             }
                                         </div>
@@ -607,8 +637,8 @@
                             </tr>
                             <tr>
                                 <td>DoH Bypass Prevention</td>
-                                <td class="@(lastResult.DnsSecurity.DohBypassBlocked ? "status-success" : "status-warning")">
-                                    @(lastResult.DnsSecurity.DohBypassBlocked ? "Blocked" : "Open")
+                                <td class="@(lastResult.DnsSecurity.DohBypassBlocked && lastResult.DnsSecurity.DohProvidesFullCoverage ? "status-success" : "status-warning")">
+                                    @(lastResult.DnsSecurity.DohBypassBlocked ? (lastResult.DnsSecurity.DohProvidesFullCoverage ? "Blocked" : "Partially Blocked") : "Open")
                                 </td>
                                 <td>@GetDohBypassDetails()</td>
                             </tr>
@@ -893,6 +923,42 @@
 @code {
     private bool IsLicenseRestricted => !LicenseState.IsSiteOperational(SiteContext.Slug);
 
+    // Isolation findings Change Control's Set Up Zones can fix (spec: "Fix with zones").
+    private static readonly HashSet<string> ZoneFixTypes =
+    [
+        NetworkOptimizer.Audit.IssueTypes.IotNetworkNotIsolated, NetworkOptimizer.Audit.IssueTypes.MediaNetworkNotIsolated,
+        NetworkOptimizer.Audit.IssueTypes.SecurityNetworkNotIsolated, NetworkOptimizer.Audit.IssueTypes.MgmtNetworkNotIsolated,
+        NetworkOptimizer.Audit.IssueTypes.MissingIsolation,
+    ];
+
+    private string? _fixing;
+    private (string Type, string Message)? _fixError;
+
+    // Fix it for me: builds the plan from live config and opens Review Plan; nothing is written until apply.
+    private async Task FixForMeAsync(string issueType)
+    {
+        _fixing = issueType;
+        _fixError = null;
+        try
+        {
+            var planId = await ChangeControl.BuildAuditFixPlanAsync(issueType);
+            NavigationManager.NavigateTo(SiteContextService.WithSiteParam($"/change-control/plans/{planId}", SiteContext.Slug));
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or UnauthorizedAccessException)
+        {
+            _fixError = (issueType, ex.Message);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Fix it for me failed for {IssueType}", issueType);
+            _fixError = (issueType, "The plan could not be built. Check the UniFi Console connection and try again.");
+        }
+        finally
+        {
+            _fixing = null;
+        }
+    }
+
     private static string FormatCoveringRules(IReadOnlyList<CoveringRuleInfo> rules)
     {
         return string.Join("; ", rules.Select(r =>
@@ -941,6 +1007,7 @@
         ("IoT", "IoT"),
         ("Security", "Security"),
         ("Guest", "Guest"),
+        ("ManagementAccess", "Management Access"),
         ("Management", "Management"),
         ("Printer", "Printer"),
         ("Dmz", "DMZ"),
@@ -990,7 +1057,7 @@
             // Load dismissed issues
             dismissedIssues = await AuditService.GetDismissedIssuesAsync();
 
-            lastAuditTime = previousResult.CompletedAt.ToLocalTime().ToString("MMM dd, yyyy HH:mm");
+            lastAuditTime = previousResult.CompletedAt.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DateTime, DisplayFormat.Culture);
             hasResults = true;
         }
 
@@ -1070,7 +1137,7 @@
             // Load dismissed issues
             dismissedIssues = await AuditService.GetDismissedIssuesAsync();
 
-            lastAuditTime = DateTime.Now.ToString("MMM dd, yyyy HH:mm");
+            lastAuditTime = DisplayTime.Now.ToString(DisplayTime.Format.DateTime, DisplayFormat.Culture);
             hasResults = true;
             _purposeOverridesPending = false;
         }
@@ -1083,13 +1150,16 @@
 
     private string? exportError;
 
+    // Threat table row counts come from Settings - Security Audit on the server.
+    private const string LatestPdfUrl = "/api/reports/latest/pdf";
+
     private async Task DownloadLatestPdf()
     {
         try
         {
             // Use JS fetch + blob to force download - Safari PWA opens PDFs inline with <a download>
             await JSRuntime.InvokeVoidAsync("eval", @"
-                fetch('/api/reports/latest/pdf')
+                fetch('" + LatestPdfUrl + @"')
                     .then(r => r.blob())
                     .then(b => {
                         const a = document.createElement('a');
@@ -1139,7 +1209,8 @@
             var reportData = new NetworkOptimizer.Reports.ReportData
             {
                 ClientName = networkName,
-                GeneratedAt = DateTime.Now,
+                GeneratedAt = DisplayTime.Now,
+                TimeZoneLabel = DisplayTime.Abbreviation(DateTime.UtcNow),
                 SecurityScore = new NetworkOptimizer.Reports.SecurityScore
                 {
                     Rating = securityScore >= 90 ? NetworkOptimizer.Reports.SecurityRating.Excellent
@@ -1268,6 +1339,7 @@
                     DoqBlocked = lastResult.DnsSecurity.DoqBlocked,
                     DoqProvidesFullCoverage = lastResult.DnsSecurity.DoqProvidesFullCoverage,
                     DohBypassBlocked = lastResult.DnsSecurity.DohBypassBlocked,
+                    DohProvidesFullCoverage = lastResult.DnsSecurity.DohProvidesFullCoverage,
                     FullyProtected = lastResult.DnsSecurity.FullyProtected,
                     WanDnsServers = lastResult.DnsSecurity.WanDnsServers.ToList(),
                     WanDnsPtrResults = lastResult.DnsSecurity.WanDnsPtrResults.ToList(),
@@ -1365,7 +1437,7 @@
             Logger.LogInformation("PDF generated: {Size} bytes", pdfBytes.Length);
 
             // Download file via JS interop
-            var fileName = $"NetworkAudit_{DateTime.Now:yyyyMMdd_HHmmss}.pdf";
+            var fileName = $"NetworkAudit_{DisplayTime.Now:yyyyMMdd_HHmmss}.pdf";
             var base64 = Convert.ToBase64String(pdfBytes);
             Logger.LogInformation("Calling JS downloadFile for {FileName}", fileName);
             await JSRuntime.InvokeVoidAsync("downloadFile", fileName, "application/pdf", base64);
@@ -1798,6 +1870,7 @@
         if (lastResult?.DnsSecurity == null) return "N/A";
         var dns = lastResult.DnsSecurity;
         if (!dns.DohBypassBlocked) return "Devices can use external DoH";
+        if (!dns.DohProvidesFullCoverage) return "Public DoH providers partially blocked";
         if (dns.Doh3Blocked) return "Public DoH + DoH3 providers blocked";
         return "Public DoH providers blocked";
     }

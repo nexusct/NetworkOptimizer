@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Globalization;
 using NetworkOptimizer.Alerts.Events;
+using NetworkOptimizer.Alerts.Models;
 using NetworkOptimizer.Core.Enums;
 using NetworkOptimizer.Monitoring.Models;
 
@@ -35,10 +36,12 @@ namespace NetworkOptimizer.Web.Services.Monitoring;
 /// </para>
 ///
 /// <para>
-/// State is in memory only, so a restart re-arms every rule: an already-open condition raises its
-/// alert once more, and the windowed rules (alignment, outage burst) stay quiet until they have
-/// gathered enough samples again. That is the accepted cost of never persisting a verdict that
-/// could go stale against a dish that has since recovered.
+/// State is in memory only. At start-up the alerts still open, and those resolved by hand with no
+/// recovery after them, are read back (<see cref="OpenAlertSeed"/>) and each rule starts open, so a
+/// condition spanning a restart keeps its one alert and one that cleared meanwhile is closed by the
+/// rule's own clear test. The
+/// windowed rules still need their samples again: alignment stays quiet until the window refills,
+/// and a seeded outage burst is held open for a full window rather than closed on an empty one.
 /// </para>
 /// </summary>
 public class StarlinkAlertEvaluator
@@ -176,7 +179,8 @@ public class StarlinkAlertEvaluator
     /// Only the first is measured; the other four are judged on what the code means, since nothing
     /// has been observed raising them. Everything else the dish reports is passed through verbatim:
     /// these are SpaceX's own judgment about its own hardware, and translating them would only lose
-    /// what a search for the exact string turns up.
+    /// what a search for the exact string turns up. <c>lower_signal_than_predicted</c> is not
+    /// benign but counts only when <see cref="StarlinkHealthThresholds.IsLowSignalCorroborated"/>.
     ///
     /// <para>
     /// The reference dish is fixed-tilt, motorless and permanently rate restricted, and raised
@@ -201,6 +205,7 @@ public class StarlinkAlertEvaluator
     private readonly TimeProvider _time;
     private readonly ConcurrentDictionary<int, DishState> _states = new();
     private readonly string _siteSuffix;
+    private readonly OpenAlertSeed _openAtStart;
 
     /// <param name="siteSlug">
     /// Site this instance evaluates for (one instance per site, owned by
@@ -209,10 +214,16 @@ public class StarlinkAlertEvaluator
     /// alert titles.
     /// </param>
     /// <param name="timeProvider">Injected in tests so the sustain windows can be driven without waiting.</param>
+    /// <param name="scopeFactory">Reads dish alerts still open before a restart, so each is closed when it clears.</param>
     public StarlinkAlertEvaluator(IAlertEventBus eventBus, ILogger<StarlinkAlertEvaluator> logger,
         string siteSlug = SiteManagementService.DefaultSiteSlug,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IServiceScopeFactory? scopeFactory = null)
     {
+        _openAtStart = new OpenAlertSeed(scopeFactory,
+            string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug,
+            [DishAlertEvent, ObstructedEvent, AlignmentDriftEvent, EthSpeedDegradedEvent, OutageBurstEvent, ServiceRestrictedEvent],
+            SeedSubject, logger, includeHandResolved: true);
         _eventBus = eventBus;
         _logger = logger;
         _time = timeProvider ?? TimeProvider.System;
@@ -255,8 +266,9 @@ public class StarlinkAlertEvaluator
         string? wanLabel = null,
         CancellationToken ct = default)
     {
-        var state = _states.GetOrAdd(starlinkId, _ => new DishState());
         var now = _time.GetUtcNow().UtcDateTime;
+        var open = await _openAtStart.OpenAsync();
+        var state = _states.GetOrAdd(starlinkId, id => NewDishState(open, id, now));
         var subject = new DishSubject(starlinkId, dishName, wanLabel);
 
         // One evaluation per dish at a time. The timer poll is single-flighted against itself, but
@@ -284,6 +296,57 @@ public class StarlinkAlertEvaluator
         {
             state.Gate.Release();
         }
+    }
+
+    /// <summary>
+    /// A dish's alerts pair by dish and by the type a recovery names, since one recovery type
+    /// closes six kinds of alert.
+    /// </summary>
+    private static string? SeedSubject(NetworkOptimizer.Alerts.Models.AlertHistoryEntry alert)
+    {
+        if (alert.DeviceId is not { } device || !device.StartsWith(DeviceIdPrefix, StringComparison.Ordinal)) return null;
+        var type = alert.EventType == RecoveredEvent ? OpenAlertSeed.Context(alert, RecoveredTypeKey) : alert.EventType;
+        return type == null ? null : $"{device}|{type}";
+    }
+
+    /// <summary>A dish first seen by this process, with every rule whose alert was open at start-up starting open.</summary>
+    private static DishState NewDishState(OpenAlerts open, int starlinkId, DateTime now)
+    {
+        var state = new DishState();
+        var device = $"{DeviceIdPrefix}{starlinkId}";
+        AlertHistoryEntry? Open(string type) => open.Take(type, $"{device}|{type}");
+
+        if (Open(DishAlertEvent) is { } fault)
+        {
+            var signature = new HashSet<string>(
+                (OpenAlertSeed.Context(fault, "dish_alerts") ?? "").Split(", ", StringSplitOptions.RemoveEmptyEntries),
+                StringComparer.OrdinalIgnoreCase);
+            var disablement = OpenAlertSeed.Context(fault, "disablement_code");
+            if (IsDisabled(disablement)) signature.Add($"disablement:{disablement}");
+            if (OpenAlertSeed.Context(fault, "self_test_regressed") == "true")
+            {
+                // It regressed, so it had passed: without this a still-failing self-test reads as cleared.
+                state.SelfTestHasPassed = true;
+                signature.Add("hardware_self_test:failed");
+            }
+            if (signature.Count == 0) signature.Add("unknown");
+            state.OpenDishAlertCodes = signature;
+            state.OpenDishAlertSeverity = fault.Severity;
+        }
+        if (Open(ObstructedEvent) is { } obstructed)
+        {
+            state.Obstruction.MarkOpen();
+            state.ObstructionCritical = obstructed.Severity == AlertSeverity.Critical;
+        }
+        if (Open(AlignmentDriftEvent) != null) state.Alignment.MarkOpen();
+        if (Open(EthSpeedDegradedEvent) != null) state.EthSpeed.MarkOpen();
+        if (Open(OutageBurstEvent) != null)
+        {
+            state.OutageBurstOpen = true;
+            state.OutageBurstHeldUntil = now + OutageWindow;
+        }
+        if (Open(ServiceRestrictedEvent) != null) state.WasRestricted = true;
+        return state;
     }
 
     /// <summary>
@@ -397,10 +460,15 @@ public class StarlinkAlertEvaluator
         // The dish's codes verbatim - they are SpaceX's own vocabulary for its own hardware, and
         // paraphrasing them would only lose what a search for the exact string turns up.
         var codes = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        var lowSignalCorroborated = StarlinkHealthThresholds.IsLowSignalCorroborated(
+            stats.FractionObstructed, stats.IsSnrPersistentlyLow);
         foreach (var code in stats.ActiveAlerts)
         {
-            if (!string.IsNullOrWhiteSpace(code) && !BenignDishAlerts.Contains(code))
-                codes.Add(code);
+            if (string.IsNullOrWhiteSpace(code) || BenignDishAlerts.Contains(code)) continue;
+            if (!lowSignalCorroborated
+                && string.Equals(code, StarlinkHealthThresholds.LowerSignalThanPredictedAlert, StringComparison.OrdinalIgnoreCase))
+                continue;
+            codes.Add(code);
         }
 
         // The signature the open alert was raised for. It carries the disablement code and the
@@ -466,6 +534,8 @@ public class StarlinkAlertEvaluator
                 ["dish_alerts"] = codeList,
                 ["disablement_code"] = disablement ?? "",
                 ["hardware_self_test"] = stats.HardwareSelfTest ?? "",
+                // Read back at start-up: a regression is the only self-test state that raises this.
+                ["self_test_regressed"] = state.SelfTestRegressed ? "true" : "false",
             })
         }, ct);
     }
@@ -718,7 +788,7 @@ public class StarlinkAlertEvaluator
 
         if (state.OutageBurstOpen)
         {
-            if (total >= OutageClearSecondsPerDay) return;
+            if (total >= OutageClearSecondsPerDay || now < state.OutageBurstHeldUntil) return;
             state.OutageBurstOpen = false;
             await PublishRecovered(subject, OutageBurstEvent, "outages",
                 "The dish is back under a normal amount of downtime for the day.", ct);
@@ -943,53 +1013,6 @@ public class StarlinkAlertEvaluator
         }
     }
 
-    private enum GateTransition { None, Opened, Closed }
-
-    /// <summary>
-    /// Two-sided sustain. A condition must hold for the window to open an alert, and its clear
-    /// condition must hold just as long to close one, so a value hovering at the bar produces one
-    /// alert and one recovery rather than a stream of both.
-    /// </summary>
-    private sealed class SustainGate
-    {
-        private DateTime? _raiseSince;
-        private DateTime? _clearSince;
-
-        public bool Open { get; private set; }
-
-        public GateTransition Observe(bool raise, bool clear, DateTime now, TimeSpan window)
-        {
-            _raiseSince = raise ? _raiseSince ?? now : null;
-            _clearSince = clear ? _clearSince ?? now : null;
-
-            if (!Open && _raiseSince is { } raiseSince && now - raiseSince >= window)
-            {
-                Open = true;
-                _clearSince = null;
-                return GateTransition.Opened;
-            }
-
-            if (Open && _clearSince is { } clearSince && now - clearSince >= window)
-            {
-                Open = false;
-                _raiseSince = null;
-                return GateTransition.Closed;
-            }
-
-            return GateTransition.None;
-        }
-
-        /// <summary>
-        /// Discards both pending runs without changing whether the alert is open, for a poll whose
-        /// reading says nothing either way.
-        /// </summary>
-        public void Stall()
-        {
-            _raiseSince = null;
-            _clearSince = null;
-        }
-    }
-
     private sealed class DishState
     {
         /// <summary>
@@ -1019,6 +1042,9 @@ public class StarlinkAlertEvaluator
 
         public readonly Queue<(DateTime At, double Seconds)> OutageSamples = new();
         public bool OutageBurstOpen;
+
+        /// <summary>A burst open before a restart stays open until the emptied window has refilled.</summary>
+        public DateTime? OutageBurstHeldUntil;
 
         /// <summary>Null until the first poll: the first reading only establishes what normal looks like.</summary>
         public bool? WasRestricted;

@@ -140,7 +140,7 @@ public static class RolloutReportBuilder
             var appOutcome = document.NetworkAppUpdate.Outcome switch
             {
                 "updated" => RolloutOutcomes.Upgraded,
-                "stuck" => RolloutOutcomes.Failed,
+                "stuck" or "refused" => RolloutOutcomes.Failed,
                 _ => RolloutOutcomes.Skipped,
             };
             report.Rows.Add(new RolloutReportRow
@@ -156,6 +156,9 @@ public static class RolloutReportBuilder
                 FromVersion = document.NetworkAppUpdate.FromVersion,
                 ToVersion = document.NetworkAppUpdate.TargetVersion,
                 Outcome = appOutcome,
+                Issue = document.NetworkAppUpdate.Outcome == "refused"
+                    ? FirmwareRolloutOrchestrator.NetworkAppRefusedIssue(document)
+                    : null,
             });
         }
 
@@ -188,7 +191,8 @@ public static class RolloutReportBuilder
             FirmwareRolloutStepState.LitmusPassed => RolloutOutcomes.Upgraded,
             FirmwareRolloutStepState.RegressionFlagged => RolloutOutcomes.RegressionFlagged,
             FirmwareRolloutStepState.Failed => RolloutOutcomes.Failed,
-            FirmwareRolloutStepState.SkippedExcluded or FirmwareRolloutStepState.AbortedSku => RolloutOutcomes.Skipped,
+            FirmwareRolloutStepState.SkippedExcluded or FirmwareRolloutStepState.AbortedSku
+                or FirmwareRolloutStepState.AbortedByAdmin => RolloutOutcomes.Skipped,
             FirmwareRolloutStepState.Held or FirmwareRolloutStepState.Pending => RolloutOutcomes.Held,
             _ => RolloutOutcomes.InProgress,
         };
@@ -250,7 +254,7 @@ public static class RolloutReportBuilder
                     $"The Console accepted UniFi OS {document.UniFiOsUpdate.TargetVersion ?? "its newest build"} but is still offering it.");
                 break;
             case "refused":
-                report.Issues.Add("The Console would not take its UniFi OS update.");
+                report.Issues.Add(FirmwareRolloutOrchestrator.UniFiOsRefusedSummary(document));
                 break;
         }
     }

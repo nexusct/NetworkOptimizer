@@ -111,10 +111,9 @@ public class IspHealthOptions
     public double LoadedLatencySpeedTestMinPlanFraction { get; set; } = 0.7;
 
     /// <summary>
-    /// How far from a load episode a WAN speed test may sit and still be taken as the measurement
-    /// OF that episode. Only wide enough to bridge the stored instant of a test and the span of
-    /// the load it caused - a test runs for tens of seconds, so anything past that is a different
-    /// event and must not speak for this one.
+    /// How far either side of a WAN speed test's stored instant the probes are read to corroborate
+    /// it. Only wide enough to bridge that instant and the span of the load the test caused - a
+    /// test runs for tens of seconds, so probes past that measured a different event.
     /// </summary>
     public double LoadedLatencySpeedTestMatchSeconds { get; set; } = 30;
 
@@ -269,6 +268,15 @@ public class IspHealthOptions
 
     /// <summary>Load episodes that let a single lossy probe stand: several dilute it, one does not.</summary>
     public int LoadedLossMinEpisodes { get; set; } = 2;
+
+    /// <summary>
+    /// Pings in one monitoring loss sample: the unit a WAN speed test's loss probes are weighed in,
+    /// so a 400-probe test counts as 80 samples rather than one.
+    /// </summary>
+    public int LossSamplePings { get; set; } = 5;
+
+    /// <summary>Probes a WAN speed test phase needs before its loss joins Packet Loss or Loaded Loss.</summary>
+    public int SpeedTestLossMinProbes { get; set; } = 100;
 
     /// <summary>
     /// Nominal seconds a loss probe spends measuring - the standard burst is five pings a second
@@ -436,6 +444,111 @@ public class IspHealthOptions
     /// </summary>
     public double CongestionLoadCoincidenceFraction { get; set; } = 0.5;
 
+    // ---- Path Localization (reactive traceroutes on a path-specific degradation) ----
+    // Provisional: every number below comes from one case (two evenings of AWS us-east and Chicago
+    // speedtest degradation) and stands until a replay of a wider set of events confirms or moves it.
+
+    /// <summary>Length of one degradation evaluation window, in minutes.</summary>
+    public int PathDegradationWindowMinutes { get; set; } = 5;
+
+    /// <summary>Consecutive degraded windows that make a target degraded (15 min sustained at 5-min windows),
+    /// and consecutive clean windows that clear it.</summary>
+    public int PathDegradationConsecutiveWindows { get; set; } = 3;
+
+    /// <summary>Trailing hours a target's own baseline (median RTT, mean loss) is taken over.</summary>
+    public int PathBaselineHours { get; set; } = 24;
+
+    /// <summary>Closed windows a baseline needs before the target is judged at all (one hour at 5-min windows).</summary>
+    public int PathBaselineMinWindows { get; set; } = 12;
+
+    /// <summary>Window loss at or above this percentage, and at least <see cref="PathLossDeltaPct"/> over baseline, is a loss signal.</summary>
+    public double PathLossMinPct { get; set; } = 2.0;
+
+    /// <summary>Percentage points of loss above the target's baseline a window must reach.</summary>
+    public double PathLossDeltaPct { get; set; } = 2.0;
+
+    /// <summary>Probes a window needs before its loss is read: a 5-min window of 5-ping bursts every 15 s.</summary>
+    public int PathLossMinProbes { get; set; } = 20;
+
+    /// <summary>Window median RTT this many ms above baseline is an RTT signal (or <see cref="PathRttDeltaFraction"/>, whichever is larger).</summary>
+    public double PathRttMinDeltaMs { get; set; } = 8.0;
+
+    /// <summary>Fraction of baseline RTT a window's median must rise by, when that exceeds <see cref="PathRttMinDeltaMs"/>.</summary>
+    public double PathRttDeltaFraction { get; set; } = 0.20;
+
+    /// <summary>
+    /// An RTT-only degradation whose 95th-percentile window jitter stays under this multiple of baseline (or
+    /// <see cref="PathStepJitterMinDeltaMs"/> over it, whichever is larger) is a route change: queues widen jitter.
+    /// Matches <see cref="CongestionJitterFactor"/>, so a step is jitter the congestion detector would not call elevated.
+    /// </summary>
+    public double PathStepJitterFactor { get; set; } = 2.0;
+
+    /// <summary>Jitter rise in ms a route change may carry whatever its ratio, as <see cref="CongestionJitterMinDeltaMs"/>
+    /// does for congestion, so a sub-ms baseline is not tripped by noise.</summary>
+    public double PathStepJitterMinDeltaMs { get; set; } = 0.8;
+
+    /// <summary>A sample older than this says nothing about a target's current state.</summary>
+    public int PathTargetStaleMinutes { get; set; } = 10;
+
+    /// <summary>Seconds between path rounds while an episode's targets stay degraded.</summary>
+    public int PathRoundIntervalSeconds { get; set; } = 60;
+
+    /// <summary>Path rounds per degraded target per episode.</summary>
+    public int PathMaxRoundsPerTarget { get; set; } = 10;
+
+    /// <summary>Degraded targets traced per episode, worst by loss then RTT rise.</summary>
+    public int PathMaxTracedTargets { get; set; } = 4;
+
+    /// <summary>Probes per hop for every episode trace (MTR-shaped).</summary>
+    public int PathProbesPerHop { get; set; } = 5;
+
+    /// <summary>TTL ceiling for episode traces.</summary>
+    public int PathMaxHops { get; set; } = 30;
+
+    /// <summary>Minutes after an episode clears before its recovery round, the per-hop baseline.</summary>
+    public int PathRecoveryDelayMinutes { get; set; } = 15;
+
+    /// <summary>
+    /// Hours an episode may stay open. A target that never clears (a step that is the new normal)
+    /// would otherwise hold its context's only episode, and keep its own windows out of the
+    /// baseline that would let it clear, for good.
+    /// </summary>
+    public int PathMaxEpisodeHours { get; set; } = 6;
+
+    /// <summary>A traced hop's pooled loss at or above this percentage is elevated.</summary>
+    public double PathHopLossElevatedPct { get; set; } = 3.0;
+
+    /// <summary>A traced hop whose episode min RTT rose this many ms over its baseline min is elevated
+    /// (or <see cref="PathHopRttDeltaFraction"/>, whichever is larger).</summary>
+    public double PathHopRttMinDeltaMs { get; set; } = 5.0;
+
+    /// <summary>Fraction of a hop's baseline min RTT its episode min must rise by, when that exceeds <see cref="PathHopRttMinDeltaMs"/>.</summary>
+    public double PathHopRttDeltaFraction { get; set; } = 0.15;
+
+    /// <summary>
+    /// Slow destination rounds needed before a hop is judged by whether it slowed in the same rounds.
+    /// One round slow at both is coincidence; a hop slow in most of two or more is on the way.
+    /// </summary>
+    public int PathHopMinPairedRounds { get; set; } = 2;
+
+    /// <summary>
+    /// A hop's (max - median) RTT spread this many times the next responding hop's, and at least
+    /// <see cref="PathHopSlowPathMinSpreadMs"/>, reads as slow-path ICMP generation at that hop.
+    /// </summary>
+    public double PathHopSlowPathSpreadFactor { get; set; } = 3.0;
+
+    /// <summary>Floor on the spread the slow-path tell needs, so sub-ms jitter never trips it.</summary>
+    public double PathHopSlowPathMinSpreadMs { get; set; } = 10.0;
+
+    /// <summary>A return hop count this far from the forward position reads as an asymmetric return.</summary>
+    public int PathReturnAsymmetryHops { get; set; } = 3;
+
+    /// <summary>Days an Unverifiable episode must repeat (same targets, same label) on before it becomes a finding.</summary>
+    public int PathRepeatFindingDays { get; set; } = 2;
+
+    /// <summary>Days episodes are kept in the site database.</summary>
+    public int PathEpisodeRetentionDays { get; set; } = 90;
+
     /// <summary>
     /// Fraction of a hop's in-window RTT samples that must exceed its own baseline p90 (by the
     /// congestion RTT floor) for the localizer to count it as elevated when testing propagation.
@@ -467,20 +580,10 @@ public class IspHealthOptions
     /// added delay (that floor alone is loaded latency). A shared/loaded-latency event collapses to a
     /// single row only when the rise is UNIFORM: the worst path's RTT rise over its own baseline is
     /// within this factor of the median path's rise. If a few paths rose materially further than the
-    /// floor (high variance), those are localized congestion ON TOP of the load - the event stays
-    /// per-hop so the localizer surfaces them as "this hop's own capacity", not "everything slowed".
+    /// floor (high variance), those are outliers: when the access egress sat at the floor, the floor
+    /// is still Loaded Latency and only the outliers localize; otherwise the event stays per-hop.
     /// </summary>
     public double CongestionLoadedUniformityFactor { get; set; } = 2.0;
-
-    /// <summary>
-    /// Clean-control floor multiple. A parallel path counts as a CLEAN control (proof a hop's
-    /// elevation is its own capacity, not access bufferbloat) when its RTT rose no more than this
-    /// multiple of the shared floor - i.e. it only picked up the load floor, not localized congestion.
-    /// Must be tighter than <see cref="CongestionLoadedUniformityFactor"/> so the materially-worse
-    /// hops are NOT counted as clean. Uses RTT (not jitter): under load the jitter floor lifts every
-    /// path, so a jitter-inclusive "elevated" test would erase every clean control.
-    /// </summary>
-    public double CongestionCleanControlFloorFactor { get; set; } = 1.5;
 
     /// <summary>
     /// Self-inflicted access bufferbloat is a line-wide rise under load: this fraction of monitored
@@ -538,6 +641,20 @@ public class IspHealthOptions
 
     /// <summary>Absolute floor in ms for a step-change candidate delta.</summary>
     public double StepMinDeltaMs { get; set; } = 1.2;
+
+    /// <summary>
+    /// Lower absolute floor for a step that another series corroborates at the same boundary.
+    /// A routing change steps every path that crosses it, so two series moving together are
+    /// evidence a single series is not; a lone step still needs <see cref="StepMinDeltaMs"/>.
+    /// </summary>
+    public double StepCorrelatedMinDeltaMs { get; set; } = 0.8;
+
+    /// <summary>
+    /// Relative floor for a corroborated step, lowered in the same proportion as the absolute one.
+    /// Keeping the lone 6% here left a deeper hop (15-17 ms) needing ~1 ms to corroborate a 0.9 ms
+    /// shift it plainly took.
+    /// </summary>
+    public double StepCorrelatedMinRelativeChange { get; set; } = 0.04;
 
     /// <summary>Relative floor (fraction of the before-median) for a step-change candidate delta.</summary>
     public double StepMinRelativeChange { get; set; } = 0.06;
@@ -775,6 +892,32 @@ public class IspHealthOptions
     };
 
     /// <summary>
+    /// Path congestion (Path Localization episodes across two or more destination networks) as a
+    /// deduction from Transit Health, by its impact: the percent of the window your Internet was
+    /// congested, each episode's minutes weighted by breadth, depth, and usage. Points off the
+    /// dimension, not the overall score (Transit Health is a third of it).
+    /// </summary>
+    public (double DegradedPercent, double Penalty)[] PathCongestionShareCurve { get; set; } =
+    {
+        (0, 0), (0.5, 2.5), (1, 5), (3, 12.5), (10, 25), (25, 35)
+    };
+
+    /// <summary>Path congestion recurrence: breadth x depth x usage per day, as points off Transit Health.</summary>
+    public (double ImpactPerDay, double Penalty)[] PathCongestionRateCurve { get; set; } =
+    {
+        (0, 0), (0.25, 1.5), (0.5, 3), (1, 5), (3, 10)
+    };
+
+    /// <summary>Peak loss at which a path congestion episode counts at full depth.</summary>
+    public double PathCongestionFullLossPct { get; set; } = 10.0;
+
+    /// <summary>RTT rise at which a path congestion episode counts at full depth.</summary>
+    public double PathCongestionFullRttRiseMs { get; set; } = 50.0;
+
+    /// <summary>Distinct destination ASNs an episode must span to count against the ISP: one network is that network's problem.</summary>
+    public int PathCongestionMinAsns { get; set; } = 2;
+
+    /// <summary>
     /// How long a gateway loss reading stays valid as the loss floor after the sample it came from
     /// (see <see cref="GatewayLossFloor"/>). The floor reflects a physical condition - a struggling
     /// forwarding path, an overloaded switch, a bad cable - that persists across a poll or two, so
@@ -822,8 +965,18 @@ public class IspHealthOptions
     /// GPON line under full load sawtooths roughly 0.8x to 1.4x, so even its troughs clear the loaded
     /// threshold and a run requirement passes easily). Two samples is deliberately low: it is enough
     /// to reject the singleton, without demanding a transfer longer than a scheduled speed test.
+    /// A run near a recorded WAN speed test is exempt - see <see cref="SpeedTestLoadLeadSeconds"/>.
     /// </summary>
     public int MinLoadedRunSamples { get; set; } = 2;
+
+    /// <summary>
+    /// How far before a WAN speed test's stored time its load may start. A loaded run in
+    /// [test - this, test + <see cref="LoadedLatencySpeedTestMatchSeconds"/>] is never demoted as
+    /// isolated: a test phase lasts about ten seconds, so at a 7 s rate aggregate it often fills one
+    /// bucket, and the recorded test is proof the load was real rather than a counter artifact.
+    /// The stamp is taken at the END of the test, so the span reaches back further than forward.
+    /// </summary>
+    public int SpeedTestLoadLeadSeconds { get; set; } = 90;
 
     /// <summary>
     /// Multiple of the configured plan speed above which a WAN throughput sample is treated as a
@@ -979,6 +1132,14 @@ public class IspHealthOptions
     /// hammered for normal in-region distance on a geographically large access network.
     /// </summary>
     public double AccessReachInternetBlendAlpha { get; set; } = 0.40;
+
+    /// <summary>
+    /// How much of an ISP hop's distance beyond the ISP's transit egress still counts against its
+    /// reach ceiling, blended in score space: ceiling = C(egress) + beta * (C(hop) - C(egress)).
+    /// 0 charges such a hop as if it sat at the egress; 1 is the plain intra-ASN ceiling. Only a
+    /// hop past the nearest transit cluster moves, so an ISP whose far hop IS the way out is unchanged.
+    /// </summary>
+    public double AccessReachBeyondEgressBeta { get; set; } = 0.25;
 
     /// <summary>
     /// Average WAN load at which packet loss reaches its worst on shared-medium access

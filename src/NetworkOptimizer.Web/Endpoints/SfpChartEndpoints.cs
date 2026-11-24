@@ -106,6 +106,12 @@ public static class SfpChartEndpoints
             var data = await influx.QuerySfpByModulesAsync(modules, queryFrom, queryTo, ct: ct);
             // Supplemental PON-layer series (attached ONT configs); empty for modules without one.
             var ponData = await influx.QuerySfpPonByModulesAsync(modules, queryFrom, queryTo, ct: ct);
+            // The newest raw polls, for the Connection Check: it reads the latest poll on every range.
+            var now = DateTime.UtcNow;
+            var live = PonChartSeries.WindowIncludesNow(queryTo, now);
+            var latestPon = live
+                ? await influx.QuerySfpPonByModulesAsync(modules, now - PonChartSeries.LatestPollsSpan, now, TimeSpan.Zero, ct)
+                : new Dictionary<string, List<MonitoringInfluxClient.PonSeriesPoint>>();
 
             var targets = await db.MonitoringTargets.AsNoTracking()
                 .Where(t => t.TargetType == MonitoringTargetType.Fabric && t.RetiredAt == null)
@@ -152,6 +158,7 @@ public static class SfpChartEndpoints
                 return new
                 {
                     id = key,
+                    deviceMac = s.DeviceMac.Replace("-", ":").ToLowerInvariant(),
                     label,
                     category = (int)s.Category,
                     sfpPart = s.SfpPart,
@@ -163,7 +170,15 @@ public static class SfpChartEndpoints
                         temp = p.TemperatureC,
                         voltage = p.VoltageV
                     }),
-                    pon = PonChartSeries.Build(ponData.TryGetValue(key, out var ponPts) ? ponPts : null)
+                    pon = PonChartSeries.Build(ponData.TryGetValue(key, out var ponPts) ? ponPts : null),
+                    ponPath = PonChartSeries.SummarizePathLoss(ponPts),
+                    ponAvail = PonChartSeries.SummarizeAvailability(ponPts),
+                    ponMore = PonChartSeries.Insights(ponPts, new PonChartSeries.LinkReadings(
+                        RxDbm: pts.LastOrDefault()?.RxPowerDbm,
+                        TxDbm: pts.LastOrDefault()?.TxPowerDbm,
+                        PonVariant: NetworkOptimizer.Core.Helpers.NetworkFormatHelpers.PonVariantLabel(s.SfpPart, s.SfpVendor),
+                        HostLinkMbps: s.LinkSpeedMbps),
+                        latestPon.TryGetValue(key, out var latestPts) ? latestPts : null, live)
                 };
             }).ToList();
 
@@ -180,14 +195,54 @@ public static class SfpChartEndpoints
 
             var events = await BuildSfpEventsAsync(db, modulesById, artifactTimes, queryFrom, queryTo, ct);
 
-            return Results.Ok(new { modules = result, events });
+            // The host devices' own reboots, remedies, and alerts, keyed by device MAC. The chart
+            // draws them only while every module on screen sits on one device.
+            // Keyed the builder's way (no separators); Key is the module's deviceMac spelling.
+            var hostsByNormalized = sfps
+                .Select(s => s.DeviceMac.Replace("-", ":").ToLowerInvariant())
+                .Distinct()
+                .ToDictionary(DeviceHealthChartEndpoints.NormalizeMac, mac => (Key: mac, Name: nameMap.TryGetValue(mac, out var hn) ? hn : mac));
+            var deviceEvents = await DeviceHealthChartEndpoints.BuildAnnotationsAsync(
+                influx, db, hostsByNormalized, queryFrom, queryTo, ct, HostEventTypesMarkedHere);
+
+            return Results.Ok(new { modules = result, events, deviceEvents });
+        });
+
+        // The PON's downstream load hour by hour over four weeks, for the hour-by-weekday map.
+        // Its own request rather than part of sfp-chart: that one is polled every few seconds
+        // and follows the window on screen, and this is a fixed month that changes once an hour.
+        group.MapGet("/api/monitoring/sfp-pon-load-hours", async (
+            MonitoringInfluxClient influx,
+            SiteDbContextFactory siteDbFactory,
+            SiteContextService siteContext,
+            CancellationToken ct) =>
+        {
+            await using var db = siteDbFactory.CreateForSite(siteContext.Slug, siteContext.IsDefault);
+            var sfps = await db.MonitoredSfps.AsNoTracking()
+                .Where(s => s.IsMonitoredOnt)
+                .Select(s => new { s.DeviceMac, s.PortName })
+                .ToListAsync(ct);
+            if (sfps.Count == 0)
+                return Results.Ok(new { days = -PonChartSeries.LoadMapDays, items = Array.Empty<object>() });
+
+            var to = DateTime.UtcNow;
+            var data = await influx.QuerySfpPonByModulesAsync(
+                sfps.Select(s => (s.DeviceMac, s.PortName)).ToList(),
+                to.AddDays(PonChartSeries.LoadMapDays), to, TimeSpan.FromHours(1), ct, loadFieldsOnly: true);
+            var items = sfps
+                .Select(s => $"{s.DeviceMac.Replace("-", ":").ToLowerInvariant()}:{s.PortName}")
+                .Distinct()
+                .Select(key => new { id = key, hours = PonChartSeries.HourlyLoad(data.TryGetValue(key, out var pts) ? pts : null) })
+                .Where(x => x.hours.Count > 0)
+                .ToList();
+            return Results.Ok(new { days = -PonChartSeries.LoadMapDays, items });
         });
     }
 
     /// <summary>
     /// The SFP alerts, and only those. A restart or a device-wide alert belongs to the device
-    /// rather than to any one module, so it is left to Device Stats instead of being repeated
-    /// against every module the device happens to carry.
+    /// rather than to any one module; those come down separately as deviceEvents, drawn only while
+    /// one host device is on screen so they are never repeated against every module it carries.
     /// </summary>
     private static readonly HashSet<string> SfpEventTypes = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -197,11 +252,18 @@ public static class SfpChartEndpoints
     };
 
     /// <summary>
-    /// The exception to that: a PON link going down is the one ONT condition worth seeing while
-    /// reading the optics, since it is what the RX and TX traces are usually being checked
-    /// against.
+    /// The exceptions to that: a PON link going down and an ONT reboot are the ONT conditions
+    /// worth seeing while reading the optics, since both break the RX and TX traces.
     /// </summary>
-    private const string PonLinkDownEventType = "ont.pon_link_down";
+    private static readonly HashSet<string> OntEventTypesOnOptics = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ont.pon_link_down",
+        "ont.rebooted",
+    };
+
+    /// <summary>Alert types this endpoint already marks per module, kept out of the host device events.</summary>
+    private static readonly HashSet<string> HostEventTypesMarkedHere =
+        new(SfpEventTypes.Concat(ChartEventMarks.OntEventTypes), StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Marks every chart on the tab.</summary>
     private const string ScopeAll = "all";
@@ -344,7 +406,7 @@ public static class SfpChartEndpoints
             events.Add((triggeredAtUtc, new
             {
                 key,
-                scope = alert.EventType.Equals(PonLinkDownEventType, StringComparison.OrdinalIgnoreCase)
+                scope = OntEventTypesOnOptics.Contains(alert.EventType)
                     ? ScopeAll
                     : ScopePon,
                 device = module.Device,

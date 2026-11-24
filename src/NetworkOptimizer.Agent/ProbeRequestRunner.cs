@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using NetworkOptimizer.AgentProtocol;
 using NetworkOptimizer.Core.Enums;
 using NetworkOptimizer.Monitoring.Probes;
+using NetworkOptimizer.Monitoring.Tailscale;
 
 namespace NetworkOptimizer.Agent;
 
@@ -39,18 +40,31 @@ public sealed class ProbeRequestRunner
                 string.IsNullOrEmpty(request.SourceIp) ? null : request.SourceIp);
 
             string json;
-            if (string.Equals(request.Kind, "dns", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(request.Kind, TailscaleLocal.StatusKind, StringComparison.Ordinal))
+            {
+                var status = await TailscaleLocalApi.ReadStatusAsync(request.Address, ct);
+                json = JsonSerializer.Serialize(status);
+            }
+            else if (string.Equals(request.Kind, TailscaleLocal.SnatKind, StringComparison.Ordinal))
+            {
+                json = JsonSerializer.Serialize(await TailnetSnat.ReadAsync(ct));
+            }
+            else if (string.Equals(request.Kind, "dns", StringComparison.OrdinalIgnoreCase))
             {
                 var result = await _executor.LookupAsync(target, request.Reverse, ct);
                 json = JsonSerializer.Serialize(result);
             }
             else if (request.Traceroute)
             {
+                // More probes per hop takes longer to finish, so the deadline grows with the ask.
+                // Kept inside the server's 30 s wait for the response.
+                var probesPerHop = request.ProbesPerHop > 0 ? request.ProbesPerHop : (int?)null;
                 var result = await _executor.TracerouteAsync(
                     target,
                     maxHops: request.MaxHops > 0 ? request.MaxHops : 30,
                     perHopTimeout: TimeSpan.FromSeconds(1),
-                    totalDeadline: TimeSpan.FromSeconds(10),
+                    totalDeadline: TimeSpan.FromSeconds(probesPerHop.HasValue ? 20 : 10),
+                    probesPerHop: probesPerHop,
                     ct: ct);
                 json = JsonSerializer.Serialize(result);
             }
