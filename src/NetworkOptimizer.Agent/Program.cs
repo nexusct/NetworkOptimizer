@@ -110,13 +110,10 @@ var lanIp = !string.IsNullOrWhiteSpace(lanIpOverride)
 // single choice cannot do on a gateway - see LocalUnicastAddresses.
 var localIps = NetworkOptimizer.Core.Helpers.NetworkUtilities.LocalUnicastAddresses();
 
-var handler = new HttpClientHandler();
-if (config.IgnoreSslErrors)
-    handler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
 // Short timeout: this client only carries enrollment and heartbeats. The
 // default 100s meant a heartbeat against an offline server host (SYN black
 // hole, e.g. host down for maintenance) hung for the full 100s per attempt.
-using var http = new HttpClient(handler)
+using var http = new HttpClient(ServerHttpHandler.Create(config.IgnoreSslErrors))
 {
     BaseAddress = new Uri(config.ServerUrl.TrimEnd('/') + "/"),
     Timeout = TimeSpan.FromSeconds(15)
@@ -132,8 +129,27 @@ if (string.IsNullOrEmpty(config.AgentKey))
     }
 
     Console.WriteLine("Enrolling with central server...");
-    var response = await http.PostAsJsonAsync("api/public/agents/enrollments",
-        new { token = config.EnrollmentToken, version, lanIp }, AgentJson.Options);
+    // Network errors and server-side failures retry: exiting instead crash-looped the
+    // service under systemd. Any other 4xx (bad or spent token) will not fix itself.
+    HttpResponseMessage response;
+    while (true)
+    {
+        try
+        {
+            response = await http.PostAsJsonAsync("api/public/agents/enrollments",
+                new { token = config.EnrollmentToken, version, lanIp }, AgentJson.Options);
+            if ((int)response.StatusCode < 500
+                && response.StatusCode is not (System.Net.HttpStatusCode.RequestTimeout or System.Net.HttpStatusCode.TooManyRequests))
+                break;
+            Console.Error.WriteLine($"Enrollment failed: {response.StatusCode}, retrying in 30s");
+            response.Dispose();
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            Console.Error.WriteLine($"Enrollment error: {ex.Message} Retrying in 30s");
+        }
+        await Task.Delay(TimeSpan.FromSeconds(30));
+    }
     if (!response.IsSuccessStatusCode)
     {
         Console.Error.WriteLine($"Enrollment failed: {response.StatusCode} {await response.Content.ReadAsStringAsync()}");
@@ -211,20 +227,73 @@ ResultBuffer? resultBuffer = null;
 ProbeRunner? probeRunner = null;
 SnmpRunner? snmpRunner = null;
 ConntrackRunner? conntrackRunner = null;
+UciInformCapture? uciCapture = null;
+Task? uciCaptureTask = null;
+GatewayBlocklistEnforcer? blocklist = null;
+Task? blocklistTask = null;
+GatewayBlocklistHitReporter? blocklistHits = null;
+Task? blocklistHitsTask = null;
+KernelLogFollower? kernelLog = null;
+Task? kernelLogTask = null;
+WanFloodGuard? floodGuard = null;
+Task? floodGuardTask = null;
+WanFloodDetector? floodDetector = null;
+Task? floodDetectorTask = null;
 Task? probeTask = null;
 Task? snmpTask = null;
 Task? conntrackTask = null;
+Task? liveDnsTask = null;
+Task? flowLatencyTask = null;
 Task? watchdogTask = null;
 
 // Capabilities for the hello. conntrack-accounting only when the installer said this is a
 // gateway AND the conntrack source proved readable right now - a permissions or module
 // surprise downgrades to "not capable", never to a lie.
 var conntrackCapable = config.OnGateway == true && ConntrackRunner.SourceReadable();
-var capabilities = conntrackCapable ? new[] { "conntrack-accounting" } : Array.Empty<string>();
+// UCI informs cross the gateway's WAN port, so only an on-gateway agent can see them.
+var uciCaptureCapable = config.OnGateway == true && UciInformCapture.Available();
+// Blocking on the gateway itself needs the gateway's own ipset and iptables.
+var blocklistCapable = config.OnGateway == true && GatewayBlocklistEnforcer.Available();
+// WAN Flood Protection needs the gateway's iptables, ipset, and tc.
+var floodCapable = config.OnGateway == true && WanFloodGuard.Available();
+// Live DNS opens the same kind of packet socket as the UCI capture.
+var liveDnsCapable = conntrackCapable && DnsCapture.Available();
+// Announced with Live Traffic even where the kernel has no conntrack events: the batches then say it is
+// not running, which is how the server tells "this Gateway cannot" from "this agent predates it".
+var flowLatencySupported = conntrackCapable && ConntrackEventSocket.Supported();
+var capabilityList = new List<string>();
+if (conntrackCapable) capabilityList.AddRange(["conntrack-accounting", ConntrackRunner.LiveTrafficCapability, ConntrackEventSocket.Capability]);
+if (liveDnsCapable) capabilityList.Add(DnsCapture.Capability);
+if (uciCaptureCapable) capabilityList.Add(UciInformCapture.Capability);
+if (blocklistCapable) capabilityList.AddRange([GatewayBlocklistEnforcer.Capability, GatewayBlocklistEnforcer.ExceptionsCapability]);
+if (floodCapable) capabilityList.Add(WanFloodRules.Capability);
+else if (config.OnGateway == true) capabilityList.Add(WanFloodRules.UnavailableCapability);
+// Change Control's revert needs only HTTPS to the console, which every agent host reaches.
+capabilityList.Add(ConfigRevert.Capability);
+// Reading a local tailscaled is per request: whether one runs here is the answer the server shows.
+capabilityList.Add(TailscaleLocal.Capability);
+var capabilities = capabilityList.ToArray();
+var configRevert = new ConfigRevertGuard();
+Task? configRevertTask = null;
 if (config.OnGateway == true)
+{
     Console.WriteLine(conntrackCapable
         ? "Conntrack accounting available (on-gateway, byte counters readable)"
         : "On-gateway install, but conntrack byte counters are not readable - conntrack accounting unavailable");
+    if (conntrackCapable)
+        Console.WriteLine(flowLatencySupported
+            ? "Flow latency available (conntrack events)"
+            : "Flow latency unavailable: this kernel has no conntrack events");
+    Console.WriteLine(uciCaptureCapable
+        ? "UCI inform capture available (packet socket opens)"
+        : "On-gateway install, but a packet socket cannot be opened - UCI inform capture unavailable");
+    Console.WriteLine(blocklistCapable
+        ? "Gateway blocklist available (ipset and iptables usable)"
+        : "On-gateway install, but ipset or iptables is not usable - gateway blocklist unavailable");
+    Console.WriteLine(floodCapable
+        ? "WAN flood protection available (iptables, ipset, and tc usable)"
+        : "On-gateway install, but iptables, ipset, or tc is not usable - WAN flood protection unavailable");
+}
 var spoolPath = Path.Combine(
     Path.GetDirectoryName(Path.GetFullPath(configPath)) ?? ".", "result-spool.bin");
 
@@ -280,8 +349,51 @@ if (!string.IsNullOrEmpty(config.TunnelUrl))
     if (conntrackCapable)
     {
         conntrackRunner = new ConntrackRunner(resultBuffer.Enqueue);
+        if (liveDnsCapable)
+        {
+            conntrackRunner.Dns = new DnsCapture();
+            liveDnsTask = conntrackRunner.Dns.RunAsync(cts.Token);
+        }
+        if (flowLatencySupported)
+        {
+            conntrackRunner.FlowLatency = new ConntrackEventSocket(conntrackRunner.Handshakes);
+            flowLatencyTask = conntrackRunner.FlowLatency.RunAsync(cts.Token);
+        }
         conntrackTask = conntrackRunner.RunAsync(cts.Token);
     }
+    if (uciCaptureCapable)
+    {
+        uciCapture = new UciInformCapture();
+        uciCaptureTask = uciCapture.RunAsync(cts.Token);
+    }
+    if (blocklistCapable)
+    {
+        // Started before the tunnel: the cached set goes back on at once after a gateway reboot.
+        var guardHosts = new[] { config.ServerUrl, config.TunnelUrl }
+            .Select(u => Uri.TryCreate(u, UriKind.Absolute, out var uri) ? uri.Host : null)
+            .OfType<string>().Distinct().ToList();
+        blocklist = new GatewayBlocklistEnforcer(
+            Path.Combine(Path.GetDirectoryName(Path.GetFullPath(configPath)) ?? ".", "gateway-blocklist.json"), guardHosts);
+        blocklistTask = blocklist.RunAsync(cts.Token);
+        kernelLog ??= new KernelLogFollower();
+        blocklistHits = new GatewayBlocklistHitReporter(kernelLog);
+        blocklistHitsTask = blocklistHits.RunAsync(cts.Token);
+    }
+    if (floodCapable)
+    {
+        // Started before the tunnel: the cached config and drops go back on at once after a gateway reboot.
+        var guardHosts = new[] { config.ServerUrl, config.TunnelUrl }
+            .Select(u => Uri.TryCreate(u, UriKind.Absolute, out var uri) ? uri.Host : null)
+            .OfType<string>().Distinct().ToList();
+        floodGuard = new WanFloodGuard(
+            Path.Combine(Path.GetDirectoryName(Path.GetFullPath(configPath)) ?? ".", "wan-flood.json"), guardHosts);
+        floodGuardTask = floodGuard.RunAsync(cts.Token);
+        kernelLog ??= new KernelLogFollower();
+        floodDetector = new WanFloodDetector(floodGuard, resultBuffer.Enqueue, kernelLog);
+        floodDetectorTask = floodDetector.RunAsync(cts.Token);
+    }
+    // One kernel log reader for every subscriber, started once they have all subscribed.
+    kernelLogTask = kernelLog?.RunAsync(cts.Token);
 }
 
 // Restart-based self-heal for a wedged async socket engine (every install
@@ -290,12 +402,17 @@ if (!string.IsNullOrEmpty(config.TunnelUrl))
 // die of the same wedge (async HTTP) and need the same cure - without a
 // buffer the spool callback is a no-op.
 watchdogTask = AsyncIoWatchdog.RunAsync(SaveSpool, cts.Token);
+// Same cure for a GC heap that stops granting allocations: the loops catch and carry on.
+OutOfMemoryRestart.PersistState = SaveSpool;
+configRevertTask = configRevert.RunAsync(cts.Token);
 
 // Prefer the persistent gRPC tunnel; REST heartbeats keep the agent visible as
 // Online whenever the tunnel is unavailable (tunnel disabled server-side, an
 // older server, or a network drop between reconnect attempts).
 while (!cts.IsCancellationRequested)
 {
+    var retryDelay = TunnelReconnectPolicy.Backoff;
+    var redialAtOnce = false;
     if (!string.IsNullOrEmpty(config.TunnelUrl))
     {
         using var connectionCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
@@ -309,10 +426,32 @@ while (!cts.IsCancellationRequested)
         if (conntrackRunner != null)
         {
             tunnel.OnConntrackConfig = conntrackRunner.UpdateConfig;
+            tunnel.OnLiveTrafficConfig = conntrackRunner.UpdateLiveTraffic;
             // Live batches ride this tunnel directly (superseded by the next window, so a lost
             // one costs nothing); the ~6s aggregates ride the result buffer like everything else.
             conntrackRunner.LiveSend = tunnel.TrySend;
         }
+        if (uciCapture != null)
+        {
+            tunnel.OnUciCaptureConfig = uciCapture.UpdateConfig;
+            uciCapture.LiveSend = tunnel.TrySend;
+        }
+        if (blocklist != null)
+        {
+            tunnel.OnGatewayBlocklist = blocklist.Update;
+            blocklist.LiveSend = tunnel.TrySend;
+        }
+        if (blocklistHits != null) blocklistHits.LiveSend = tunnel.TrySend;
+        if (floodGuard != null)
+        {
+            tunnel.OnWanFloodConfig = floodGuard.Update;
+            floodGuard.LiveSend = tunnel.TrySend;
+        }
+        tunnel.OnConfigRevertArm = configRevert.OnArm;
+        tunnel.OnConfigRevertConfirm = configRevert.OnConfirm;
+        tunnel.OnOpened = configRevert.OnConnected;
+        configRevert.LiveSend = tunnel.TrySend;
+        configRevert.TunnelUp = () => tunnel.IsOpen;
         tunnel.OnWanSpeedTestConfig = wanConfig => speedTestServer?.UpdateWanServers(
             wanConfig.Servers.Select(s => new SpeedTestServer.WanServerEntry(s.ServerId, s.Url)).ToList(),
             wanConfig.DefaultServerId);
@@ -348,7 +487,7 @@ while (!cts.IsCancellationRequested)
                 NetworkOptimizer.Monitoring.Probes.LocalProbeExecutor.SupportsSourceBinding,
                 config.OnGateway, capabilities,
                 config.IgnoreSslErrors, cts.Token);
-            Console.Error.WriteLine("Tunnel closed by server, reconnecting...");
+            Console.Error.WriteLine("Tunnel closed by server");
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
@@ -357,15 +496,40 @@ while (!cts.IsCancellationRequested)
         catch (Exception ex)
         {
             Console.Error.WriteLine($"Tunnel error: {ex.Message}");
+            OutOfMemoryRestart.Report("the tunnel", ex);
         }
         finally
         {
             if (conntrackRunner != null) conntrackRunner.LiveSend = null;
+            if (uciCapture != null) uciCapture.LiveSend = null;
+            if (blocklist != null) blocklist.LiveSend = null;
+            if (blocklistHits != null) blocklistHits.LiveSend = null;
+            if (floodGuard != null) floodGuard.LiveSend = null;
+            configRevert.LiveSend = null;
+            configRevert.TunnelUp = () => false;
             connectionCts.Cancel();
             // Nothing to salvage: the drain only peeks, so every unacked frame is
             // still in the buffer and replays on the next connection.
             try { await drainTask; } catch (OperationCanceledException) { }
         }
+        if (cts.IsCancellationRequested) break;
+
+        // However the tunnel ended, a long healthy run redials within seconds; see TunnelReconnectPolicy.
+        var healthyFor = tunnel.HealthyFor;
+        redialAtOnce = TunnelReconnectPolicy.RedialsAtOnce(healthyFor);
+        retryDelay = TunnelReconnectPolicy.Delay(healthyFor, Random.Shared);
+        Console.Error.WriteLine(healthyFor is { } ran
+            ? $"Reconnecting in {retryDelay.TotalSeconds:0}s (the tunnel was healthy for {ran.TotalMinutes:0} min)"
+            : $"Reconnecting in {retryDelay.TotalSeconds:0}s");
+    }
+
+    // The heartbeat keeps the agent visible while the tunnel is down; an immediate redial is
+    // the better signal, and a slow heartbeat would only delay it.
+    if (redialAtOnce)
+    {
+        try { await Task.Delay(retryDelay, cts.Token); }
+        catch (OperationCanceledException) { break; }
+        continue;
     }
 
     try
@@ -391,7 +555,7 @@ while (!cts.IsCancellationRequested)
         Console.Error.WriteLine($"Heartbeat error: {ex.Message}");
     }
 
-    try { await Task.Delay(TimeSpan.FromSeconds(30), cts.Token); }
+    try { await Task.Delay(retryDelay, cts.Token); }
     catch (OperationCanceledException) { break; }
 }
 
@@ -412,6 +576,31 @@ if (snmpTask != null)
 if (conntrackTask != null)
 {
     try { await conntrackTask; } catch (OperationCanceledException) { }
+}
+if (liveDnsTask != null)
+{
+    try { await liveDnsTask; } catch (OperationCanceledException) { }
+}
+if (flowLatencyTask != null)
+{
+    try { await flowLatencyTask; } catch (OperationCanceledException) { }
+}
+if (uciCaptureTask != null)
+{
+    try { await uciCaptureTask; } catch (OperationCanceledException) { }
+}
+if (blocklistTask != null)
+{
+    try { await blocklistTask; } catch (OperationCanceledException) { }
+}
+if (blocklistHitsTask != null)
+{
+    try { await blocklistHitsTask; } catch (OperationCanceledException) { }
+}
+foreach (var task in new[] { floodGuardTask, floodDetectorTask, kernelLogTask, configRevertTask })
+{
+    if (task == null) continue;
+    try { await task; } catch (OperationCanceledException) { }
 }
 if (watchdogTask != null)
 {

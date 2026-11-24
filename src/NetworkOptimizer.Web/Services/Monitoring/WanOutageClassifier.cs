@@ -48,7 +48,11 @@ internal sealed record WanTargetSnapshot(
 /// <see cref="WanVerdictKind.Total"/> verdict. <paramref name="LastReachableHop"/> /
 /// <paramref name="BrokenNetwork"/> carry <see cref="OutageDetector.AttributeBreak"/>'s
 /// attribution for the upstream case; <paramref name="BranchLabel"/> names the shared
-/// ancestor (or shared network) for a branch-shaped partial, null for an independent one.
+/// ancestor for a branch-shaped partial, null for an independent one. <paramref name="Broad"/>
+/// marks a partial with strong evidence (a monitored path hop, or a wide spread of networks),
+/// which opens on the total's fast clock; a narrow one waits longer to confirm.
+/// <paramref name="ChartCategory"/> is the Network Performance category that shows the shallowest
+/// affected target, so the alert's link opens on the targets that actually went down.
 /// </summary>
 internal sealed record WanVerdict(
     WanVerdictKind Kind,
@@ -57,7 +61,9 @@ internal sealed record WanVerdict(
     string? BrokenNetwork,
     string? BranchLabel,
     int FailingCount,
-    int TotalCount)
+    int TotalCount,
+    bool Broad = false,
+    string ChartCategory = MonitoringLinks.AccessIspCategory)
 {
     public static readonly WanVerdict None = new(WanVerdictKind.None, false, null, null, null, 0, 0);
 }
@@ -73,6 +79,20 @@ internal sealed record WanVerdict(
 /// </summary>
 internal static class WanOutageClassifier
 {
+    private static readonly string[] CategoriesByDepth =
+        [MonitoringLinks.AccessIspCategory, MonitoringLinks.TransitCategory, MonitoringLinks.InternetServiceCategory];
+
+    /// <summary>The shallowest of several chart categories (several WANs' verdicts), ISP when there are none.</summary>
+    internal static string ShallowestCategory(IEnumerable<string?> categories)
+    {
+        var present = categories.ToHashSet();
+        return CategoriesByDepth.FirstOrDefault(present.Contains) ?? MonitoringLinks.AccessIspCategory;
+    }
+
+    /// <summary>The category of the shallowest affected target.</summary>
+    private static string ChartCategoryOf(IEnumerable<WanTargetSnapshot> affected) =>
+        ShallowestCategory(affected.Select(t => MonitoringLinks.CategoryFor(t.Type)));
+
     public static WanVerdict Classify(IReadOnlyList<WanTargetSnapshot> targets)
     {
         if (targets.Count == 0) return WanVerdict.None;
@@ -84,7 +104,7 @@ internal static class WanOutageClassifier
         // Access layer and out: every target on the WAN is failing, first hop included.
         if (failing.Count == targets.Count)
             return new WanVerdict(WanVerdictKind.Total, AccessDown: accessRows.Count > 0,
-                null, null, null, failing.Count, targets.Count);
+                null, null, null, failing.Count, targets.Count, ChartCategory: ChartCategoryOf(failing));
 
         // Upstream of the access layer: the first hop answers, everything beyond it is failing.
         // At least one failing internet destination is required - a set that is all transit
@@ -97,7 +117,7 @@ internal static class WanOutageClassifier
         {
             var (lastReachable, brokenNetwork) = AttributeUpstreamBreak(targets);
             return new WanVerdict(WanVerdictKind.Total, AccessDown: false,
-                lastReachable, brokenNetwork, null, failing.Count, targets.Count);
+                lastReachable, brokenNetwork, null, failing.Count, targets.Count, ChartCategory: ChartCategoryOf(failing));
         }
 
         // Partial pass, over the degraded set (offline or sustained loss). A partial only opens
@@ -114,22 +134,32 @@ internal static class WanOutageClassifier
         if (degraded.Count == 1)
             return WanVerdict.None;
 
+        // A monitored path hop the degraded targets sit behind is real path evidence.
         var branch = FindBranchLabel(targets, degraded);
         if (branch != null)
             return new WanVerdict(WanVerdictKind.Partial, false, null, null, branch,
-                degraded.Count, targets.Count);
+                degraded.Count, targets.Count, Broad: true, ChartCategory: ChartCategoryOf(degraded));
 
-        // Independence gate, by network (ASN label / real ASN), inherited from the partial
-        // detector: several endpoints of one provider are one network, not several.
-        var networks = degraded.Select(NetworkKeyOf).Distinct().Count();
-        if (networks >= 2)
-            return new WanVerdict(WanVerdictKind.Partial, false, null, null, null,
-                degraded.Count, targets.Count);
+        // Independence gate, by network (ASN label / real ASN), over the degraded destinations:
+        // several endpoints of one provider are one network, and a transit hop no failing
+        // destination sits behind is uncorroborated. One network with no path hop to anchor on
+        // is that provider's problem, not the WAN's (two AWS regions dark at once, say), so it
+        // gets the single-destination treatment.
+        var degradedDestinations = degraded.Where(t => t.IsInternet).ToList();
+        var networks = degradedDestinations.Select(NetworkKeyOf).Distinct().Count();
+        if (networks < 2)
+            return WanVerdict.None;
 
-        // One network, no monitored shared ancestor: the network itself is the branch.
-        return new WanVerdict(WanVerdictKind.Partial, false, null, null,
-            NetworkKeyOf(degraded[0]), degraded.Count, targets.Count);
+        // Breadth over destinations only, for the same reason: a rate-limited transit hop is no reach lost.
+        var destinations = targets.Count(t => t.IsInternet);
+        // Links to Internet even when a transit hop is also dark: with no branch, that hop is uncorroborated.
+        return new WanVerdict(WanVerdictKind.Partial, false, null, null, null,
+            degraded.Count, targets.Count, Broad: degradedDestinations.Count * BroadShareDenominator >= destinations,
+            ChartCategory: MonitoringLinks.InternetServiceCategory);
     }
+
+    /// <summary>A scattered partial is broad once at least 1/N of the WAN's monitored destinations are degraded.</summary>
+    private const int BroadShareDenominator = 3;
 
     /// <summary>
     /// Break attribution for a total-with-first-hop-answering verdict, through

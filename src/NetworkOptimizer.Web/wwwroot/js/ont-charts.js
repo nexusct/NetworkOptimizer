@@ -2,15 +2,15 @@
 // Same control pattern as cellular-charts.js.
 
 import ApexCharts from '/_content/Blazor-ApexCharts/js/apexcharts.esm.js';
-import { computeStats, renderStatsTable as renderTable } from './chart-stats.js?v=9';
-import { valueSortedTooltip, tooltipHeld, alignedPoints } from './chart-tooltip.js?v=17';
+import { computeStats, renderStatsTable as renderTable } from './chart-stats.js?v=10';
+import { valueSortedTooltip, tooltipHeld, alignedPoints } from './chart-tooltip.js?v=22';
 import { renderFilterReset, isFiltered } from './chart-filter.js?v=6';
-import { createMarkLayer } from './chart-event-marks.js?v=5';
-import { createAxisDateCaption } from './chart-axis-date.js?v=3';
-import { ponSeriesFor, ponDetailsHtml, ponErrorTotalsHtml, updatePonCard } from './pon-section.js?v=4';
-import { syncIdentity } from './chart-sync.js?v=7';
+import { createMarkLayer } from './chart-event-marks.js?v=14';
+import { createAxisDateCaption } from './chart-axis-date.js?v=5';
+import { ponSeriesFor, ponDetailsHtml, ponErrorTotalsHtml, updatePonCard, ponPayloadMbps, fmtPonLoad, ponLaunchSeries, createPonLoadMap, renderPonExtras, initPonViewTabs } from './pon-section.js?v=24';
+import { syncIdentity } from './chart-sync.js?v=9';
 import { awaitContainer } from './chart-mount.js?v=1';
-import { loadWindowHours, saveWindowHours, markActiveRange, notifyWindowMoved } from './chart-window.js?v=2';
+import { loadWindowHours, saveWindowHours, markActiveRange, notifyWindowMoved } from './chart-window.js?v=3';
 
 // Storage scope for this tab's remembered time window.
 const WINDOW_TAB = 'ont';
@@ -27,6 +27,18 @@ let tempChart = null;
 // FEC/BIP error-delta chart; its section stays hidden unless some ONT reports the counters.
 let errorsChart = null;
 let ponGemChart = null;
+let ponUtilChart = null;
+let ponLossChart = null;
+let ponAvailChart = null;
+let ponGrantChart = null;
+let ponBiasChart = null;
+let ponCpuChart = null;
+const ponLoadMap = createPonLoadMap({
+    ApexCharts, url: '/api/monitoring/ont-pon-load-hours',
+    cardSelector: '.ont-pon-loadmap-card', chartSelector: '.ont-pon-loadmap-chart', summarySelector: '.ont-pon-loadmap-summary',
+});
+// The downstream payload rate the load chart's tooltip takes its percentages from.
+let ponPayload = ponPayloadMbps([]);
 let ponHostChart = null;
 let pollTimer = null;
 let currentRangeHours = 24;
@@ -72,20 +84,16 @@ function baseOpts(height, yTitle, yFormatter, extra, group = SYNC_GROUP) {
         dataLabels: { enabled: false },
         xaxis: {
             type: 'datetime',
-            labels: {
-                style: { colors: '#9ca3af' },
-                datetimeUTC: false,
-                datetimeFormatter: { hour: 'HH:mm', day: 'MMM dd' },
-            },
+            labels: noTime.timeAxisLabels({ style: { colors: '#9ca3af' } }),
             title: axisDate.option(),
         },
         yaxis: {
             title: { text: yTitle, style: { color: '#9ca3af' } },
-            labels: { style: { colors: '#9ca3af' }, formatter: yFormatter },
+            labels: { minWidth: 20, style: { colors: '#9ca3af' }, formatter: yFormatter },
         },
         grid: { borderColor: '#374151', strokeDashArray: 3 },
         legend: { show: false },
-        tooltip: { theme: 'dark', shared: true, x: { format: 'MMM dd, HH:mm:ss' }, custom: valueSortedTooltip },
+        tooltip: { theme: 'dark', shared: true, x: { formatter: noTime.chartTooltipFormatter() }, custom: valueSortedTooltip },
         noData: { text: 'No data in this time range', style: { color: '#64748b' } },
     };
     if (extra?.yaxis) {
@@ -215,6 +223,9 @@ function drawSeries() {
         powerSeries.push({ name: d.label + ' TX', color: c.tx, data: alignedPoints(pts, p => p.tx) });
         powerDash.push(0);
         powerDash.push(5);
+        // The far end of the same fibre, where the OLT announces it: dotted, in the RX color.
+        const launch = ponLaunchSeries(d, d.label, c.rx);
+        if (launch) { powerSeries.push(launch); powerDash.push(2); }
         tempSeries.push({ name: d.label, color: c.temp, data: alignedPoints(pts, p => p.temp) });
     });
     if (powerChart) {
@@ -272,7 +283,26 @@ async function ensureErrorsChartMounted() {
     const gemEl = container.querySelector('.ont-pon-gem-chart');
     if (hostEl) { ponHostChart = new ApexCharts(hostEl, { ...baseOpts(160, 'errors', fmtCount), series: [], colors: PALETTE }); chartEls.ponHost = hostEl; }
     if (gemEl) ponGemChart = new ApexCharts(gemEl, { ...baseOpts(160, 'frames', fmtCount), series: [], colors: PALETTE });
-    await Promise.all([errorsChart.render(), ponHostChart?.render(), ponGemChart?.render()].filter(Boolean));
+    const utilEl = container.querySelector('.ont-pon-util-chart');
+    if (utilEl) {
+        // Rate on the axis; the tooltip adds the share of the PON's downstream payload.
+        const utilOpts = baseOpts(180, 'Mbps', v => v == null ? '' : v >= 10 ? v.toFixed(0) : v.toFixed(1), { yaxis: { min: 0 } });
+        utilOpts.tooltip = { ...utilOpts.tooltip, custom: ctx => valueSortedTooltip(ctx, { format: v => fmtPonLoad(v, ponPayload) }) };
+        ponUtilChart = new ApexCharts(utilEl, { ...utilOpts, series: [], colors: PALETTE });
+    }
+    const availEl = container.querySelector('.ont-pon-avail-chart');
+    if (availEl) ponAvailChart = new ApexCharts(availEl, { ...baseOpts(160, 'seconds', v => v == null ? '' : v >= 10 ? v.toFixed(0) : v.toFixed(1), { yaxis: { min: 0 } }), series: [], colors: PALETTE });
+    const grantEl = container.querySelector('.ont-pon-grant-chart');
+    if (grantEl) ponGrantChart = new ApexCharts(grantEl, { ...baseOpts(160, 'per second', fmtCount, { yaxis: { min: 0 } }), series: [], colors: PALETTE });
+    const biasEl = container.querySelector('.ont-pon-bias-chart');
+    if (biasEl) ponBiasChart = new ApexCharts(biasEl, { ...baseOpts(160, 'mA', v => v == null ? '' : v.toFixed(1) + ' mA', {
+        yaxis: { min: v => Math.floor(v - 1), max: v => Math.ceil(v + 1) } }), series: [], colors: PALETTE });
+    const cpuEl = container.querySelector('.ont-pon-cpu-chart');
+    if (cpuEl) ponCpuChart = new ApexCharts(cpuEl, { ...baseOpts(160, '%', v => v == null ? '' : v.toFixed(1) + '%', { yaxis: { min: 0, max: 100 } }), series: [], colors: PALETTE });
+    const lossEl = container.querySelector('.ont-pon-loss-chart');
+    if (lossEl) ponLossChart = new ApexCharts(lossEl, { ...baseOpts(160, 'dB', v => v == null ? '' : v.toFixed(1) + ' dB', {
+        yaxis: { min: v => Math.floor(v - 1), max: v => Math.ceil(v + 1) } }), series: [], colors: PALETTE });
+    await Promise.all([errorsChart.render(), ponHostChart?.render(), ponGemChart?.render(), ponUtilChart?.render(), ponLossChart?.render(), ponAvailChart?.render(), ponGrantChart?.render(), ponBiasChart?.render(), ponCpuChart?.render()].filter(Boolean));
     // It arrives after the first draw, so it starts with no marks on it.
     markLayer.reset();
     applyAnnotations();
@@ -298,13 +328,19 @@ async function updateErrorsChart() {
 
     const withErrors = reporting.filter(d => visibility[d.id] !== false);
     const multi = withErrors.length > 1;
-    const errSeries = [], gemSeries = [], hostSeries = [];
+    const errSeries = [], gemSeries = [], hostSeries = [], utilSeries = [], lossSeries = [], availSeries = [], grantSeries = [], biasSeries = [], cpuSeries = [];
     withErrors.forEach(d => {
         const slot = Math.max(0, reporting.findIndex(x => x.id === d.id));
         const built = ponSeriesFor(d, multi ? `${d.label} ` : '', slot, PALETTE);
         errSeries.push(...built.errSeries);
         gemSeries.push(...built.gemSeries);
         hostSeries.push(...built.hostSeries);
+        utilSeries.push(...built.utilSeries);
+        lossSeries.push(...built.lossSeries);
+        availSeries.push(...built.availSeries);
+        biasSeries.push(...built.biasSeries);
+        cpuSeries.push(...built.cpuSeries);
+        grantSeries.push(...built.grantSeries);
     });
     // Unlike SFP Stats, this tab mixes ONTs that serve the whole PON set with ones that report a
     // link state and no counters at all, so each card hides itself rather than drawing an empty
@@ -312,6 +348,17 @@ async function updateErrorsChart() {
     updatePonCard(container, '.ont-pon-errors-card', errorsChart, errSeries);
     updatePonCard(container, '.ont-pon-host-card', ponHostChart, hostSeries);
     updatePonCard(container, '.ont-pon-gem-card', ponGemChart, gemSeries);
+    ponPayload = ponPayloadMbps(withErrors);
+    updatePonCard(container, '.ont-pon-util-card', ponUtilChart, utilSeries);
+    updatePonCard(container, '.ont-pon-loss-card', ponLossChart, lossSeries);
+    updatePonCard(container, '.ont-pon-avail-card', ponAvailChart, availSeries);
+    updatePonCard(container, '.ont-pon-grant-card', ponGrantChart, grantSeries);
+    updatePonCard(container, '.ont-pon-bias-card', ponBiasChart, biasSeries);
+    updatePonCard(container, '.ont-pon-cpu-card', ponCpuChart, cpuSeries);
+    renderPonExtras(container, 'ont', withErrors, {
+        palette: PALETTE, loadMap: ponLoadMap,
+        slotOf: d => Math.max(0, reporting.findIndex(x => x.id === d.id)),
+    });
 
     const el = container.querySelector('.ont-pon-details');
     if (el) {
@@ -329,7 +376,6 @@ async function updateErrorsChart() {
 // Columns this tab adds to the shared table. Ones no ONT fills are dropped by the renderer.
 const DETAIL_EXTRAS = [
     { header: 'PON Type', cell: d => d.ponType ? escapeHtml(d.ponType) : null },
-    { header: 'OLT', cell: d => d.olt ? escapeHtml(d.olt) : null },
 ];
 
 function renderStatsTable(container, showAll) {
@@ -372,8 +418,7 @@ function startPoll() {
 function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 
 function toLocalDatetimeString(d) {
-    const pad = n => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    return noTime.inputValue(d);
 }
 
 // A plain preset keeps no explicit bounds - getEffectiveFrom/To answer null for it - so its window
@@ -408,7 +453,7 @@ function updateCustomLabel(container) {
         btn.classList.add('active');
         const from = getEffectiveFrom(), to = getEffectiveTo();
         if (from && to) {
-            const fmt = d => d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+            const fmt = d => noTime.date(d, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
             btn.setAttribute('data-tooltip', `${fmt(from)} - ${fmt(to)}`);
         }
         if (!clearBtn) {
@@ -434,8 +479,9 @@ function applyDragZoom(xaxis) {
     notifyWindowMoved();
     const container = document.getElementById(containerId);
     if (container && xaxis && Number.isFinite(xaxis.min) && Number.isFinite(xaxis.max) && xaxis.min < xaxis.max) {
-        customFrom = new Date(xaxis.min);
-        customTo = new Date(xaxis.max);
+        // The selection is in chart x (noTime.toChart); the window is real instants.
+        customFrom = new Date(noTime.fromChart(xaxis.min));
+        customTo = new Date(noTime.fromChart(xaxis.max));
         isCustomRange = true;
         windowOffset = 0;
         container.querySelectorAll('[data-range]').forEach(b => b.classList.remove('active'));
@@ -546,6 +592,7 @@ export async function mount(elId) {
     if (containerId !== elId) return;
 
     if (restoredHours !== null) markActiveRange(container, restoredHours);
+    initPonViewTabs(container.querySelector('.ont-errors-section'));
 
     const powerEl = container.querySelector('.ont-power-chart');
     const tempEl = container.querySelector('.ont-temp-chart');
@@ -558,6 +605,13 @@ export async function mount(elId) {
     if (errorsChart) { errorsChart.destroy(); errorsChart = null; }
     if (ponHostChart) { ponHostChart.destroy(); ponHostChart = null; }
     if (ponGemChart) { ponGemChart.destroy(); ponGemChart = null; }
+    if (ponUtilChart) { ponUtilChart.destroy(); ponUtilChart = null; }
+    if (ponLossChart) { ponLossChart.destroy(); ponLossChart = null; }
+    if (ponAvailChart) { ponAvailChart.destroy(); ponAvailChart = null; }
+    if (ponGrantChart) { ponGrantChart.destroy(); ponGrantChart = null; }
+    if (ponBiasChart) { ponBiasChart.destroy(); ponBiasChart = null; }
+    if (ponCpuChart) { ponCpuChart.destroy(); ponCpuChart = null; }
+    ponLoadMap.destroy();
 
     powerChart = new ApexCharts(powerEl, {
         ...baseOpts(220, 'dBm', v => v != null ? v.toFixed(1) + ' dBm' : '', {
@@ -608,8 +662,8 @@ export async function mount(elId) {
 
     container.querySelector('[data-action="apply-custom"]')?.addEventListener('click', () => {
         notifyWindowMoved();
-        const from = fromInput?.value ? new Date(fromInput.value) : null;
-        const to = toInput?.value ? new Date(toInput.value) : null;
+        const from = fromInput?.value ? noTime.fromInputValue(fromInput.value) : null;
+        const to = toInput?.value ? noTime.fromInputValue(toInput.value) : null;
         if (!from || !to || isNaN(from) || isNaN(to) || from >= to) return;
         customFrom = from;
         customTo = to;
@@ -663,6 +717,13 @@ export function unmount() {
     if (errorsChart) { errorsChart.destroy(); errorsChart = null; }
     if (ponHostChart) { ponHostChart.destroy(); ponHostChart = null; }
     if (ponGemChart) { ponGemChart.destroy(); ponGemChart = null; }
+    if (ponUtilChart) { ponUtilChart.destroy(); ponUtilChart = null; }
+    if (ponLossChart) { ponLossChart.destroy(); ponLossChart = null; }
+    if (ponAvailChart) { ponAvailChart.destroy(); ponAvailChart = null; }
+    if (ponGrantChart) { ponGrantChart.destroy(); ponGrantChart = null; }
+    if (ponBiasChart) { ponBiasChart.destroy(); ponBiasChart = null; }
+    if (ponCpuChart) { ponCpuChart.destroy(); ponCpuChart = null; }
+    ponLoadMap.destroy();
     containerId = null;
     deviceMeta = [];
     visibility = {};

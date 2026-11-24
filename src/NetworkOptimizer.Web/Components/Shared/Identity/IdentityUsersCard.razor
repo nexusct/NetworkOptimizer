@@ -11,6 +11,7 @@
 @inject NetworkOptimizer.Web.Services.SiteSwitchService SiteSwitch
 @implements IDisposable
 @inject Microsoft.Extensions.Options.IOptions<Microsoft.AspNetCore.Identity.IdentityOptions> IdentityOptions
+@inject IDisplayTimeZone DisplayTime
 
 @* Settings - Identity: the instance-wide account list. Create, enable/disable, delete, change role,
    reset another user's password, and link or unlink an external identity. Everything runs through
@@ -24,7 +25,7 @@
         @if (_multiSiteEnabled)
         {
             <div class="card-header-badges">
-                <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                <ScopeBadge />
             </div>
         }
     </div>
@@ -135,6 +136,10 @@
                                         {
                                             <span class="status-badge status-info">Password</span>
                                         }
+                                        @if (summary.HasPassword && user.PasswordIsTemporary && !IdentityBootstrapService.IsBuiltInAdmin(user))
+                                        {
+                                            <span class="status-badge status-warning" data-tooltip="Set by an administrator. The user must choose a new password at their next sign-in.">Must change</span>
+                                        }
                                         @if (summary.MfaEnabled)
                                         {
                                             <span class="status-badge status-active" data-tooltip="Authenticator app enrolled as a second factor">MFA</span>
@@ -158,7 +163,7 @@
                                 <td class="hide-mobile">
                                     @if (user.LastLoginAt is { } last)
                                     {
-                                        <span data-tooltip="@($"Method: {user.LastLoginMethod ?? "password"}")">@last.ToLocalTime().ToString("g")</span>
+                                        <span data-tooltip="@($"Method: {user.LastLoginMethod ?? "password"}")">@last.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DateTime, DisplayFormat.Culture)</span>
                                     }
                                     else
                                     {
@@ -189,13 +194,30 @@
                                                 @(user.IsEnabled ? "Disable" : "Enable")
                                             </button>
                                         </span>
-                                        <span class="identity-lock" data-tooltip="@UndeletableReason(user)">
-                                            <button type="button" class="btn btn-danger btn-sm"
-                                                    @onclick="() => DeleteAsync(user)"
-                                                    disabled="@(_busyUserId == user.Id || UndeletableReason(user) is not null)">
-                                                Delete
-                                            </button>
-                                        </span>
+                                        @if (_confirmDeleteUserId == user.Id)
+                                        {
+                                            <span class="confirm-inline">
+                                                <span class="confirm-text">Delete?</span>
+                                                <button type="button" class="btn btn-danger btn-sm"
+                                                        @onclick="() => DeleteAsync(user)" disabled="@(_busyUserId == user.Id)">
+                                                    Yes, delete
+                                                </button>
+                                                <button type="button" class="btn btn-secondary btn-sm"
+                                                        @onclick="() => _confirmDeleteUserId = null" disabled="@(_busyUserId == user.Id)">
+                                                    Cancel
+                                                </button>
+                                            </span>
+                                        }
+                                        else
+                                        {
+                                            <span class="identity-lock" data-tooltip="@UndeletableReason(user)">
+                                                <button type="button" class="btn btn-danger btn-sm"
+                                                        @onclick="() => _confirmDeleteUserId = user.Id"
+                                                        disabled="@(_busyUserId == user.Id || UndeletableReason(user) is not null)">
+                                                    Delete
+                                                </button>
+                                            </span>
+                                        }
                                     </div>
                                 </td>
                                 }
@@ -209,8 +231,8 @@
                                             <div class="form-group">
                                                 <label class="form-label">New password for @user.UserName <span class="tooltip-icon tooltip-icon-sm tooltip-icon-contrast" data-tooltip="@_passwordPolicy">?</span></label>
                                                 <input type="password" class="form-control" @bind="_newPassword"
-                                                       autocomplete="new-password" placeholder="Enter a new password" />
-                                                <p class="form-help">The user signs in with this password next time. Their MFA and passkeys are unchanged.</p>
+                                                       autocomplete="new-password" placeholder="Enter a new password" data-1p-ignore data-lpignore="true" data-bwignore />
+                                                <p class="form-help">@(IsSelf(user) || IdentityBootstrapService.IsBuiltInAdmin(user) ? "This account signs in with this password next time." : "The user signs in with this password once, then must choose their own.") Their MFA and passkeys are unchanged.</p>
                                             </div>
                                             <div class="identity-form-actions">
                                                 <button type="button" class="btn btn-primary btn-sm" @onclick="() => ResetPasswordAsync(user)">Set password</button>
@@ -302,15 +324,15 @@
                     <div class="identity-form-grid">
                         <div class="form-group">
                             <label class="form-label">Username</label>
-                            <input class="form-control" @bind="_newUserName" placeholder="john" autocomplete="off" />
+                            <input class="form-control" @bind="_newUserName" placeholder="john" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
                         </div>
                         <div class="form-group">
                             <label class="form-label">Display name (optional)</label>
-                            <input class="form-control" @bind="_newDisplayName" placeholder="John Smith" autocomplete="off" />
+                            <input class="form-control" @bind="_newDisplayName" placeholder="John Smith" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
                         </div>
                         <div class="form-group">
                             <label class="form-label">Password <span class="tooltip-icon tooltip-icon-sm tooltip-icon-contrast" data-tooltip="@_passwordPolicy">?</span></label>
-                            <input type="password" class="form-control" @bind="_newUserPassword" autocomplete="new-password" placeholder="Initial password" />
+                            <input type="password" class="form-control" @bind="_newUserPassword" autocomplete="new-password" placeholder="Initial password" data-1p-ignore data-lpignore="true" data-bwignore />
                         </div>
                         <div class="form-group">
                             <label class="form-label">Role <span class="tooltip-icon tooltip-icon-sm tooltip-icon-contrast" role="button" data-tooltip-hover-only data-tooltip="Click to see what each role can and cannot do" @onclick="() => OnExplainRoles.InvokeAsync()">?</span></label>
@@ -396,6 +418,7 @@
     private string? _message;
     private string _messageClass = "info";
     private string? _busyUserId;
+    private string? _confirmDeleteUserId;
 
     private bool _addingUser;
     private bool _creating;
@@ -592,6 +615,7 @@
         finally
         {
             _busyUserId = null;
+            _confirmDeleteUserId = null;
             await ReloadAsync();
             // Deleting an account takes its grants with it.
             await OnAccessChanged.InvokeAsync();

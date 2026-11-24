@@ -14,6 +14,7 @@
 @inject ClientDashboardService DashboardService
 @inject UniFiConnectionService ConnectionService
 @inject NavigationManager NavigationManager
+@inject IJSRuntime JS
 @inject ApMapService ApMapService
 @inject IMeshOptimizationService MeshService
 @inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
@@ -22,25 +23,29 @@
 @inject IApMapAdminService ApMapAdmin
 @inject IAuthorizationService Authz
 @inject IWiFiIssueAcknowledgmentService IssueAcknowledgments
+@inject NetworkOptimizer.Web.Services.Identity.IUserPreferences UserPreferences
 @implements IDisposable
 @rendermode InteractiveServer
+@inject IDisplayTimeZone DisplayTime
 
 <PageTitle>Wi-Fi Optimizer - Network Optimizer</PageTitle>
 
 <div class="page-header">
+    <PageBackButton />
     <h1>Wi-Fi Optimizer</h1>
-    <p class="page-description">Site health scoring, signal analysis, and optimization recommendations</p>
+    <p class="page-description">Wi-Fi health scoring, signal analysis, and optimization recommendations</p>
 </div>
 
 <RestrictedSiteNotice />
 
 <ApTelemetryBanner Message="AP Telemetry reads Wi-Fi data straight from your access points, for client stats, roam records, and radio health the UniFi Console does not report." />
+<ApTelemetryHistoryAlert />
 
 @if (!ConnectionService.IsConnected && ConnectionService.IsInitialized)
 {
     <div class="connection-banner @(!string.IsNullOrEmpty(ConnectionService.LastError) ? "connection-error" : "")">
         <div class="banner-content">
-            <span class="banner-icon">!</span>
+            <span class="banner-icon"><GatewayIcon /></span>
             <div class="banner-text">
                 @if (!string.IsNullOrEmpty(ConnectionService.LastError))
                 {
@@ -73,8 +78,9 @@
 {
     <!-- Quick Stats Row -->
     <div class="stats-row wifi-stats-row">
-        <div class="stat-card">
+        <a class="stat-card stat-card-link" href="/wifi-optimizer?tab=overview" @onclick="@(() => ShowOverviewCardAsync("wifi-health-score"))" @onclick:preventDefault>
             <div class="stat-icon wifi-health-icon @GetScoreClass(_summary?.HealthScore)">
+                <ScoreRing Score="@_summary?.HealthScore" Small="true" />
                 @if (_loading)
                 {
                     <span class="spinner-sm"></span>
@@ -95,11 +101,11 @@
                         @GetScoreLabel(_summary?.HealthScore)
                     }
                 </div>
-                <div class="stat-label">Site Health</div>
+                <div class="stat-label">Wi-Fi Health</div>
             </div>
-        </div>
+        </a>
 
-        <div class="stat-card">
+        <a class="stat-card stat-card-link" href="/wifi-optimizer?tab=overview" @onclick="@(() => ShowOverviewCardAsync("wifi-access-points"))" @onclick:preventDefault>
             <svg class="stat-icon-svg" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg" width="32" height="32">
                 <path d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" opacity="0.7"></path>
                 <path fill-rule="evenodd" clip-rule="evenodd" d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10Zm4-10a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z" opacity="0.6"></path>
@@ -119,12 +125,10 @@
                 </div>
                 <div class="stat-label">Access Points</div>
             </div>
-        </div>
+        </a>
 
-        <div class="stat-card">
-            <svg class="stat-icon-svg stat-icon-sm" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg" width="32" height="32">
-                <path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5s-3 1.34-3 3 1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/>
-            </svg>
+        <a class="stat-card stat-card-link" href="/wifi-optimizer?tab=client" @onclick="@(() => ShowClientStats(weakSignalOnly: false))" @onclick:preventDefault>
+            <AppIcon Name="clients" Class="stat-icon-svg stat-icon-sm" />
             <div class="stat-content">
                 <div class="stat-value">
                     @if (_loading)
@@ -138,12 +142,10 @@
                 </div>
                 <div class="stat-label">Wireless Clients</div>
             </div>
-        </div>
+        </a>
 
-        <div class="stat-card @(_summary?.WeakSignalClients > 0 ? "stat-warning" : "")">
-            <svg class="stat-icon-svg stat-icon-sm" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg" width="32" height="32">
-                <path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4l2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z"/>
-            </svg>
+        <a class="stat-card stat-card-link @(_summary?.WeakSignalClients > 0 ? "stat-warning" : "")" href="/wifi-optimizer?tab=client&signal=weak" @onclick="@(() => ShowClientStats(weakSignalOnly: true))" @onclick:preventDefault>
+            <AppIcon Name="wifi-weak" Class="stat-icon-svg stat-icon-sm" />
             <div class="stat-content">
                 <div class="stat-value">
                     @if (_loading)
@@ -157,12 +159,12 @@
                 </div>
                 <div class="stat-label">Weak Signal</div>
             </div>
-        </div>
+        </a>
     </div>
 
     <!-- View Tabs -->
     <div class="wifi-view-tabs-wrapper">
-        <button class="wifi-tabs-scroll-btn wifi-tabs-scroll-left" onclick="this.parentElement.querySelector('.wifi-view-tabs').scrollBy({left: -200, behavior: 'smooth'})">&#8249;</button>
+        <button class="wifi-tabs-scroll-btn wifi-tabs-scroll-left" onclick="this.parentElement.querySelector('.wifi-view-tabs').scrollBy({left: -200, behavior: 'smooth'})"><AppIcon Name="chevron-left" /></button>
         <div class="wifi-view-tabs">
             <button class="wifi-view-tab @(_activeTab == "overview" ? "active" : "")"
                     @onclick="@(() => SetActiveTab("overview"))">
@@ -198,7 +200,7 @@
             </button>
             <button class="wifi-view-tab @(_activeTab == "power" ? "active" : "")"
                     @onclick="@(() => SetActiveTab("power"))">
-                Power/Coverage
+                Power &amp; Coverage
             </button>
             <button class="wifi-view-tab @(_activeTab == "loadbalance" ? "active" : "")"
                     @onclick="@(() => SetActiveTab("loadbalance"))">
@@ -225,7 +227,7 @@
                 AP Telemetry
             </button>
         </div>
-        <button class="wifi-tabs-scroll-btn wifi-tabs-scroll-right" onclick="this.parentElement.querySelector('.wifi-view-tabs').scrollBy({left: 200, behavior: 'smooth'})">&#8250;</button>
+        <button class="wifi-tabs-scroll-btn wifi-tabs-scroll-right" onclick="this.parentElement.querySelector('.wifi-view-tabs').scrollBy({left: 200, behavior: 'smooth'})"><AppIcon Name="chevron-right" /></button>
     </div>
 
     @if (_activeTab == "metrics")
@@ -233,7 +235,7 @@
         <!-- Metrics - Time Series Charts -->
         <div class="card card-full-width">
             <div class="card-body">
-                <NetworkOptimizer.Web.Components.Shared.WiFi.Metrics InitialApMac="@_initialApMac" InitialBand="@_initialBand" />
+                <NetworkOptimizer.Web.Components.Shared.WiFi.Metrics InitialApMac="@_initialApMac" InitialBand="@_initialBand" InitialRange="@_initialRange" />
             </div>
         </div>
     }
@@ -242,7 +244,11 @@
         <!-- Client Stats Timeline -->
         <div class="card card-full-width">
             <div class="card-body">
-                <NetworkOptimizer.Web.Components.Shared.WiFi.ClientTimeline InitialClientMac="@_initialClientMac" InitialApMac="@_initialApMac" InitialBand="@_initialBand" />
+                <NetworkOptimizer.Web.Components.Shared.WiFi.ClientTimeline @key="_clientTimelineKey"
+                                                                            InitialClientMac="@_initialClientMac" InitialApMac="@_initialApMac" InitialBand="@_initialBand"
+                                                                            InitialSignalMin="@_initialSignalMin" InitialSignalMax="@_initialSignalMax"
+                                                                            InitialWeakSignal="@_initialWeakSignal"
+                                                                            OnClientNavigate="HandleClientNavigate" />
             </div>
         </div>
     }
@@ -279,7 +285,7 @@
         <!-- Channel Analysis -->
         <div class="card card-full-width">
             <div class="card-body">
-                <NetworkOptimizer.Web.Components.Shared.WiFi.ChannelAnalysis OnClientClick="HandleMapClientClick" InitialBand="@_initialBand" InitialChannel="@_initialChannel" AutoRunRecommendation="@_autoRunRecommendation" />
+                <NetworkOptimizer.Web.Components.Shared.WiFi.ChannelAnalysis OnClientClick="HandleMapClientClick" InitialBand="@_initialBand" InitialChannel="@_initialChannel" AutoRunRecommendation="@_autoRunRecommendation" OnPlanApplied="LoadChannelRecommendationsAsync" />
             </div>
         </div>
     }
@@ -306,7 +312,7 @@
         <!-- Power & Coverage Analysis -->
         <div class="card card-full-width">
             <div class="card-body">
-                <NetworkOptimizer.Web.Components.Shared.WiFi.PowerCoverageAnalysis OnClientClick="HandleMapClientClick" />
+                <NetworkOptimizer.Web.Components.Shared.WiFi.PowerCoverageAnalysis OnClientClick="HandleMapClientClick" OnNavigateToClients="HandleSignalRangeNavigate" />
             </div>
         </div>
     }
@@ -352,9 +358,9 @@
     {
     <div class="content-grid wifi-content-grid">
         <!-- Health Score Card -->
-        <div class="card">
+        <div class="card" id="wifi-health-score">
             <div class="card-header">
-                <h2 class="card-title">Site Health Score</h2>
+                <h2 class="card-title">Wi-Fi Health Score</h2>
                 <button class="btn btn-sm btn-secondary" @onclick="RefreshData" disabled="@_refreshing">
                     @if (_refreshing)
                     {
@@ -385,12 +391,13 @@
                     <div class="health-score-display">
                         <div class="health-score-main">
                             <div class="score-circle @GetScoreClass(_healthScore.OverallScore)">
+                                <ScoreRing Score="@_healthScore.OverallScore" />
                                 <span class="score-value @(_healthScore.OverallScore == 100 ? "score-perfect" : "")">@_healthScore.OverallScore</span>
                                 <span class="score-max">/100</span>
                             </div>
                             <div class="score-label">@GetScoreLabel(_healthScore.OverallScore)</div>
                             <div class="health-score-timestamp">
-                                Last updated: @_healthScore.Timestamp.ToLocalTime().ToString("h:mm tt")
+                                Last updated: @_healthScore.Timestamp.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.Time, DisplayFormat.Culture)
                             </div>
                         </div>
 
@@ -593,7 +600,7 @@
         </div>
 
         <!-- Access Points Card -->
-        <div class="card card-span-2">
+        <div class="card card-span-2" id="wifi-access-points">
             <div class="card-header">
                 <h2 class="card-title">Access Points</h2>
                 <button class="btn btn-sm btn-secondary" @onclick="RefreshData" disabled="@_refreshing">
@@ -638,7 +645,7 @@
                                         <span class="ap-status-text">@ap.Status.Label</span>
                                     </div>
                                 </div>
-                                <div class="ap-stats @(ap.IsMeshChild ? "ap-stats-mesh" : "") @(ap.MeshUplinkIsMlo || ap.MeshChildren.Any(c => c.IsMlo) ? "ap-stats-mlo" : "")">
+                                <div class="ap-stats @(ap.IsMeshChild ? "ap-stats-mesh" : "") @(ap.MeshUplinkIsMlo || ap.MeshChildren.Any(c => c.IsMlo) || ap.MeshChildren.Count > 1 ? "ap-stats-mlo" : "")">
                                     <div class="ap-stat clickable" @onclick="@(() => NavigateToTab("client", ap.Mac))" @onclick:stopPropagation="true">
                                         <span class="ap-stat-value">@ap.TotalClients</span>
                                         <span class="ap-stat-label">Clients</span>
@@ -721,7 +728,20 @@
                                     }
                                     @if (ap.MeshChildren.Count > 0)
                                     {
-                                        @foreach (var child in ap.MeshChildren)
+                                        var childPages = GetMeshChildPages(ap.MeshChildren);
+                                        var childPage = Math.Clamp(_meshChildPage.GetValueOrDefault(ap.Mac), 0, childPages.Count - 1);
+                                        var parentMac = ap.Mac;
+                                        var pageCount = childPages.Count;
+                                        @* One MLO child per page (its link rows stack), non-MLO children two to a page; the pager sits bottom right.
+                                           Every page sits in one grid cell so the card keeps the tallest page's height. *@
+                                        <div class="ap-mesh-children"
+                                             @ontouchstart="@(e => OnMeshChildTouchStart(parentMac, e))"
+                                             @ontouchend="@(e => OnMeshChildTouchEnd(parentMac, pageCount, e))">
+                                            <div class="mesh-child-pages">
+                                            @for (var p = 0; p < pageCount; p++)
+                                            {
+                                            <div class="mesh-child-page @(p == childPage ? "active" : "")">
+                                        @foreach (var child in childPages[p])
                                         {
                                             <div class="ap-mesh-info">
                                                 @if (child.IsMlo && child.Links.Count > 0)
@@ -776,6 +796,18 @@
                                                 <span class="ap-stat-label"><strong>Mesh Child@(child.IsMlo ? " (MLO)" : ""):</strong> @child.Name</span>
                                             </div>
                                         }
+                                            </div>
+                                            }
+                                            </div>
+                                            @if (pageCount > 1)
+                                            {
+                                                <div class="mesh-child-nav">
+                                                    <button class="nav-btn" @onclick="@(() => SetMeshChildPage(parentMac, childPage - 1, pageCount))" @onclick:stopPropagation="true" disabled="@(childPage == 0)">&#x2039;</button>
+                                                    <span class="modem-counter">@(childPage + 1)/@pageCount</span>
+                                                    <button class="nav-btn" @onclick="@(() => SetMeshChildPage(parentMac, childPage + 1, pageCount))" @onclick:stopPropagation="true" disabled="@(childPage >= pageCount - 1)">&#x203A;</button>
+                                                </div>
+                                            }
+                                        </div>
                                     }
                                 </div>
                                 <div class="ap-radios">
@@ -831,7 +863,17 @@
         </div>
     </div>
 
-        @if (_speedTestResults.Any(r => r.Latitude.HasValue && r.Longitude.HasValue) || _apMapMarkers.Any())
+        var hasSpeedMap = _speedTestResults.Any(r => r.Latitude.HasValue && r.Longitude.HasValue) || _apMapMarkers.Any();
+        @if (hasSpeedMap)
+        {
+            <div class="time-range-selector wifi-overview-map-switch" role="tablist" aria-label="Map">
+                <button class="time-btn @(_overviewMap == OverviewSpeedMap ? "active" : "")" role="tab" aria-selected="@(_overviewMap == OverviewSpeedMap)"
+                        @onclick="() => SetOverviewMapAsync(OverviewSpeedMap)">Speed Map</button>
+                <button class="time-btn @(_overviewMap == OverviewSignalMap ? "active" : "")" role="tab" aria-selected="@(_overviewMap == OverviewSignalMap)"
+                        @onclick="() => SetOverviewMapAsync(OverviewSignalMap)">Signal Map</button>
+            </div>
+        }
+        @if (hasSpeedMap && _overviewMap == OverviewSpeedMap)
         {
             <SpeedTestMap Results="_speedTestResults"
                           ApMarkers="_apMapMarkers"
@@ -842,6 +884,10 @@
                           TimeFilterHours="_speedTestTimeRangeHours"
                           ClientDetailMode="true"
                           ShowDashboardLinks="true" />
+        }
+        else if (hasSpeedMap)
+        {
+            <NetworkOptimizer.Web.Components.Shared.WiFi.FloorPlanEditor SpeedTestResults="_speedTestResults" SignalLogMarkers="_signalMapPoints" OnClientClick="HandleMapClientClick" OnSignalTimeRangeChanged="HandleSignalTimeRangeChanged" SignalTimeFilterHours="_signalTimeRangeHours" />
         }
     } @* End of overview tab *@
 }
@@ -864,8 +910,25 @@
     [SupplyParameterFromQuery(Name = "channel")]
     public int? ChannelQueryParam { get; set; }
 
+    /// <summary>Client Stats signal range in dBm, either end optional (a Signal Strength Distribution bar).</summary>
+    [SupplyParameterFromQuery(Name = "sigmin")]
+    public int? SignalMinQueryParam { get; set; }
+
+    [SupplyParameterFromQuery(Name = "sigmax")]
+    public int? SignalMaxQueryParam { get; set; }
+
+    /// <summary>"weak": Client Stats lists only weak-signal clients, by the per-band rule the Weak Signal card counts.</summary>
+    [SupplyParameterFromQuery(Name = "signal")]
+    public string? SignalClassQueryParam { get; set; }
+
+    private bool WeakSignalQuery => string.Equals(SignalClassQueryParam, "weak", StringComparison.OrdinalIgnoreCase);
+
     [SupplyParameterFromQuery(Name = "recommend")]
     public bool? RecommendQueryParam { get; set; }
+
+    /// <summary>A Metrics time range preset to open on ("1h", "1D", ...).</summary>
+    [SupplyParameterFromQuery(Name = "range")]
+    public string? RangeQueryParam { get; set; }
 
     [SupplyParameterFromQuery(Name = "edge")]
     public string? EdgeQueryParam { get; set; }
@@ -875,12 +938,55 @@
     private bool _loading = true;
     private bool _refreshing = false;
     private string _activeTab = "overview";
+
+    // Which map Overview shows; each user's last choice (IUserPreferences).
+    private const string OverviewSpeedMap = "speed";
+    private const string OverviewSignalMap = "signal";
+    private const string OverviewMapPreference = "wifi.overviewMap";
+    private string _overviewMap = OverviewSpeedMap;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_scrollToOverviewCard is { } cardId && _activeTab == "overview")
+        {
+            _scrollToOverviewCard = null;
+            try { await JS.InvokeVoidAsync("noHighlightTarget", cardId); }
+            catch (Exception ex) when (ex is not OperationCanceledException) { }
+        }
+
+        // The caller is known only in the circuit, so the saved choice is read after the first render.
+        if (!firstRender) return;
+        try
+        {
+            if (await UserPreferences.GetAsync(OverviewMapPreference) is OverviewSignalMap)
+            {
+                _overviewMap = OverviewSignalMap;
+                StateHasChanged();
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException) { }
+    }
+
+    private async Task SetOverviewMapAsync(string map)
+    {
+        if (_overviewMap == map) return;
+        _overviewMap = map;
+        try { await UserPreferences.SetAsync(OverviewMapPreference, map); }
+        catch (Exception ex) when (ex is not OperationCanceledException) { }
+    }
     private string? _initialClientMac;
     private string? _initialApMac;
     private RadioBand? _initialBand;
     private int? _initialChannel;
+    private int? _initialSignalMin;
+    private int? _initialSignalMax;
+    private bool _initialWeakSignal;
+    // Bumped by the stat cards so Client Stats re-applies their filter even when it is already open.
+    private int _clientTimelineKey;
+    private string? _scrollToOverviewCard;
     private bool _autoRunRecommendation;
     private string? _initialEdge;
+    private string? _initialRange;
 
     private static readonly HashSet<string> ValidTabs = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -898,13 +1004,25 @@
 
     private async Task SetActiveTab(string tab)
     {
+        // Switching tabs only navigates; OnParametersSet switches once the URL changes. A tab's
+        // NavigationLock (a wall half drawn, an import under way) can then cancel the switch.
+        if (tab != _activeTab)
+        {
+            NavigationManager.NavigateTo("/wifi-optimizer?tab=" + tab, forceLoad: false, replace: false);
+            return;
+        }
+
         _activeTab = tab;
         // Clear all drill-down filters when manually switching tabs
         _initialClientMac = null;
         _initialApMac = null;
         _initialBand = null;
         _initialChannel = null;
+        _initialSignalMin = null;
+        _initialSignalMax = null;
+        _initialWeakSignal = false;
         _initialEdge = null;
+        _initialRange = null;
         _autoRunRecommendation = false;
 
         // Reload AP markers when entering Speed Map tab (may have been edited on Signal Map)
@@ -917,13 +1035,18 @@
         _lastTabParam = tab;
     }
 
-    private void NavigateToTab(string tab, string? apMac = null, RadioBand? band = null, int? channel = null)
+    private void NavigateToTab(string tab, string? apMac = null, RadioBand? band = null, int? channel = null,
+        int? signalMin = null, int? signalMax = null, bool weakSignal = false)
     {
         _activeTab = tab;
         _initialApMac = apMac;
         _initialBand = band;
         _initialChannel = channel;
+        _initialSignalMin = signalMin;
+        _initialSignalMax = signalMax;
+        _initialWeakSignal = weakSignal;
         _initialClientMac = null;
+        _initialRange = null;
         _autoRunRecommendation = false;
 
         // Build URL with filter params
@@ -934,10 +1057,39 @@
             uri += "&band=" + BandToQueryString(band.Value);
         if (channel.HasValue)
             uri += "&channel=" + channel.Value;
+        uri += SignalQuery(signalMin, signalMax, weakSignal);
 
         NavigationManager.NavigateTo(uri, forceLoad: false, replace: false);
         _lastTabParam = tab;
     }
+
+    private static string SignalQuery(int? min, int? max, bool weak = false) =>
+        (min.HasValue ? "&sigmin=" + min.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "")
+        + (max.HasValue ? "&sigmax=" + max.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "")
+        + (weak ? "&signal=weak" : "");
+
+    /// <summary>The Wireless Clients and Weak Signal cards: Client Stats, all clients or the weak-signal ones.</summary>
+    private void ShowClientStats(bool weakSignalOnly)
+    {
+        NavigateToTab("client", weakSignal: weakSignalOnly);
+        _clientTimelineKey++;
+    }
+
+    /// <summary>The Wi-Fi Health and Access Points cards: the Overview card with that id, scrolled to once it renders.</summary>
+    private async Task ShowOverviewCardAsync(string cardId)
+    {
+        if (_activeTab != "overview")
+        {
+            _scrollToOverviewCard = cardId;
+            NavigateToTab("overview");
+            return;
+        }
+        try { await JS.InvokeVoidAsync("noHighlightTarget", cardId); }
+        catch (Exception ex) when (ex is not OperationCanceledException) { }
+    }
+
+    private void HandleSignalRangeNavigate((int? Min, int? Max) range) =>
+        NavigateToTab("client", signalMin: range.Min, signalMax: range.Max);
 
     private static string BandToQueryString(RadioBand band) => band switch
     {
@@ -978,7 +1130,8 @@
         await InvokeAsync(StateHasChanged);
         try
         {
-            _channelPlans = await WiFiService.GetAllChannelRecommendationsAsync(new RecommendationOptions());
+            var options = new RecommendationOptions { DfsPreference = await WiFiService.GetDefaultDfsPreferenceAsync() };
+            _channelPlans = await WiFiService.GetAllChannelRecommendationsAsync(options);
         }
         catch
         {
@@ -1032,6 +1185,62 @@
 
     // MACs of mesh children with an in-flight Optimize Mesh action (drives the per-card spinner).
     private readonly HashSet<string> _optimizingMacs = new();
+
+    /// <summary>Current mesh-child page per parent AP MAC, and where a swipe on it started.</summary>
+    private readonly Dictionary<string, int> _meshChildPage = new();
+    private readonly Dictionary<string, double> _meshChildTouchX = new();
+
+    /// <summary>Swipe distance in px that turns a mesh-child page.</summary>
+    private const double MeshChildSwipePx = 40;
+
+    /// <summary>
+    /// Pages of a parent's mesh children: an MLO child alone (its link rows fill the block), and
+    /// the rest two to a page, in list order.
+    /// </summary>
+    private static List<List<MeshChildInfo>> GetMeshChildPages(List<MeshChildInfo> children)
+    {
+        var pages = new List<List<MeshChildInfo>>();
+        List<MeshChildInfo>? pair = null;
+        foreach (var child in children)
+        {
+            if (child.IsMlo && child.Links.Count > 0)
+            {
+                pages.Add([child]);
+                pair = null;
+                continue;
+            }
+
+            if (pair == null || pair.Count == 2)
+            {
+                pair = [];
+                pages.Add(pair);
+            }
+            pair.Add(child);
+        }
+        return pages;
+    }
+
+    private void SetMeshChildPage(string parentMac, int page, int pageCount) =>
+        _meshChildPage[parentMac] = Math.Clamp(page, 0, pageCount - 1);
+
+    private void OnMeshChildTouchStart(string parentMac, TouchEventArgs e)
+    {
+        if (e.Touches.Length > 0)
+            _meshChildTouchX[parentMac] = e.Touches[0].ClientX;
+    }
+
+    private void OnMeshChildTouchEnd(string parentMac, int pageCount, TouchEventArgs e)
+    {
+        if (!_meshChildTouchX.Remove(parentMac, out var startX) || e.ChangedTouches.Length == 0 || pageCount < 2)
+            return;
+
+        var dx = e.ChangedTouches[0].ClientX - startX;
+        if (Math.Abs(dx) < MeshChildSwipePx)
+            return;
+
+        var current = _meshChildPage.GetValueOrDefault(parentMac);
+        SetMeshChildPage(parentMac, dx < 0 ? current + 1 : current - 1, pageCount);
+    }
     private string? _toastMessage;
     private string? _toastNote;
     private string _toastClass = "alert-info";
@@ -1066,6 +1275,12 @@
             _activeTab = "client";
             _initialClientMac = ClientQueryParam;
             _lastTabParam = "client";
+            // A client's URL carries the list's filters, so Back after a reload lands on the same list.
+            _initialApMac = ApQueryParam;
+            _initialBand = BandFromQueryString(BandQueryParam);
+            _initialSignalMin = SignalMinQueryParam;
+            _initialSignalMax = SignalMaxQueryParam;
+            _initialWeakSignal = WeakSignalQuery;
         }
         else if (!string.IsNullOrEmpty(TabParam))
         {
@@ -1075,9 +1290,13 @@
             // Parse drill-down filter params
             _initialApMac = ApQueryParam;
             _initialBand = BandFromQueryString(BandQueryParam);
+            _initialSignalMin = SignalMinQueryParam;
+            _initialSignalMax = SignalMaxQueryParam;
+            _initialWeakSignal = WeakSignalQuery;
             _initialChannel = ChannelQueryParam;
             _autoRunRecommendation = RecommendQueryParam == true;
             _initialEdge = EdgeQueryParam;
+            _initialRange = RangeQueryParam;
         }
         else
         {
@@ -1136,12 +1355,19 @@
             _activeTab = "client";
             _initialClientMac = ClientQueryParam;
         }
+        // Back from a client's details: the URL keeps the Client Stats tab and drops the client.
+        else if (string.IsNullOrEmpty(ClientQueryParam) && _initialClientMac != null
+                 && _activeTab == "client" && ResolveTab(TabParam) == "client")
+        {
+            _initialClientMac = null;
+        }
         else if (!string.IsNullOrEmpty(EdgeQueryParam) && EdgeQueryParam != _initialEdge)
         {
             _activeTab = "roaming";
             _initialEdge = EdgeQueryParam;
         }
-        else if (TabParam != _lastTabParam && _lastTabParam != null)
+        // A bare /wifi-optimizer leaves the last tab null, and a link from it (a health issue's) must still switch.
+        else if (TabParam != _lastTabParam)
         {
             var newTab = ResolveTab(TabParam);
             if (newTab != _activeTab)
@@ -1152,14 +1378,29 @@
                 // Re-parse drill-down params for the new tab
                 _initialApMac = ApQueryParam;
                 _initialBand = BandFromQueryString(BandQueryParam);
+                _initialSignalMin = SignalMinQueryParam;
+                _initialSignalMax = SignalMaxQueryParam;
+                _initialWeakSignal = WeakSignalQuery;
                 _initialChannel = ChannelQueryParam;
                 _autoRunRecommendation = RecommendQueryParam == true;
                 _initialEdge = EdgeQueryParam;
+                _initialRange = RangeQueryParam;
+                // The Speed Map reloads AP markers on entry: they may have moved on the Signal Map.
+                if (newTab == "coverage") _apMarkersStale = true;
 
                 StateHasChanged();
             }
         }
         _lastTabParam = TabParam;
+    }
+
+    private bool _apMarkersStale;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (!_apMarkersStale) return;
+        _apMarkersStale = false;
+        await LoadApMarkers();
     }
 
     private async void OnConnectionChanged()
@@ -1228,7 +1469,7 @@
 
         try
         {
-            var result = await MeshService.OptimizeAsync(ap.Ip, ap.MeshUplinkInterface, ap.Name);
+            var result = await MeshService.OptimizeAsync(ap.Ip, ap.MeshUplinkInterface, ap.Name, ap.Mac);
             // Only warn about the data lag when it actually roamed - there's nothing to wait for
             // on a noop or a failure.
             var note = result.Action == "moved"
@@ -1368,6 +1609,41 @@
         _initialClientMac = mac;
         NavigationManager.NavigateTo("/wifi-optimizer?tab=client&client=" + Uri.EscapeDataString(mac), forceLoad: false, replace: false);
         _lastTabParam = "client";
+    }
+
+    /// <summary>A client was opened from the Client Stats list, so the list is the history entry right behind it.</summary>
+    private bool _listBehindClient;
+
+    /// <summary>
+    /// A client picked in Client Stats, or the list (null), goes in the URL so the browser's Back and
+    /// Forward step between the list and a client. The list's AP and band filters stay in it. Back
+    /// to the list steps back through history when the list is right behind, so Back after it does
+    /// not return to the client.
+    /// </summary>
+    private async Task HandleClientNavigate(string? mac)
+    {
+        if (string.IsNullOrEmpty(mac) && _listBehindClient)
+        {
+            _listBehindClient = false;
+            _initialClientMac = null;
+            await JS.InvokeVoidAsync("history.back");
+            return;
+        }
+        _listBehindClient = !string.IsNullOrEmpty(mac) && _initialClientMac == null;
+
+        var uri = "/wifi-optimizer?tab=client";
+        if (!string.IsNullOrEmpty(ApQueryParam))
+            uri += "&ap=" + Uri.EscapeDataString(ApQueryParam);
+        if (!string.IsNullOrEmpty(BandQueryParam))
+            uri += "&band=" + Uri.EscapeDataString(BandQueryParam);
+        uri += SignalQuery(SignalMinQueryParam, SignalMaxQueryParam, WeakSignalQuery);
+        if (!string.IsNullOrEmpty(mac))
+            uri += "&client=" + Uri.EscapeDataString(mac);
+
+        _activeTab = "client";
+        _initialClientMac = string.IsNullOrEmpty(mac) ? null : mac;
+        _lastTabParam = "client";
+        NavigationManager.NavigateTo(uri, forceLoad: false, replace: false);
     }
 
     private void HandleApLoadBalanceNavigate((string? ApMac, RadioBand? Band) filter)

@@ -16,7 +16,8 @@ namespace NetworkOptimizer.Monitoring.Probes;
 /// - TCP probe is .NET sockets — fully cross-platform.
 /// - Traceroute shells out to the OS binary. On Linux Docker we install the `traceroute`
 ///   package (see open question 9). On Windows we shell out to `tracert.exe`. On macOS
-///   `traceroute` is built in.
+///   `traceroute` is built in. Where only BusyBox's applet exists (some UniFi OS gateways),
+///   it runs as `busybox traceroute`.
 ///
 /// Capability detection caches its result after the first call.
 /// </summary>
@@ -29,13 +30,14 @@ public class LocalProbeExecutor : IProbeExecutor
     private bool _tracerouteBinaryAvailable;
     private TracerouteBinaryTraits _tracerouteTraits = TracerouteBinaryTraits.FullyBindable;
 
-    // Throttle native Process.Start. macOS ARM64 has a .NET 10 runtime bug
+    // Throttle native Process.Start on macOS only. macOS ARM64 has a .NET 10 runtime bug
     // (dotnet/runtime#112167) where concurrent Process.Start with redirected
-    // stdout/stderr causes heap corruption and Abort trap: 6. Limit to 2 on
-    // macOS (faster 0.1s ping interval compensates). Linux is unaffected.
+    // stdout/stderr causes heap corruption and Abort trap: 6. Limit to 2 there
+    // (faster 0.1s ping interval compensates). Linux is unaffected, and a cap there queued a
+    // discovery sweep's traces past the server's per-request wait on an agent, so none applies.
     private readonly SemaphoreSlim _processLaunchLimiter = new(
-        OperatingSystem.IsMacOS() ? 2 : 4,
-        OperatingSystem.IsMacOS() ? 2 : 4);
+        OperatingSystem.IsMacOS() ? 2 : int.MaxValue,
+        OperatingSystem.IsMacOS() ? 2 : int.MaxValue);
 
     public LocalProbeExecutor(ILogger<LocalProbeExecutor> logger)
     {
@@ -92,9 +94,27 @@ public class LocalProbeExecutor : IProbeExecutor
 
     private async Task<bool> IsTracerouteInstalledAsync(CancellationToken ct)
     {
+        var banner = await ReadTracerouteBannerAsync("traceroute", "-V", ct);
+        var viaBusyBox = false;
+        if (banner == null)
+        {
+            // Some UniFi OS gateways (UDR7, UCG-Ultra) ship no traceroute binary, only BusyBox's
+            // applet. Run with no arguments it prints its usage; without the applet it says so instead.
+            banner = await ReadTracerouteBannerAsync("busybox", "traceroute", ct);
+            if (banner == null || banner.IndexOf("Usage: traceroute", StringComparison.OrdinalIgnoreCase) < 0)
+                return false;
+            viaBusyBox = true;
+        }
+        _tracerouteTraits = InterpretTracerouteBanner(banner) with { ViaBusyBoxMultiCall = viaBusyBox };
+        return true;
+    }
+
+    /// <summary>Runs a traceroute just to read its version or usage text; null when it cannot be started.</summary>
+    private async Task<string?> ReadTracerouteBannerAsync(string exe, string args, CancellationToken ct)
+    {
         try
         {
-            var psi = new ProcessStartInfo("traceroute", "-V")
+            var psi = new ProcessStartInfo(exe, args)
             {
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -102,7 +122,7 @@ public class LocalProbeExecutor : IProbeExecutor
                 CreateNoWindow = true
             };
             using var probe = Process.Start(psi);
-            if (probe == null) return false;
+            if (probe == null) return null;
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromSeconds(2));
             // Both streams: GNU traceroute prints its version on stdout, while BusyBox and
@@ -113,15 +133,13 @@ public class LocalProbeExecutor : IProbeExecutor
             var stdoutTask = probe.StandardOutput.ReadToEndAsync(cts.Token);
             var stderrTask = probe.StandardError.ReadToEndAsync(cts.Token);
             try { await probe.WaitForExitAsync(cts.Token); } catch { }
-            var banner = (await SafeReadAsync(stdoutTask) ?? string.Empty)
+            return (await SafeReadAsync(stdoutTask) ?? string.Empty)
                 + "\n" + (await SafeReadAsync(stderrTask) ?? string.Empty);
-            _tracerouteTraits = InterpretTracerouteBanner(banner);
-            return true;
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Local traceroute binary probe failed");
-            return false;
+            _logger.LogDebug(ex, "Local traceroute binary probe ({Exe}) failed", exe);
+            return null;
         }
     }
 
@@ -134,7 +152,21 @@ public class LocalProbeExecutor : IProbeExecutor
     /// offered. A probe that cannot bind must fail rather than leave by the default route:
     /// that would record another WAN's latency under this one's name.
     /// </summary>
-    internal readonly record struct TracerouteBinaryTraits(bool IsBusyBox, bool CanBindAddress, bool CanBindInterface)
+    /// <param name="ReportsBackHops">
+    /// Linux traceroute (Butskoy's, the one that calls itself "Modern traceroute for Linux") takes
+    /// <c>--back</c> and then prints a hop's return hop count wherever it differs from the forward
+    /// one. Nothing else has the option, so it is only ever passed to a binary that announced itself.
+    /// </param>
+    /// <param name="CanIcmp">
+    /// Whether <c>-I</c> sends ICMP. A BusyBox built without ICMP support still accepts <c>-I</c> and
+    /// sends UDP, so for BusyBox this is read from the usage text, which lists <c>-I</c> only when it works.
+    /// </param>
+    /// <param name="CanTcp">Whether <c>-T</c> exists. No BusyBox build has it.</param>
+    /// <param name="ViaBusyBoxMultiCall">
+    /// No <c>traceroute</c> on the PATH, only the applet, so the command runs as <c>busybox traceroute</c>.
+    /// </param>
+    internal readonly record struct TracerouteBinaryTraits(bool IsBusyBox, bool CanBindAddress, bool CanBindInterface,
+        bool ReportsBackHops = false, bool CanIcmp = true, bool CanTcp = true, bool ViaBusyBoxMultiCall = false)
     {
         /// <summary>A GNU/BSD traceroute: both bind options present. Also the assumption before detection runs.</summary>
         public static TracerouteBinaryTraits FullyBindable => new(false, true, true);
@@ -146,16 +178,58 @@ public class LocalProbeExecutor : IProbeExecutor
     {
         if (string.IsNullOrWhiteSpace(banner)) return TracerouteBinaryTraits.FullyBindable;
         if (banner.IndexOf("busybox", StringComparison.OrdinalIgnoreCase) < 0)
-            return TracerouteBinaryTraits.FullyBindable;
+            return TracerouteBinaryTraits.FullyBindable with
+            {
+                ReportsBackHops = banner.Contains("Modern traceroute", StringComparison.OrdinalIgnoreCase)
+            };
 
         return new TracerouteBinaryTraits(
             IsBusyBox: true,
             CanBindAddress: MentionsOption(banner, 's'),
-            CanBindInterface: MentionsOption(banner, 'i'));
+            CanBindInterface: MentionsOption(banner, 'i'),
+            CanIcmp: MentionsOption(banner, 'I'),
+            CanTcp: false);
     }
 
-    /// <summary>Whether a usage line lists a single-letter option, either bare or inside a bundled flag group.</summary>
-    private static bool MentionsOption(string banner, char option)
+    /// <summary>
+    /// Decides how a trace in <paramref name="requested"/> mode runs when the native binary is present.
+    /// ICMP on a binary without it runs as UDP and reports UDP. It never falls to the managed trace:
+    /// discovery runs ICMP and UDP side by side, and spots managed RTTs only by a UDP request answered
+    /// as ICMP, so a native UDP / managed ICMP mix would pass its concurrent RTTs as trusted.
+    /// TCP without <c>-T</c> takes the managed trace unbound, as with no binary, and fails bound.
+    /// </summary>
+    /// <returns>Whether to use the binary, the mode it runs in, or the reason the trace cannot run.</returns>
+    internal static (bool UseBinary, ProbeMode Mode, string? Error) ChooseTraceMode(
+        ProbeMode requested, bool sourceBound, TracerouteBinaryTraits traits)
+    {
+        if (requested == ProbeMode.Icmp && !traits.CanIcmp)
+            return (true, ProbeMode.Udp, null);
+        if (requested != ProbeMode.Tcp || traits.CanTcp)
+            return (true, requested, null);
+        return sourceBound
+            ? (false, requested, "This host's traceroute has no TCP mode, so a source-bound TCP trace cannot run")
+            : (false, requested, null);
+    }
+
+    /// <summary>
+    /// BusyBox reports an interface it cannot bind on stderr and then traces anyway, out the default
+    /// route, with exit 0. Its output would file another WAN's path under this one, so it is an error.
+    /// </summary>
+    /// <returns>The error to fail the trace with, or null when the bind held.</returns>
+    internal static string? DetectBindFailure(string? stderr, string? source)
+    {
+        if (string.IsNullOrEmpty(source) || string.IsNullOrEmpty(stderr)) return null;
+        return stderr.Contains("can't bind to interface", StringComparison.OrdinalIgnoreCase)
+            ? $"traceroute could not bind to '{source}'"
+            : null;
+    }
+
+    /// <summary>
+    /// Whether a usage line lists a single-letter option, either bare or inside a bundled flag group
+    /// ("[ -46dFITnreAUDV ]"). Case matters: -I is ICMP, -i an interface. Public so the SSH vantage
+    /// reads a remote traceroute's usage the same way.
+    /// </summary>
+    public static bool MentionsOption(string banner, char option)
     {
         for (var i = 0; i < banner.Length - 1; i++)
         {
@@ -246,9 +320,11 @@ public class LocalProbeExecutor : IProbeExecutor
             var overall = TimeSpan.FromSeconds(interval * safeCount + timeoutSeconds + 5);
             using var killCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             killCts.CancelAfter(overall);
+            var killedHere = false;
             try { await proc.WaitForExitAsync(killCts.Token); }
             catch (OperationCanceledException)
             {
+                killedHere = true;
                 try { proc.Kill(entireProcessTree: true); } catch { }
             }
             var stdout = await SafeReadAsync(stdoutTask);
@@ -256,14 +332,19 @@ public class LocalProbeExecutor : IProbeExecutor
             if (stdout is null)
                 throw new ProbeOutputTimeoutException(
                     $"ping output read for {target.Address} did not complete within {OutputReadGrace.TotalSeconds:0}s");
+            // ping exits 0, 1 or 2; above 128 is 128 + a signal sent from outside, as when the agent's
+            // service stops and takes its children with it. A burst cut short is not loss.
+            if (!killedHere && proc.HasExited && proc.ExitCode > 128)
+                throw new ProbeInterruptedException($"ping to {target.Address} was ended by signal {proc.ExitCode - 128}");
 
             var parsed = PingOutputParser.Parse(stdout, target, Vantage, safeCount);
             return parsed;
         }
         // Output-timeout means async completion delivery is broken, and the managed
         // Ping path depends on the same machinery - falling back would hang or
-        // fabricate. Let it propagate; callers drop the sample.
-        catch (Exception ex) when (ex is not ProbeOutputTimeoutException)
+        // fabricate. An interrupted ping has no outcome either. Let both propagate;
+        // callers drop the sample.
+        catch (Exception ex) when (ex is not ProbeOutputTimeoutException and not ProbeInterruptedException)
         {
             _logger.LogDebug(ex, "Native ping invocation failed; falling back to managed Ping");
             return await ManagedPingAsync(target, count, timeout, ct);
@@ -510,6 +591,7 @@ public class LocalProbeExecutor : IProbeExecutor
         int maxHops = 30,
         TimeSpan? perHopTimeout = null,
         TimeSpan? totalDeadline = null,
+        int? probesPerHop = null,
         CancellationToken ct = default)
     {
         await GetCapabilityAsync(ct);
@@ -520,9 +602,20 @@ public class LocalProbeExecutor : IProbeExecutor
         // that the managed implementation can't get. On Windows MSI installs the binary
         // isn't available and tracert.exe's output is a different format, so we fall back
         // to the managed Ping-with-TTL implementation only there (or as a last-resort
-        // fallback when traceroute is genuinely missing).
+        // fallback when neither traceroute nor BusyBox's applet is present).
         var deadlineDuration = totalDeadline ?? TimeSpan.FromSeconds(10);
-        if (!_tracerouteBinaryAvailable || OperatingSystem.IsWindows())
+        var useBinary = _tracerouteBinaryAvailable && !OperatingSystem.IsWindows();
+        var mode = target.Mode;
+        if (useBinary)
+        {
+            var (binary, chosen, modeError) = ChooseTraceMode(
+                target.Mode, !string.IsNullOrEmpty(target.SourceInterface), _tracerouteTraits);
+            if (modeError != null)
+                return FailTrace(target, modeError);
+            useBinary = binary;
+            mode = chosen;
+        }
+        if (!useBinary)
         {
             // The managed Ping-with-TTL traceroute cannot bind a source, exactly as the
             // managed ping path cannot. Tracing out the default route would attribute
@@ -532,10 +625,17 @@ public class LocalProbeExecutor : IProbeExecutor
 
             using var managedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             managedCts.CancelAfter(deadlineDuration);
-            return await _managedTraceroute.RunAsync(target, Vantage, maxHops, perHopTimeout, 3, managedCts.Token);
+            // Capped at three: the managed trace sends its probes one after another, so every silent
+            // hop costs probes x timeout, and five a hop runs a typical path into the deadline.
+            return await _managedTraceroute.RunAsync(target, Vantage, maxHops, perHopTimeout,
+                Math.Min(probesPerHop ?? 3, 3), managedCts.Token);
         }
 
-        var (exe, args, buildError) = BuildTracerouteCommand(target, maxHops, perHopTimeout, _tracerouteTraits);
+        var (exe, args, buildError) = BuildTracerouteCommand(
+            target with { Mode = mode }, maxHops, perHopTimeout, _tracerouteTraits, probesPerHop);
+        // Mirrors the --back decision BuildTracerouteCommand made, so the parser knows a hop
+        // printed without a return count came home by as many hops as it went out.
+        var backHops = probesPerHop.HasValue && _tracerouteTraits.ReportsBackHops;
         if (buildError != null)
             return FailTrace(target, buildError);
         // Acquire the throttle FIRST, THEN start the per-trace deadline. The
@@ -590,8 +690,12 @@ public class LocalProbeExecutor : IProbeExecutor
             var stdout = stdoutTask.IsCompletedSuccessfully ? stdoutTask.Result : (await SafeReadAsync(stdoutTask) ?? string.Empty);
             var stderr = stderrTask.IsCompletedSuccessfully ? stderrTask.Result : (await SafeReadAsync(stderrTask) ?? string.Empty);
 
+            var bindError = DetectBindFailure(stderr, target.SourceInterface);
+            if (bindError != null)
+                return FailTrace(target, bindError);
+
             var output = string.IsNullOrWhiteSpace(stdout) ? stderr : stdout;
-            return TracerouteOutputParser.Parse(output, target, Vantage, target.Mode);
+            return TracerouteOutputParser.Parse(output, target, Vantage, mode, backHopsReported: backHops);
         }
         catch (Exception ex)
         {
@@ -776,10 +880,13 @@ public class LocalProbeExecutor : IProbeExecutor
     /// <param name="maxHops">TTL ceiling.</param>
     /// <param name="perHopTimeout">Per-hop wait; floored at one second, which is the flag's unit.</param>
     /// <param name="traits">What the installed binary can bind, from <see cref="InterpretTracerouteBanner"/>.</param>
+    /// <param name="probesPerHop">Probes per TTL; null keeps the two this has always sent. A caller that
+    /// asks for a count is reading per-hop behavior, so it also gets <c>--back</c> where the binary has it.</param>
     /// <param name="isWindows">Which platform's traceroute to build for; defaults to this host's.</param>
     /// <returns>The executable and arguments, or an error explaining why the probe cannot run.</returns>
     internal static (string Exe, string Args, string? Error) BuildTracerouteCommand(
-        ProbeTarget target, int maxHops, TimeSpan? perHopTimeout, TracerouteBinaryTraits traits, bool? isWindows = null)
+        ProbeTarget target, int maxHops, TimeSpan? perHopTimeout, TracerouteBinaryTraits traits,
+        int? probesPerHop = null, bool? isWindows = null)
     {
         var wait = (int)Math.Max(1, (perHopTimeout ?? TimeSpan.FromSeconds(2)).TotalSeconds);
         if (isWindows ?? OperatingSystem.IsWindows())
@@ -819,7 +926,9 @@ public class LocalProbeExecutor : IProbeExecutor
         // PTR resolution stays ON — hostnames like "cr1.stl1.example.net" are gold for the
         // wizard's hop-labelling logic (spec 5.5). Linux's resolver times out fast, so the
         // cost is bounded by the per-probe deadline anyway.
-        var args = $"-m {maxHops} -q 2 -w {wait} {protoFlag} {sourceArg}{target.Address}".Trim();
-        return ("traceroute", args, null);
+        var queries = probesPerHop is int q ? Math.Clamp(q, 1, 10) : 2;
+        var back = probesPerHop.HasValue && traits.ReportsBackHops ? "--back " : string.Empty;
+        var args = $"-m {maxHops} -q {queries} -w {wait} {back}{protoFlag} {sourceArg}{target.Address}".Trim();
+        return traits.ViaBusyBoxMultiCall ? ("busybox", $"traceroute {args}", null) : ("traceroute", args, null);
     }
 }

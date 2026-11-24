@@ -349,7 +349,7 @@ public class PortSecurityAnalyzer
                 continue;
 
             var key = (client.LastUplinkMac.ToLowerInvariant(), client.LastUplinkRemotePort.Value);
-            var clientName = client.DisplayName ?? client.Name ?? client.Hostname ?? client.Mac;
+            var clientName = UniFi.ClientNames.For(client) ?? client.Mac;
 
             // Keep the most recently seen client per port
             if (lookup.TryGetValue(key, out var existing))
@@ -524,8 +524,8 @@ public class PortSecurityAnalyzer
 
     /// <summary>
     /// Determine the effective device role using uplink-based detection.
-    /// Gateway-class devices (UDR, UX, UDM, etc.) that uplink to another UniFi device
-    /// are mesh APs, not gateways. UDR/UX devices have integrated APs.
+    /// A gateway-class device that uplinks to another UniFi device is an Express (UX, UX7)
+    /// adopted as an AP, not the gateway.
     /// </summary>
     /// <remarks>
     /// This logic parallels UniFiDiscovery.DetermineDeviceType but works with raw JSON.
@@ -543,6 +543,10 @@ public class PortSecurityAnalyzer
         // Non-gateway types are switches (not gateway, not AP)
         if (!baseType.IsGateway())
             return (false, false);
+
+        // The device's own mode decides first: an Express adopted as an AP reports "mesh".
+        if (NetworkOptimizer.UniFi.UniFiProductDatabase.IsAccessPointMode(device.GetStringOrNull("device_mode_override")))
+            return (false, true);
 
         // If we don't have device MAC info, fall back to API type (assume gateway)
         if (allDeviceMacs == null || allDeviceMacs.Count == 0)

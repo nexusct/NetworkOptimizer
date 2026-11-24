@@ -2,6 +2,7 @@ using NetworkOptimizer.Alerts.Interfaces;
 using NetworkOptimizer.Core;
 using NetworkOptimizer.Core.Enums;
 using NetworkOptimizer.Storage.Models;
+using NetworkOptimizer.Storage.Models.Identity;
 using NetworkOptimizer.UniFi;
 
 namespace NetworkOptimizer.Web.Services;
@@ -26,6 +27,37 @@ public static class ScheduleExecutorRegistration
             ExecuteLanSpeedTestAsync(app.Services, siteKey, targetId, ct);
         scheduleService.SqmLearningExecutor = (siteKey, taskId, targetId, targetConfig, ct) =>
             ExecuteSqmLearningAsync(app.Services, siteKey, taskId, targetId, targetConfig, ct);
+
+        var connections = app.Services.GetRequiredService<SiteConnectionRegistry>();
+        scheduleService.SkipTask = (siteKey, task) =>
+            siteKey == SiteManagementService.DefaultSiteSlug
+            && connections.GetDefault().HasNoConsole
+            && NeedsConsole(task);
+    }
+
+    /// <summary>
+    /// Whether a scheduled task needs the site's UniFi Console (or the gateway it finds). The
+    /// server-side WAN speed test and LAN speed tests to configured devices run without one.
+    /// </summary>
+    internal static bool NeedsConsole(NetworkOptimizer.Alerts.Models.ScheduledTask task)
+    {
+        switch (task.TaskType)
+        {
+            case "audit":
+            case NetworkOptimizer.Alerts.ScheduleService.SqmLearningTaskType:
+                return true;
+            case "wan_speedtest":
+                try
+                {
+                    return ParseWanTestConfig(task.TargetConfig).TestType != "server";
+                }
+                catch (Exception)
+                {
+                    return true; // an unreadable config fails its run anyway
+                }
+            default:
+                return false;
+        }
     }
 
     /// <summary>
@@ -56,11 +88,13 @@ public static class ScheduleExecutorRegistration
 
     private const string LicenseRestrictedError = "Site is restricted by licensing";
 
-    private static async Task<(bool Success, string? Summary, string? Error)> ExecuteAuditAsync(
+    private static readonly ScheduledAuditRetryPolicy AuditRetry = new();
+
+    private static async Task<NetworkOptimizer.Alerts.ScheduleRunOutcome> ExecuteAuditAsync(
         IServiceProvider services, string siteKey, CancellationToken ct)
     {
         if (IsLicenseRestricted(services, siteKey))
-            return (false, null, LicenseRestrictedError);
+            return new NetworkOptimizer.Alerts.ScheduleRunOutcome(false, null, LicenseRestrictedError);
 
         // Ensure the site's console connection is fresh for scheduled audits
         // (fingerprint cache expires after 24h)
@@ -74,7 +108,7 @@ public static class ScheduleExecutorRegistration
         scope.ServiceProvider.GetRequiredService<SiteContextService>().OverrideSite(siteKey);
         var auditService = scope.ServiceProvider.GetRequiredService<AuditService>();
         if (auditService.IsRunning)
-            return (false, null, "Audit is already running");
+            return new NetworkOptimizer.Alerts.ScheduleRunOutcome(false, null, "Audit is already running");
 
         // A scheduled scan has no user behind it: run the gated scan as system so it authorizes
         // and audits as "system:scheduler:audit" (design doc 06).
@@ -84,14 +118,11 @@ public static class ScheduleExecutorRegistration
         try
         {
             var result = await auditScan.RunAuditAsync(new AuditOptions { IsScheduled = true });
-            var summary = result.CriticalCount > 0 || result.WarningCount > 0
-                ? $"Score: {result.Score} - {result.CriticalCount} critical, {result.WarningCount} recommended"
-                : $"Score: {result.Score}";
-            return (true, summary, null);
+            return AuditRetry.Decide(siteKey, result, DateTime.UtcNow);
         }
         catch (Exception ex)
         {
-            return (false, null, ex.Message);
+            return new NetworkOptimizer.Alerts.ScheduleRunOutcome(false, null, ex.Message);
         }
     }
 
@@ -162,6 +193,8 @@ public static class ScheduleExecutorRegistration
             (lease, var queued) = await WanTestGate.EnterAsync(siteKey, ct);
             if (queued)
                 await Task.Delay(WanTestSettle, ct);
+
+            await WaitForSqmClearanceAsync(scope.ServiceProvider, siteKey, taskId, ct);
 
             var (testType, maxMode, wanGroup, wanName, wanContextId, multiInterfaces) =
                 ParseWanTestConfig(targetConfig);
@@ -260,6 +293,55 @@ public static class ScheduleExecutorRegistration
     /// <summary>How long a scheduled test waits out a run started from the WAN Speed Test page.</summary>
     private static readonly TimeSpan WanTestIdleWait = TimeSpan.FromMinutes(5);
 
+    /// <summary>
+    /// Holds the test while the gateway's Adaptive SQM speed test is running or about to start.
+    /// Every test type waits, server tests included: they load the same WAN. A site with no
+    /// enabled Adaptive SQM WAN, or a gateway that cannot be read, runs at once as before.
+    /// </summary>
+    private static async Task WaitForSqmClearanceAsync(IServiceProvider sp, string siteKey, int taskId, CancellationToken ct)
+    {
+        var sqmWans = (await sp.GetRequiredService<NetworkOptimizer.Storage.Interfaces.ISpeedTestRepository>()
+            .GetAllSqmWanConfigsAsync(ct)).Where(w => w.Enabled).ToList();
+        if (sqmWans.Count == 0)
+            return;
+
+        var ssh = sp.GetRequiredService<Ssh.IGatewaySshService>();
+        var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("WanScheduleSqmClearance");
+        var deadline = DateTime.UtcNow + SqmLearning.SqmSpeedTestClearance.MaxWait;
+        string? held = null;
+
+        while (true)
+        {
+            SqmLearning.SqmSpeedTestClearance.Reading? reading;
+            try
+            {
+                var (ok, output) = await ssh.RunCommandAsync(SqmLearning.SqmSpeedTestClearance.Command, TimeSpan.FromSeconds(15), ct);
+                reading = ok ? SqmLearning.SqmSpeedTestClearance.Parse(output) : null;
+            }
+            catch (Exception) when (!ct.IsCancellationRequested)
+            {
+                reading = null; // an SSH timeout or failure runs the test as before
+            }
+
+            var reason = reading == null ? null : SqmLearning.SqmSpeedTestClearance.HoldReason(reading, sqmWans);
+            if (reason == null)
+            {
+                if (held != null)
+                    logger.LogInformation("Scheduled WAN speed test {TaskId} on site {Site} resumed after waiting: {Reason}", taskId, siteKey, held);
+                return;
+            }
+            if (DateTime.UtcNow >= deadline)
+            {
+                logger.LogWarning("Scheduled WAN speed test {TaskId} on site {Site} runs after the longest wait although {Reason}", taskId, siteKey, reason);
+                return;
+            }
+            if (held == null)
+                logger.LogInformation("Scheduled WAN speed test {TaskId} on site {Site} waits: {Reason}", taskId, siteKey, reason);
+            held = reason;
+            await Task.Delay(SqmLearning.SqmSpeedTestClearance.Poll, ct);
+        }
+    }
+
     /// <summary>True once the service is idle, false if it is still running when the wait runs out.</summary>
     internal static async Task<bool> WaitForIdleAsync(
         Func<Task<bool>> isRunning, CancellationToken ct, TimeSpan? maxWait = null, TimeSpan? poll = null)
@@ -292,35 +374,27 @@ public static class ScheduleExecutorRegistration
         var device = devices.FirstOrDefault(d => d.Host == targetId);
 
         // Fall back to UniFi-discovered devices if not found in manual config
+        NetworkOptimizer.UniFi.DiscoveredDevice? unifiDevice = null;
         if (device == null)
         {
             var connService = services.GetRequiredService<SiteConnectionRegistry>().GetFor(siteKey);
             try
             {
                 var discovered = await connService.GetDiscoveredDevicesAsync(ct);
-                var unifiDevice = discovered.FirstOrDefault(d =>
+                unifiDevice = discovered.FirstOrDefault(d =>
                     d.IpAddress == targetId && d.Type != DeviceType.Gateway && d.CanRunIperf3);
-                if (unifiDevice != null)
-                {
-                    device = new DeviceSshConfiguration
-                    {
-                        Name = unifiDevice.Name ?? "Unknown Device",
-                        Host = unifiDevice.IpAddress,
-                        DeviceType = unifiDevice.Type,
-                        Enabled = true,
-                        StartIperf3Server = true
-                    };
-                }
             }
             catch { /* UniFi unavailable - fall through to error */ }
         }
 
-        if (device == null)
+        if (device == null && unifiDevice == null)
             return (false, null, $"Device not found: {targetId}");
 
         try
         {
-            var result = await lanService.RunSpeedTestAsync(device);
+            var result = device != null
+                ? await lanService.RunSpeedTestAsync(device)
+                : await lanService.RunSpeedTestAsync(unifiDevice!);
             if (result.ErrorMessage != null)
                 return (false, null, result.ErrorMessage);
 
@@ -419,11 +493,10 @@ public static class ScheduleExecutorRegistration
 
         if (!matched)
         {
-            await DisableScheduleAsync(services, siteKey, taskId, ct);
-            return new ReconcileResult(false,
-                $"WAN schedule disabled: could not reconcile interface {targetId} " +
-                $"(group={wanGroup}, name={wanName}) against live controller data",
-                null, null, null, null);
+            var reason = $"WAN schedule disabled: could not reconcile interface {targetId} " +
+                $"(group={wanGroup}, name={wanName}) against live controller data";
+            await DisableScheduleAsync(services, siteKey, taskId, reason, ct);
+            return new ReconcileResult(false, reason, null, null, null, null);
         }
 
         if (newIface != targetId || newGroup != wanGroup || newName != wanName)
@@ -472,11 +545,10 @@ public static class ScheduleExecutorRegistration
 
             if (!matched)
             {
-                await DisableScheduleAsync(services, siteKey, taskId, ct);
-                return new ReconcileResult(false,
-                    $"WAN schedule disabled: could not reconcile interface {iface} " +
-                    $"(group={grp}, name={nm}) against live controller data",
-                    null, null, null, null);
+                var reason = $"WAN schedule disabled: could not reconcile interface {iface} " +
+                    $"(group={grp}, name={nm}) against live controller data";
+                await DisableScheduleAsync(services, siteKey, taskId, reason, ct);
+                return new ReconcileResult(false, reason, null, null, null, null);
             }
 
             updatedInterfaces.Add(newIface);
@@ -509,7 +581,8 @@ public static class ScheduleExecutorRegistration
         return new ReconcileResult(true, null, newTargetId, newWanGroup, newWanName, newMultiInterfaces);
     }
 
-    private static async Task DisableScheduleAsync(IServiceProvider services, string siteKey, int taskId, CancellationToken ct)
+    private static async Task DisableScheduleAsync(
+        IServiceProvider services, string siteKey, int taskId, string reason, CancellationToken ct)
     {
         // Schedule rows live in each site's own database; task ids are per-site sequences.
         using var scope = CreatePinnedScope(services, siteKey);
@@ -519,8 +592,20 @@ public static class ScheduleExecutorRegistration
         {
             task.Enabled = false;
             await repo.UpdateAsync(task, ct);
+            LogScheduleDisabled(services.GetRequiredService<Auditing.IAuditLogger>(), siteKey, task, reason);
         }
     }
+
+    /// <summary>
+    /// Audits a schedule the app disabled on its own. A user's toggle is audited by the service gate;
+    /// writes straight to the repository are not, so these would otherwise leave no trace.
+    /// </summary>
+    internal static void LogScheduleDisabled(
+        Auditing.IAuditLogger audit, string siteSlug, NetworkOptimizer.Alerts.Models.ScheduledTask task, string reason) =>
+        audit.Log(Auditing.AuditEventBuilder.FromSystem(
+            AuditCategories.Action, AuditActions.ScheduleChanged,
+            targetType: "schedule", targetId: task.Id.ToString(), targetName: task.Name,
+            siteSlug: siteSlug, details: new { Enabled = false, Reason = reason }));
 
     private static async Task PersistScheduleUpdateAsync(
         IServiceProvider services, string siteKey, int taskId, string? newTargetId,

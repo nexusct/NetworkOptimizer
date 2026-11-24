@@ -5,6 +5,7 @@ using NetworkOptimizer.Storage.Models;
 using NetworkOptimizer.Storage.Services;
 using NetworkOptimizer.UniFi;
 using NetworkOptimizer.UniFi.Models;
+using NetworkOptimizer.Web.Services.Ssh;
 
 namespace NetworkOptimizer.Web.Services;
 
@@ -19,7 +20,7 @@ namespace NetworkOptimizer.Web.Services;
 /// the site's agent tunnel when its devices are reached that way). The
 /// registry flips <see cref="Active"/> as sites are enabled and disabled.
 /// </summary>
-public class CellularModemService : ICellularModemService
+public class CellularModemService : ICellularModemService, IDisposable
 {
     private readonly ILogger<CellularModemService> _logger;
     private readonly IServiceProvider _serviceProvider;
@@ -151,6 +152,27 @@ public class CellularModemService : ICellularModemService
                     _logger.LogInformation("Discovered cellular modem: {Name} ({Model}) at {Host}",
                         device.Name, displayModel, device.Ip);
                 }
+                else if (UniFiProductDatabase.IsCellularGateway(device.Model, device.Shortname))
+                {
+                    // A gateway's device IP is its WAN address, so list it at its LAN address.
+                    // Polls go to the Gateway SSH host either way.
+                    var lanIp = (await _connectionService.GetDiscoveredDevicesAsync())
+                        .FirstOrDefault(d => string.Equals(d.Mac, device.Mac, StringComparison.OrdinalIgnoreCase))
+                        ?.LanIpAddress;
+                    var displayModel = UniFiProductDatabase.GetBestProductName(device.Model, device.Shortname);
+                    discovered.Add(new DiscoveredModem
+                    {
+                        DeviceId = device.Id,
+                        Name = device.Name,
+                        Model = displayModel,
+                        Host = lanIp ?? device.Ip ?? "",
+                        MacAddress = device.Mac,
+                        IsOnline = UniFiDeviceStateMap.IsOnline(device.State) && device.Adopted,
+                        Provider = CellularModemProviders.ModemProviderKeys.UniFiGateway,
+                    });
+                    _logger.LogInformation("Discovered cellular gateway: {Name} ({Model}) at {Host}",
+                        device.Name, displayModel, lanIp ?? device.Ip);
+                }
             }
         }
         catch (Exception ex)
@@ -183,13 +205,10 @@ public class CellularModemService : ICellularModemService
     // TODO: Move to ICellularModemProvider.RequiresSharedSsh property when adding a 4th provider
     /// <summary>
     /// Whether this modem's provider requires the shared UniFi SSH credentials.
-    /// Providers with per-modem SSH credentials (quectel-at) handle their own auth.
+    /// Providers with per-modem SSH credentials (quectel-at, quectel-ssh) handle their own auth.
     /// </summary>
-    private static bool RequiresSharedSsh(ModemConfiguration modem)
-    {
-        var key = string.IsNullOrWhiteSpace(modem.Provider) ? DefaultProviderKey : modem.Provider;
-        return string.Equals(key, "qmicli", StringComparison.OrdinalIgnoreCase);
-    }
+    private static bool RequiresSharedSsh(ModemConfiguration modem) =>
+        CellularModemProviders.ModemProviderKeys.UsesSharedSsh(modem.Provider);
 
     /// <summary>
     /// Dispatch a poll to the appropriate provider based on the row's Provider column.
@@ -206,6 +225,42 @@ public class CellularModemService : ICellularModemService
 
     private async Task<ModemPollContext> ToPollContextAsync(ModemConfiguration modem)
     {
+        var context = ToPollContext(modem);
+        if (!OffersStoredKey(modem))
+            return context;
+
+        using var scope = CreateSiteScope();
+        return await WithStoredKeyAsync(context, scope.ServiceProvider);
+    }
+
+    /// <summary>
+    /// Whether the modem is offered the site's stored key: opt-in per modem, and per-modem SSH only, so
+    /// a modem that authenticates with a password is never offered a key it does not hold.
+    /// </summary>
+    internal static bool OffersStoredKey(ModemConfiguration modem)
+        => modem.UseManagedSshKey && CellularModemProviders.ModemProviderKeys.UsesPerModemSsh(modem.Provider);
+
+    /// <summary>
+    /// Adds the site's stored SSH key to a per-modem SSH context, the same additive way gateway SSH
+    /// does. The provider must be scoped to the modem's site. Returns the context unchanged without a key.
+    /// </summary>
+    internal static async Task<ModemPollContext> WithStoredKeyAsync(ModemPollContext context, IServiceProvider siteScopedProvider)
+    {
+        // The reader attaches to a connection, so a throwaway one carries the key across.
+        var carrier = new SshConnectionInfo { Host = context.Host, Username = context.Username ?? "" };
+        await StoredSshKeyReader.AttachAsync(siteScopedProvider, carrier);
+        if (string.IsNullOrEmpty(carrier.StoredPrivateKeyPem))
+            return context;
+
+        return context with
+        {
+            StoredPrivateKeyPem = carrier.StoredPrivateKeyPem,
+            StoredPrivateKeyPassphrase = carrier.StoredPrivateKeyPassphrase,
+        };
+    }
+
+    private ModemPollContext ToPollContext(ModemConfiguration modem)
+    {
         string? password = null;
         if (!string.IsNullOrEmpty(modem.Password))
         {
@@ -213,22 +268,14 @@ public class CellularModemService : ICellularModemService
             catch { password = modem.Password; }
         }
 
-        // HTTP and per-modem-SSH providers reach agent sites through the tunnel
-        // proxy. Shared-SSH (qmicli) providers are left alone: their transport is
-        // the site's UniFiSshService, which applies the same routing itself -
-        // rewriting here too would proxy the proxy.
-        var (host, port) = (modem.Host, modem.Port);
-        if (!RequiresSharedSsh(modem))
-            (host, port) = await _tunnelRouting.RouteAsync(_siteSlug, modem.Host, modem.Port);
-
         return new ModemPollContext
         {
             Id = modem.Id,
             SiteSlug = _siteSlug,
             Name = modem.Name,
-            Host = host,
-            ConfiguredHost = modem.Host,
-            Port = port,
+            Host = modem.Host,
+            Port = modem.Port,
+            Dialer = _tunnelRouting.DialerFor(_siteSlug),
             Username = string.IsNullOrEmpty(modem.Username) ? null : modem.Username,
             Password = password,
             PrivateKeyPath = string.IsNullOrEmpty(modem.PrivateKeyPath) ? null : modem.PrivateKeyPath,
@@ -358,7 +405,7 @@ public class CellularModemService : ICellularModemService
     {
         if (!string.IsNullOrEmpty(config.Password) && !_credentialProtection.IsEncrypted(config.Password))
         {
-            config.Password = _credentialProtection.Encrypt(config.Password);
+            config.Password = _credentialProtection.EncryptForSite(config.Password, _siteSlug);
         }
 
         var isNew = config.Id == 0;
@@ -591,4 +638,10 @@ public class DiscoveredModem
     public string Host { get; set; } = "";
     public string MacAddress { get; set; } = "";
     public bool IsOnline { get; set; }
+
+    /// <summary>The provider key the modem is added with: qmicli, or unifi-gateway for a built-in modem.</summary>
+    public string Provider { get; set; } = CellularModemProviders.ModemProviderKeys.Qmicli;
+
+    /// <summary>True for a gateway's built-in modem, which is polled with the Gateway SSH credentials.</summary>
+    public bool IsGateway => CellularModemProviders.ModemProviderKeys.UsesGatewaySsh(Provider);
 }

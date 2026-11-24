@@ -12,6 +12,13 @@ namespace NetworkOptimizer.Web.Services;
 /// </summary>
 public static class AlertRuleAutoEnable
 {
+    /// <summary>
+    /// Rules the source-wide enables never touch. Each has its own trigger (an ONT attached to an
+    /// SFP module) or stays off until a user turns it on, so configuring any ONT must not enable it.
+    /// </summary>
+    public static readonly IReadOnlySet<string> OptInOnlyPatterns =
+        new HashSet<string> { "ont.management_unresponsive", "ont.rebooted", "ont.path_loss_high", "ont.path_loss_rise" };
+
     public static async Task EnableBySourceAsync(IServiceScope scope, string source, ILogger logger)
     {
         try
@@ -22,9 +29,11 @@ public static class AlertRuleAutoEnable
                 .AnyAsync(r => r.Source == source && r.IsEnabled);
             if (anyEnabled) return;
 
-            var disabled = await db.AlertRules
+            var disabled = (await db.AlertRules
                 .Where(r => r.Source == source && !r.IsEnabled)
-                .ToListAsync();
+                .ToListAsync())
+                .Where(r => !OptInOnlyPatterns.Contains(r.EventTypePattern))
+                .ToList();
 
             if (disabled.Count == 0) return;
 
@@ -113,18 +122,52 @@ public static class AlertRuleAutoEnable
             rule.Name, pattern);
     }
 
+    /// <summary>
+    /// Enables one default rule when its feature is first used, if the rule still has its shipped
+    /// state: disabled and never edited. Every edit or toggle on the Alerts page sets UpdatedAt, so a
+    /// rule a user turned off is never turned back on, and a deleted one stays deleted. Matching the
+    /// shipped name as well leaves alone a rule the user added for the same event.
+    /// </summary>
+    /// <returns>Whether the rule was enabled.</returns>
+    public static async Task<bool> EnableUntouchedDefaultAsync(
+        NetworkOptimizerDbContext db, string pattern, string name, ILogger logger, CancellationToken ct = default)
+    {
+        var rule = await db.AlertRules.FirstOrDefaultAsync(
+            r => r.EventTypePattern == pattern && r.Name == name && !r.IsEnabled && r.UpdatedAt == null, ct);
+        if (rule == null) return false;
+
+        rule.IsEnabled = true;
+        await db.SaveChangesAsync(ct);
+        logger.LogInformation("Enabled the '{Name}' alert rule now that its feature is in use", rule.Name);
+        return true;
+    }
+
     public static void EnableFreshlySeeded(
         NetworkOptimizerDbContext db, string source, ISet<string> seededPatterns, Func<bool> hasConfigs)
     {
         var freshlySeeded = db.AlertRules
             .Where(r => r.Source == source && !r.IsEnabled)
             .ToList()
-            .Where(r => seededPatterns.Contains(r.EventTypePattern))
+            .Where(r => seededPatterns.Contains(r.EventTypePattern) && !OptInOnlyPatterns.Contains(r.EventTypePattern))
             .ToList();
         if (freshlySeeded.Count > 0 && hasConfigs())
         {
             foreach (var rule in freshlySeeded) rule.IsEnabled = true;
             db.SaveChanges();
         }
+    }
+
+    /// <summary>
+    /// Enables ONE just-seeded opt-in rule when its own prerequisite already holds on this database.
+    /// Runs only in the seed pass that inserted it, so a user's later choice is never overridden.
+    /// </summary>
+    public static void EnableFreshlySeededWhen(
+        NetworkOptimizerDbContext db, string pattern, ISet<string> seededPatterns, Func<bool> prerequisite)
+    {
+        if (!seededPatterns.Contains(pattern)) return;
+        var rule = db.AlertRules.FirstOrDefault(r => r.EventTypePattern == pattern);
+        if (rule == null || rule.IsEnabled || !prerequisite()) return;
+        rule.IsEnabled = true;
+        db.SaveChanges();
     }
 }

@@ -26,11 +26,25 @@ public class UniFiDeviceResponse
     public string Type { get; set; } = string.Empty;
 
     /// <summary>
-    /// Normalized device type enum value.
+    /// Normalized device type enum value: the device's role on this site.
     /// Uses product identity to normalize power appliances that the controller reports
-    /// as switches, access points, or dedicated SmartPower devices.
+    /// as switches, access points, or dedicated SmartPower devices, and the device mode to
+    /// make a gateway-class device adopted as an access point (an Express in AP mode) an AP.
     /// </summary>
-    public DeviceType DeviceType => UniFiProductDatabase.ClassifyDeviceType(Type, Model, Shortname);
+    public DeviceType DeviceType => UniFiProductDatabase.ClassifyDeviceType(Type, Model, Shortname, DeviceModeOverride);
+
+    /// <summary>
+    /// What the device is, regardless of the mode it runs in: an Express in AP mode is still
+    /// Gateway here. Use it for hardware facts (SSH credentials, gateway-class templates).
+    /// </summary>
+    public DeviceType HardwareType => UniFiProductDatabase.ClassifyDeviceType(Type, Model, Shortname);
+
+    /// <summary>
+    /// Mode a gateway-class device is adopted in: absent for a gateway, "mesh" for an Express
+    /// adopted as an access point, "managed_shadow_gateway" for a shadow gateway.
+    /// </summary>
+    [JsonPropertyName("device_mode_override")]
+    public string? DeviceModeOverride { get; set; }
 
     [JsonPropertyName("model")]
     public string Model { get; set; } = string.Empty;
@@ -125,11 +139,40 @@ public class UniFiDeviceResponse
     [JsonConverter(typeof(FlexibleIntConverter))]
     public int? SuricataUpgradePendingTarget { get; set; }
 
+    private string? _informKey;
+
+    /// <summary>
+    /// The device's inform key (hex AES-128), which decrypts the inform frames it sends. Write-only
+    /// to the serializer on purpose: it is a device secret, so the private getter keeps it out of
+    /// every re-serialized payload (exports, support files, caches). Read it with
+    /// <see cref="GetInformKey"/>.
+    /// </summary>
+    [JsonPropertyName("x_authkey")]
+    [VendorSpecific("UniFi", "Per-device inform key; used to decrypt UCI inform frames")]
+    public string? XAuthKey { private get => _informKey; set => _informKey = value; }
+
+    /// <summary>The device's inform key, or null when the console did not return one.</summary>
+    public string? GetInformKey() => _informKey;
+
     [JsonPropertyName("adopted")]
     public bool Adopted { get; set; }
 
     [JsonPropertyName("state")]
     public int State { get; set; }
+
+    /// <summary>
+    /// The config version UniFi Network wants the device on. A config write changes it when the
+    /// console provisions the device, not in the write's own response.
+    /// </summary>
+    [JsonPropertyName("cfgversion")]
+    public string? CfgVersion { get; set; }
+
+    /// <summary>
+    /// The config version the device reports running. Equal to a new <see cref="CfgVersion"/> once a
+    /// write has been applied, well before the live radio stats catch up.
+    /// </summary>
+    [JsonPropertyName("known_cfgversion")]
+    public string? KnownCfgVersion { get; set; }
 
     [JsonPropertyName("uptime")]
     public long Uptime { get; set; }
@@ -169,6 +212,10 @@ public class UniFiDeviceResponse
     /// </summary>
     [JsonPropertyName("last_uplink")]
     public UplinkInfo? LastUplink { get; set; }
+
+    /// <summary>LLDP neighbors this device sees, one entry per local port.</summary>
+    [JsonPropertyName("lldp_table")]
+    public List<UniFiLldpEntry>? LldpTable { get; set; }
 
     // Stats
     [JsonPropertyName("stat")]
@@ -330,12 +377,24 @@ public class UniFiDeviceResponse
     public Dictionary<string, WanGeoInfo>? LastGeoInfo { get; set; }
 
     /// <summary>
+    /// The gateway's current per-WAN geo-IP lookup, keyed like <see cref="LastGeoInfo"/>. Unlike
+    /// it, each entry carries the ASN: the one UniFi Network draws the ISP logo from.
+    /// </summary>
+    [VendorSpecific("UniFi", "stat/device geo_info: per-WAN geo-IP with asn, isp_name, isp_organization")]
+    [JsonPropertyName("geo_info")]
+    public Dictionary<string, WanGeoInfo>? GeoInfo { get; set; }
+
+    /// <summary>
     /// Mobile-broadband (cellular) state, present on gateways/modems with an
     /// integrated or attached cellular radio. The SIM's networkoperator/spn is the
     /// preferred carrier source for a cellular WAN.
     /// </summary>
     [JsonPropertyName("mbb")]
     public MbbInfo? Mbb { get; set; }
+
+    /// <summary>A gateway's LAN networks, each with the IPv6 prefixes it hands out.</summary>
+    [JsonPropertyName("network_table")]
+    public List<GatewayNetworkTableEntry>? NetworkTable { get; set; }
 
     /// <summary>
     /// Captures additional JSON properties not mapped to typed properties.
@@ -384,6 +443,23 @@ public class UniFiDeviceResponse
     }
 }
 
+/// <summary>One LAN network in a gateway's network_table.</summary>
+public class GatewayNetworkTableEntry
+{
+    [JsonPropertyName("name")]
+    public string? Name { get; set; }
+
+    /// <summary>A static IPv6 network's gateway address with the prefix length (singular; PD networks use <see cref="Ipv6Subnets"/>).</summary>
+    [JsonPropertyName("ipv6_subnet")]
+    [JsonConverter(typeof(FlexibleStringListConverter))]
+    public List<string>? Ipv6Subnet { get; set; }
+
+    /// <summary>A Prefix Delegation network's gateway address in each delegated prefix, with the prefix length.</summary>
+    [JsonPropertyName("ipv6_subnets")]
+    [JsonConverter(typeof(FlexibleStringListConverter))]
+    public List<string>? Ipv6Subnets { get; set; }
+}
+
 /// <summary>
 /// Represents a WAN interface from the gateway device JSON.
 /// These appear as dynamic keys (wan, wan1, wan2, wan3, etc.) on the device object.
@@ -411,6 +487,11 @@ public class GatewayWanInterface
 
     [JsonPropertyName("ip")]
     public string? Ip { get; set; }
+
+    /// <summary>The WAN's IPv6 addresses: global ones and link-local, without a prefix length.</summary>
+    [JsonPropertyName("ipv6")]
+    [JsonConverter(typeof(FlexibleStringListConverter))]
+    public List<string>? Ipv6 { get; set; }
 
     [JsonPropertyName("latency")]
     public int? Latency { get; set; }
@@ -474,6 +555,11 @@ public class WanGeoInfo
 
     [JsonPropertyName("isp")]
     public string? Isp { get; set; }
+
+    /// <summary>The WAN address's ASN; only the device-level geo_info carries it, and 0 means unknown.</summary>
+    [JsonPropertyName("asn")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? Asn { get; set; }
 
     /// <summary>Either field, whichever the source populated.</summary>
     public string? AnyName => string.IsNullOrWhiteSpace(IspName) ? Isp : IspName;
@@ -556,6 +642,10 @@ public class SwitchPort
 
     [JsonPropertyName("speed")]
     public int Speed { get; set; }
+
+    /// <summary>Negotiated duplex. Null when the console omits it.</summary>
+    [JsonPropertyName("full_duplex")]
+    public bool? FullDuplex { get; set; }
 
     /// <summary>
     /// Whether auto-negotiation is enabled for this port.
@@ -737,6 +827,37 @@ public class SwitchPort
     /// <summary>SFP module compliance type (e.g., "1000BASE-LX", "PON").</summary>
     [JsonPropertyName("sfp_compliance")]
     public string? SfpCompliance { get; set; }
+}
+
+/// <summary>
+/// One LLDP neighbor from a device's lldp_table.
+/// </summary>
+public class UniFiLldpEntry
+{
+    /// <summary>Neighbor chassis ID; a MAC address when the subtype is "mac" or "local".</summary>
+    [JsonPropertyName("chassis_id")]
+    public string? ChassisId { get; set; }
+
+    /// <summary>Chassis ID subtype: "mac", "local", and others.</summary>
+    [JsonPropertyName("chassis_id_subtype")]
+    public string? ChassisIdSubtype { get; set; }
+
+    /// <summary>Neighbor's port ID.</summary>
+    [JsonPropertyName("port_id")]
+    public string? PortId { get; set; }
+
+    /// <summary>Local port index the neighbor was seen on.</summary>
+    [JsonPropertyName("local_port_idx")]
+    [JsonConverter(typeof(FlexibleIntConverter))]
+    public int? LocalPortIdx { get; set; }
+
+    /// <summary>Local interface name the neighbor was seen on (e.g. "eth1").</summary>
+    [JsonPropertyName("local_port_name")]
+    public string? LocalPortName { get; set; }
+
+    /// <summary>Whether the neighbor is on a wired port.</summary>
+    [JsonPropertyName("is_wired")]
+    public bool IsWired { get; set; }
 }
 
 public class UplinkInfo

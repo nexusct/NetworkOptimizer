@@ -11,6 +11,7 @@ namespace NetworkOptimizer.Web.Services;
 public static class DashboardCards
 {
     public const string StatsRow = "stats-row";
+    public const string ActiveAlerts = "active-alerts";
     public const string SecurityPosture = "security-posture";
     public const string SqmStatus = "sqm-status";
     public const string ThreatTrends = "threat-trends";
@@ -27,20 +28,21 @@ public static class DashboardCards
     /// <summary>All valid card IDs</summary>
     public static readonly string[] All =
     [
-        StatsRow, SecurityPosture, SqmStatus, ThreatTrends, CellularStats, CmStats, OntStats,
+        StatsRow, ActiveAlerts, SecurityPosture, SqmStatus, ThreatTrends, CellularStats, CmStats, OntStats,
         StarlinkStats, SpeedTests, WiFiOptimizer, RecentAlerts, DeviceStatus, LiveView
     ];
 
     /// <summary>Default full-width cards</summary>
     public static readonly HashSet<string> DefaultFullWidth = new()
     {
-        StatsRow, DeviceStatus, LiveView
+        StatsRow, ActiveAlerts, DeviceStatus, LiveView
     };
 
     /// <summary>Display names for cards</summary>
     public static string GetDisplayName(string cardId) => cardId switch
     {
         StatsRow => "Quick Stats",
+        ActiveAlerts => "Active Alerts",
         SecurityPosture => "Security Posture",
         SqmStatus => "Adaptive SQM",
         ThreatTrends => "Threat Trends",
@@ -140,15 +142,14 @@ public interface IDashboardLayoutAdminService
 
 public class DashboardLayoutService : IDashboardLayoutAdminService
 {
-    private readonly ISystemSettingsService _settings;
-
     /// <summary>
-    /// Saving goes through the gated admin path, not the plain settings service. The layout is ONE
-    /// setting shared by the whole site, so rearranging it rearranges the dashboard for everybody -
-    /// a Viewer could quietly reorganise what their colleagues see. Reads stay on the plain service,
-    /// which is what every render and background tick needs.
+    /// The plain settings store, for reads and the save alike. The save's gate is
+    /// <see cref="IDashboardLayoutAdminService"/> (Site Admin on the site in context); never route it
+    /// through the instance-wide <see cref="ISystemSettingsAdmin"/>, which refuses a Site Admin
+    /// without the global Admin role. Callers that save must use the interface, not this class.
     /// </summary>
-    private readonly ISystemSettingsAdmin _settingsAdmin;
+    private readonly ISystemSettingsService _settings;
+    private readonly SiteContextService _siteContext;
     private readonly ILogger<DashboardLayoutService> _logger;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -159,11 +160,11 @@ public class DashboardLayoutService : IDashboardLayoutAdminService
 
     public DashboardLayoutService(
         ISystemSettingsService settings,
-        ISystemSettingsAdmin settingsAdmin,
+        SiteContextService siteContext,
         ILogger<DashboardLayoutService> logger)
     {
         _settings = settings;
-        _settingsAdmin = settingsAdmin;
+        _siteContext = siteContext;
         _logger = logger;
     }
 
@@ -174,7 +175,7 @@ public class DashboardLayoutService : IDashboardLayoutAdminService
     {
         try
         {
-            var json = await _settings.GetAsync(SystemSettingKeys.DashboardLayout);
+            var json = await _settings.GetAsync(_siteContext.Slug, SystemSettingKeys.DashboardLayout);
             if (!string.IsNullOrEmpty(json))
             {
                 var layout = JsonSerializer.Deserialize<DashboardLayout>(json, JsonOptions);
@@ -200,7 +201,7 @@ public class DashboardLayoutService : IDashboardLayoutAdminService
     public async Task SaveLayoutAsync(DashboardLayout layout)
     {
         var json = JsonSerializer.Serialize(layout, JsonOptions);
-        await _settingsAdmin.SetAsync(SystemSettingKeys.DashboardLayout, json);
+        await _settings.SetAsync(_siteContext.Slug, SystemSettingKeys.DashboardLayout, json);
         _logger.LogDebug("Saved dashboard layout");
     }
 
@@ -209,7 +210,7 @@ public class DashboardLayoutService : IDashboardLayoutAdminService
     /// </summary>
     public async Task ResetLayoutAsync()
     {
-        await _settings.SetAsync(SystemSettingKeys.DashboardLayout, null);
+        await _settings.SetAsync(_siteContext.Slug, SystemSettingKeys.DashboardLayout, null);
         _logger.LogDebug("Reset dashboard layout to defaults");
     }
 
@@ -238,23 +239,38 @@ public class DashboardLayoutService : IDashboardLayoutAdminService
     }
 
     /// <summary>
-    /// Ensure any newly added cards/stats appear in existing saved layouts.
+    /// Ensure any newly added cards/stats appear in existing saved layouts. A new card goes in at its
+    /// default position: right after the nearest card that precedes it in <see cref="DashboardCards.All"/>,
+    /// or first when none does, so it is not buried under every card the site already has.
     /// </summary>
-    private static void MergeDefaults(DashboardLayout layout)
+    internal static void MergeDefaults(DashboardLayout layout)
     {
         var existingCardIds = new HashSet<string>(layout.Cards.Select(c => c.Id));
-        foreach (var cardId in DashboardCards.All)
+        for (var i = 0; i < DashboardCards.All.Length; i++)
         {
-            if (!existingCardIds.Contains(cardId))
+            var cardId = DashboardCards.All[i];
+            if (existingCardIds.Contains(cardId))
+                continue;
+
+            var isLiveView = cardId == DashboardCards.LiveView;
+            var card = new DashboardCardConfig
             {
-                var isLiveView = cardId == DashboardCards.LiveView;
-                layout.Cards.Add(new DashboardCardConfig
-                {
-                    Id = cardId,
-                    Visible = !isLiveView,
-                    FullWidth = isLiveView || DashboardCards.DefaultFullWidth.Contains(cardId)
-                });
+                Id = cardId,
+                Visible = !isLiveView,
+                FullWidth = isLiveView || DashboardCards.DefaultFullWidth.Contains(cardId)
+            };
+
+            var insertAt = 0;
+            for (var p = i - 1; p >= 0; p--)
+            {
+                var predecessor = layout.Cards.FindIndex(c => c.Id == DashboardCards.All[p]);
+                if (predecessor < 0) continue;
+                insertAt = predecessor + 1;
+                break;
             }
+
+            layout.Cards.Insert(insertAt, card);
+            existingCardIds.Add(cardId);
         }
 
         var existingStatIds = new HashSet<string>(layout.StatItems);

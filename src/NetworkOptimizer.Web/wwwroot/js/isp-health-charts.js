@@ -3,7 +3,7 @@
 // render as shaded x-axis ranges, path shifts as annotation lines.
 
 import ApexCharts from '/_content/Blazor-ApexCharts/js/apexcharts.esm.js';
-import { valueSortedTooltip, tooltipHeld, alignedPoints } from './chart-tooltip.js?v=17';
+import { valueSortedTooltip, tooltipHeld, alignedPoints } from './chart-tooltip.js?v=22';
 import { renderFilterReset, isFiltered } from './chart-filter.js?v=6';
 
 const PALETTE = ['#2ba89a', '#3b82f6', '#a78bfa', '#ef5858', '#f59e0b', '#10b981'];
@@ -55,11 +55,14 @@ function buildOpts() {
             animations: { enabled: false },
             events: {
                 zoomed: (ctx, opts) => {
+                    // zoomWindow stays in chart x for zoomX; the panel is told real instants.
                     const min = opts?.xaxis?.min, max = opts?.xaxis?.max;
                     zoomWindow = min != null ? { min, max } : null;
                     if (restoringZoom) return;
                     setZoomed(min != null);
-                    notifyZoom(min, max);
+                    // A library reset carries no bounds: the panel gets null, not a converted NaN.
+                    if (min == null) notifyZoom(null, null);
+                    else notifyZoom(noTime.fromChart(min), noTime.fromChart(max));
                 },
             },
         },
@@ -69,11 +72,7 @@ function buildOpts() {
         dataLabels: { enabled: false },
         xaxis: {
             type: 'datetime',
-            labels: {
-                style: { colors: '#9ca3af' },
-                datetimeUTC: false,
-                datetimeFormatter: { hour: 'HH:mm', day: 'MMM dd' },
-            },
+            labels: noTime.timeAxisLabels({ style: { colors: '#9ca3af' } }),
         },
         yaxis: {
             min: 0,
@@ -106,7 +105,7 @@ function buildOpts() {
         tooltip: {
             theme: 'dark',
             shared: true,
-            x: { format: 'MMM dd, HH:mm' },
+            x: { formatter: noTime.chartTooltipFormatter(false) },
             // The shared renderer: rows ordered by value so they match the vertical order of the
             // lines, plus a hover dot on each. Its own format because this axis prints a bare
             // number under an "ms" title while the tooltip has always carried the unit.
@@ -149,8 +148,8 @@ function buildAnnotations(events) {
         if (!onVisibleSeries(e, visible)) continue;
         if (e.type === 'congestion') {
             xaxis.push({
-                x: new Date(e.start).getTime(),
-                x2: new Date(e.end).getTime(),
+                x: noTime.toChart(new Date(e.start).getTime()),
+                x2: noTime.toChart(new Date(e.end).getTime()),
                 fillColor: e.shared ? '#ef5858' : '#f59e0b',
                 opacity: 0.12,
                 label: {
@@ -158,10 +157,34 @@ function buildAnnotations(events) {
                     style: { color: '#ededef', background: e.shared ? '#7f1d1d' : '#78350f', fontSize: '10px' },
                 },
             });
+        } else if (e.type === 'path-shift' && e.end) {
+            // A traced route change: its episode's span, in the Path shift line's blue.
+            xaxis.push({
+                x: noTime.toChart(new Date(e.start).getTime()),
+                x2: noTime.toChart(new Date(e.end).getTime()),
+                fillColor: '#4797ff',
+                opacity: 0.12,
+                label: {
+                    text: e.label,
+                    style: { color: '#ededef', background: '#1e3a5f', fontSize: '10px' },
+                },
+            });
+        } else if (e.type === 'acknowledged') {
+            // An episode of an acknowledged finding: muted, and only drawn when its pill is on.
+            xaxis.push({
+                x: noTime.toChart(new Date(e.start).getTime()),
+                x2: noTime.toChart(new Date(e.end).getTime()),
+                fillColor: '#5c5c66',
+                opacity: 0.12,
+                label: {
+                    text: e.label,
+                    style: { color: '#ededef', background: '#2a2a2e', fontSize: '10px' },
+                },
+            });
         } else if (e.type === 'unreachable') {
             xaxis.push({
-                x: new Date(e.start).getTime(),
-                x2: e.end ? new Date(e.end).getTime() : undefined,
+                x: noTime.toChart(new Date(e.start).getTime()),
+                x2: e.end ? noTime.toChart(new Date(e.end).getTime()) : undefined,
                 fillColor: '#a78bfa',
                 opacity: 0.12,
                 label: {
@@ -171,7 +194,7 @@ function buildAnnotations(events) {
             });
         } else {
             xaxis.push({
-                x: new Date(e.start).getTime(),
+                x: noTime.toChart(new Date(e.start).getTime()),
                 borderColor: '#4797ff',
                 strokeDashArray: 4,
                 label: {
@@ -422,14 +445,14 @@ export function setHiddenTypes(types) {
 export function currentView() {
     let min = null, max = null;
     if (zoomWindow?.min != null) {
-        min = zoomWindow.min;
-        max = zoomWindow.max;
+        min = noTime.fromChart(zoomWindow.min);
+        max = noTime.fromChart(zoomWindow.max);
     } else if (win?.from && win?.to) {
         min = new Date(win.from).getTime();
         max = new Date(win.to).getTime();
     } else {
         const g = chart?.w?.globals;
-        if (g && g.maxX > g.minX) { min = g.minX; max = g.maxX; }
+        if (g && g.maxX > g.minX) { min = noTime.fromChart(g.minX); max = noTime.fromChart(g.maxX); }
     }
     if (min == null || max == null || !(max > min)) return null;
     return { atIso: new Date((min + max) / 2).toISOString(), spanMs: Math.round(max - min) };
@@ -455,5 +478,11 @@ export function unmount() {
     win = null;
     hiddenTypes = new Set();
     lastEvents = [];
+    // The chip row and which networks were hidden belong to this mount: kept, a remount into the same card added
+    // a second row, and a network hidden on one WAN stayed hidden on the next WAN's report.
+    if (badgesEl) { badgesEl.remove(); badgesEl = null; }
+    seriesVisibility = {};
+    asnMeta = [];
+    lastSeries = [];
     if (chart) { chart.destroy(); chart = null; }
 }

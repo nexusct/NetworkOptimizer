@@ -52,6 +52,20 @@ public class WiFiOptimizerContext
     public IEnumerable<NetworkInfo> IoTNetworks => Networks.Where(n => n.Enabled && n.Purpose == NetworkPurpose.IoT);
 
     /// <summary>
+    /// Enabled SSIDs bound to an IoT network, directly or through PPSK.
+    /// </summary>
+    public List<WlanConfiguration> IoTSsids => IoTSsidsOf(Wlans, Networks);
+
+    /// <summary>
+    /// Enabled SSIDs bound to an enabled IoT network (by VlanAnalyzer classification), directly or through PPSK.
+    /// </summary>
+    public static List<WlanConfiguration> IoTSsidsOf(IEnumerable<WlanConfiguration> wlans, IEnumerable<NetworkInfo> networks)
+    {
+        var iotNetworkIds = networks.Where(n => n.Enabled && n.Purpose == NetworkPurpose.IoT).Select(n => n.Id).ToHashSet();
+        return wlans.Where(w => w.Enabled && w.AllNetworkIds.Any(iotNetworkIds.Contains)).ToList();
+    }
+
+    /// <summary>
     /// First Security/Camera network found.
     /// </summary>
     public NetworkInfo? SecurityNetwork => Networks.FirstOrDefault(n => n.Enabled && n.Purpose == NetworkPurpose.Security);

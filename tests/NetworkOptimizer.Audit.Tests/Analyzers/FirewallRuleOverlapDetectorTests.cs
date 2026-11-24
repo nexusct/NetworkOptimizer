@@ -8,6 +8,26 @@ namespace NetworkOptimizer.Audit.Tests.Analyzers;
 
 public class FirewallRuleOverlapDetectorTests
 {
+    #region ConnectionStatesOverlap Tests
+
+    [Theory]
+    [InlineData("CUSTOM", new[] { "INVALID" }, "ALL", new string[0], true)]
+    [InlineData("CUSTOM", new[] { "INVALID" }, "RESPOND_ONLY", new[] { "RELATED", "ESTABLISHED" }, false)]
+    [InlineData("CUSTOM", new[] { "INVALID" }, null, new string[0], true)]
+    [InlineData("CUSTOM", new[] { "NEW" }, "RESPOND_ONLY", new string[0], false)]
+    [InlineData("ALL", new string[0], "RESPOND_ONLY", new[] { "RELATED", "ESTABLISHED" }, true)]
+    public void ConnectionStatesOverlap_ReturnsWhetherAnyStateIsShared(
+        string? type1, string[] states1, string? type2, string[] states2, bool expected)
+    {
+        var rule1 = new FirewallRule { Id = "r1", ConnectionStateType = type1, ConnectionStates = [.. states1] };
+        var rule2 = new FirewallRule { Id = "r2", ConnectionStateType = type2, ConnectionStates = [.. states2] };
+
+        FirewallRuleOverlapDetector.ConnectionStatesOverlap(rule1, rule2).Should().Be(expected);
+        FirewallRuleOverlapDetector.RulesOverlap(rule1, rule2).Should().Be(expected);
+    }
+
+    #endregion
+
     #region ProtocolsOverlap Tests
 
     [Theory]
@@ -1469,6 +1489,46 @@ public class FirewallRuleOverlapDetectorTests
 
     #endregion
 
+    #region IpVersionsOverlap Tests
+
+    [Theory]
+    [InlineData("IPV4", "IPV6", false)]
+    [InlineData("IPV6", "IPV4", false)]
+    [InlineData("ipv4", "ipv6", false)]
+    [InlineData("IPV4", "IPV4", true)]
+    [InlineData("IPV6", "IPV6", true)]
+    [InlineData("IPV4", "BOTH", true)]
+    [InlineData("BOTH", "IPV6", true)]
+    [InlineData("BOTH", "BOTH", true)]
+    [InlineData(null, "IPV4", true)]
+    [InlineData("IPV6", null, true)]
+    [InlineData(null, null, true)]
+    public void RulesOverlap_IpVersion_DisjointFamiliesNeverOverlap(string? v1, string? v2, bool expected)
+    {
+        // Otherwise identical ANY/ANY rules, so ip_version alone decides the result (#1231)
+        var rule1 = CreateRule(protocol: "all", sourceMatchingTarget: "ANY", destMatchingTarget: "ANY",
+            sourceZoneId: "zone-a", destZoneId: "zone-b", ipVersion: v1);
+        var rule2 = CreateRule(protocol: "all", sourceMatchingTarget: "ANY", destMatchingTarget: "ANY",
+            sourceZoneId: "zone-a", destZoneId: "zone-b", ipVersion: v2);
+
+        FirewallRuleOverlapDetector.RulesOverlap(rule1, rule2).Should().Be(expected);
+        FirewallRuleOverlapDetector.RulesOverlap(rule2, rule1).Should().Be(expected);
+    }
+
+    [Fact]
+    public void RulesOverlap_SameIpv4Family_OtherCriteriaStillDecide()
+    {
+        // IPv4 on both sides must not short-circuit to overlap: disjoint ports still separate them
+        var rule1 = CreateRule(protocol: "tcp", sourceMatchingTarget: "ANY", destMatchingTarget: "ANY",
+            destPort: "53", ipVersion: "IPV4");
+        var rule2 = CreateRule(protocol: "tcp", sourceMatchingTarget: "ANY", destMatchingTarget: "ANY",
+            destPort: "443", ipVersion: "IPV4");
+
+        FirewallRuleOverlapDetector.RulesOverlap(rule1, rule2).Should().BeFalse();
+    }
+
+    #endregion
+
     #region MatchOpposite Tests - Sources
 
     [Fact]
@@ -2332,7 +2392,8 @@ public class FirewallRuleOverlapDetectorTests
         string? sourceZoneId = null,
         string? destZoneId = null,
         List<int>? appIds = null,
-        List<int>? appCategoryIds = null)
+        List<int>? appCategoryIds = null,
+        string? ipVersion = null)
     {
         return new FirewallRule
         {
@@ -2340,6 +2401,7 @@ public class FirewallRuleOverlapDetectorTests
             Name = "Test Rule",
             Enabled = true,
             Protocol = protocol,
+            IpVersion = ipVersion,
             MatchOppositeProtocol = matchOppositeProtocol,
             SourceMatchingTarget = sourceMatchingTarget,
             SourceNetworkIds = sourceNetworkIds,

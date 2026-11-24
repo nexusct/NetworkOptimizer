@@ -74,6 +74,7 @@ public class FirmwareRolloutRepository : IFirmwareRolloutRepository
                 existing.AutopilotWindowMode = settings.AutopilotWindowMode;
                 existing.FixedDayOfWeek = settings.FixedDayOfWeek;
                 existing.FixedHour = settings.FixedHour;
+                existing.FixedWindowFlexible = settings.FixedWindowFlexible;
                 existing.NotifyHoursAhead = settings.NotifyHoursAhead;
                 existing.SoakHours = settings.SoakHours;
                 existing.MinReleaseAgeDays = settings.MinReleaseAgeDays;
@@ -176,7 +177,10 @@ public class FirmwareRolloutRepository : IFirmwareRolloutRepository
         }
     }
 
-    public async Task<List<FirmwareRolloutPlan>> GetPlanHistoryAsync(int limit = 50, CancellationToken cancellationToken = default)
+    public Task<List<FirmwareRolloutPlan>> GetPlanHistoryAsync(int limit = 50, CancellationToken cancellationToken = default) =>
+        GetPlanHistoryPageAsync(0, limit, cancellationToken);
+
+    public async Task<List<FirmwareRolloutPlan>> GetPlanHistoryPageAsync(int offset, int limit, CancellationToken cancellationToken = default)
     {
         try
         {
@@ -184,6 +188,7 @@ public class FirmwareRolloutRepository : IFirmwareRolloutRepository
                 .AsNoTracking()
                 .OrderByDescending(p => p.CreatedAt)
                 .ThenByDescending(p => p.Id)
+                .Skip(Math.Max(0, offset))
                 .Take(limit)
                 .ToListAsync(cancellationToken);
         }
@@ -193,6 +198,9 @@ public class FirmwareRolloutRepository : IFirmwareRolloutRepository
             throw;
         }
     }
+
+    public Task<int> CountPlansAsync(CancellationToken cancellationToken = default) =>
+        _context.FirmwareRolloutPlans.CountAsync(cancellationToken);
 
     public async Task UpdatePlanAsync(FirmwareRolloutPlan plan, CancellationToken cancellationToken = default)
     {
@@ -304,6 +312,28 @@ public class FirmwareRolloutRepository : IFirmwareRolloutRepository
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to get steps for firmware rollout plan {Id}", planId);
+            throw;
+        }
+    }
+
+    public async Task<List<FirmwareRolloutStep>> GetStrandedStepsAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var inFlight = new[]
+            {
+                FirmwareRolloutStepState.Commanded, FirmwareRolloutStepState.Down,
+                FirmwareRolloutStepState.BackOnline, FirmwareRolloutStepState.CoolDown
+            };
+            return await (from s in _context.FirmwareRolloutSteps.AsNoTracking()
+                          join p in _context.FirmwareRolloutPlans.AsNoTracking() on s.PlanId equals p.Id
+                          where FirmwareRolloutStatuses.Terminal.Contains(p.Status) && inFlight.Contains(s.State)
+                          orderby s.Id
+                          select s).ToListAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get stranded firmware rollout steps");
             throw;
         }
     }

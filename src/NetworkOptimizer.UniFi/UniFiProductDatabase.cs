@@ -61,13 +61,23 @@ public static class UniFiProductDatabase
 
         // Industrial
         "USW-Industrial",
+        "USW-Industrial-DIN-8",
+        "USW-Industrial-DIN-8-PoE",
+        "USW-Industrial-DIN-2.5G-8-PoE",
 
         // Pro XG (MIPS-based)
         "USW-Pro-XG-8-PoE",
 
+        // Pro Series Gen1 (no iperf3)
+        "USW-Pro-48-PoE",
+
         // Pro Max Series (no iperf3)
         "USW-Pro-Max-16",
         "USW-Pro-Max-16-PoE",
+        "USW-Pro-Max-24",
+        "USW-Pro-Max-24-PoE",
+        "USW-Pro-Max-48",
+        "USW-Pro-Max-48-PoE",
 
         // Legacy US Series (MIPS-based)
         "US-8",
@@ -227,6 +237,10 @@ public static class UniFiProductDatabase
         { "USC8P60", "US-8-60W" },
         { "USC8P150", "US-8-150W" },
         { "USC8P450", "USW-Industrial" },
+        { "USWED97", "USW-Industrial-DIN-8-PoE" },
+        { "USWED98", "USW-Industrial-DIN-8" },
+        // TODO(#1287): inferred from sysid ed9b; public.json has no Network model code for it yet.
+        { "USWED9B", "USW-Industrial-DIN-2.5G-8-PoE" },
         { "USL16P", "USW-16-PoE" },
         { "USL16PB", "USW-16-PoE" },
         { "USL24", "USW-24" },
@@ -344,6 +358,7 @@ public static class UniFiProductDatabase
         { "UAPA6B0", "U7-Pro-Outdoor-EU" },
         { "UAPA6B3", "U7-LR" },
         { "UAPA6BA", "U7-Pro-XG-Wall" },
+        { "UAPA6BE", "U7-Industrial" },
 
         // ----- Official: Enterprise WiFi 7 (E7) Series -----
         { "UAPA697", "E7" },
@@ -439,13 +454,15 @@ public static class UniFiProductDatabase
         { "ULTE", "U-LTE" },
         { "ULTEPUS", "U-LTE-Backup-Pro" },
         { "ULTEPEU", "U-LTE-Backup-Pro" },
-        { "UCI", "UCI" },
         { "UMBBE630", "U5G-Max" },
         { "UMBBE631", "U5G-Max-Outdoor" },
         // Unified display name - real SKUs are U5G-US / U5G-EU but we use a
         // single non-regional name for cleaner UX and one device icon.
         { "UMBBE633", "U5G-Backup" },
         { "UMBBE634", "U5G-Backup" },
+
+        // ----- Official: Cable Internet (DOCSIS) -----
+        { "UCI", "UCI" },
 
         // ----- Official: UPS -----
         { "USWDA23", "UPS-Tower" },
@@ -533,6 +550,9 @@ public static class UniFiProductDatabase
         { "USWULTRA", "USW-Ultra" },
         { "USWLITE8", "USW-Lite-8-PoE" },
         { "USWLITE16", "USW-Lite-16-PoE" },
+        { "USID8", "USW-Industrial-DIN-8" },
+        { "USID8P", "USW-Industrial-DIN-8-PoE" },
+        { "USID2P5G8P", "USW-Industrial-DIN-2.5G-8-PoE" },
         { "USW8", "US-8" },
         { "USW8P60", "US-8-60W" },
         { "USW8P150", "US-8-150W" },
@@ -599,6 +619,8 @@ public static class UniFiProductDatabase
         { "U7PROXG", "U7-Pro-XG" },
         { "U7PO", "U7-Pro-Outdoor" },
         { "U7POEU", "U7-Pro-Outdoor-EU" },
+        { "U7-Industrial", "U7-Industrial" },
+        { "U7I", "U7-Industrial" },
         { "G7LR", "U7-LR" },
         { "G7LRV2", "U7-LR" },
         { "G7LT", "U7-Lite" },
@@ -819,11 +841,16 @@ public static class UniFiProductDatabase
     }
 
     /// <summary>
-    /// Switches that have no SSH daemon. These are managed exclusively through the
+    /// Devices that have no SSH daemon. These are managed exclusively through the
     /// UniFi Network Application and will reject SSH connections at the transport layer.
     /// </summary>
     private static readonly HashSet<string> DevicesWithoutSsh = new(StringComparer.OrdinalIgnoreCase)
     {
+        // Power devices. Not every one: keep a model off this list until it is confirmed without SSH.
+        "UPS-Tower",
+        "USP-Plug",
+        "USP-Strip",
+
         // Flex Series (excluding Flex XG, which does have SSH)
         "USW-Flex",
         "USW-Flex-Mini",
@@ -838,8 +865,8 @@ public static class UniFiProductDatabase
     };
 
     /// <summary>
-    /// Whether a device accepts SSH connections. Returns false for switch models known
-    /// to have no SSH daemon (Flex and Ultra families).
+    /// Whether a device accepts SSH connections. Returns false for models known to have
+    /// no SSH daemon (Flex and Ultra switches, UPS Tower, smart plugs and strips).
     /// </summary>
     public static bool HasSsh(string? model, string? shortname)
     {
@@ -977,14 +1004,26 @@ public static class UniFiProductDatabase
     /// Older power appliances report as switches or access points, while newer ones use
     /// the dedicated usp type. The product allow-list normalizes all of them without
     /// treating real managed switches with power capabilities as SmartPower devices.
+    /// A gateway-class device whose device_mode_override is "mesh" (an Express adopted as an
+    /// AP) is an AccessPoint; any other mode value leaves the result unchanged.
     /// </summary>
-    public static DeviceType ClassifyDeviceType(string? apiType, string? model, string? shortname)
+    public static DeviceType ClassifyDeviceType(string? apiType, string? model, string? shortname, string? deviceModeOverride = null)
     {
         if (IsPowerDevice(model, shortname))
             return DeviceType.SmartPower;
 
-        return DeviceTypeExtensions.FromUniFiApiType(apiType, model);
+        var type = DeviceTypeExtensions.FromUniFiApiType(apiType, model);
+        // Model-agnostic on purpose: UniFi's web UI keys this on the mode field alone.
+        if (type == DeviceType.Gateway && IsAccessPointMode(deviceModeOverride))
+            return DeviceType.AccessPoint;
+        return type;
     }
+
+    /// <summary>
+    /// Whether a gateway-class device's device_mode_override puts it in access point mode.
+    /// </summary>
+    public static bool IsAccessPointMode(string? deviceModeOverride) =>
+        string.Equals(deviceModeOverride, "mesh", StringComparison.Ordinal);
 
     /// <summary>
     /// Check if a model code represents a cellular/LTE modem
@@ -1025,8 +1064,18 @@ public static class UniFiProductDatabase
     }
 
     /// <summary>
+    /// Check if a device is a gateway with a built-in cellular modem (UDR-5G-Max). These are not
+    /// <see cref="IsCellularModem(string?, string?, string?)"/>: they are gateways, and are polled
+    /// with the gateway's SSH credentials rather than the device ones.
+    /// </summary>
+    /// <param name="model">The model field (internal code)</param>
+    /// <param name="shortname">The shortname field</param>
+    public static bool IsCellularGateway(string? model, string? shortname) =>
+        GetBestProductName(model, shortname) == "UDR-5G-Max";
+
+    /// <summary>
     /// Get the default QMI device path for a cellular modem based on its model.
-    /// U-LTE devices use /dev/cdc-wdm0, U5G Backup uses qrtr://3,
+    /// U-LTE devices use /dev/cdc-wdm0, U5G Backup uses qrtr://3, the UDR-5G-Max an MHI pipe,
     /// U5G-Max and other 5G modems use /dev/wwan0qmi0.
     /// </summary>
     /// <param name="model">The model code or product name</param>
@@ -1054,6 +1103,14 @@ public static class UniFiProductDatabase
             model.Equals("U5G-EU", StringComparison.OrdinalIgnoreCase))
         {
             return "qrtr://3";
+        }
+
+        // UDR-5G-Max's built-in modem is QMI over MBIM on an MHI pipe (UniFi OS's MBIM_IFACE)
+        if (model.Equals("UDR-5G-Max", StringComparison.OrdinalIgnoreCase) ||
+            model.Equals("UDMA6B9", StringComparison.OrdinalIgnoreCase) ||
+            model.Equals("UDR5G", StringComparison.OrdinalIgnoreCase))
+        {
+            return "/dev/mhi_0308_02.01.00_pipe_12";
         }
 
         // U5G-Max and other 5G modems use /dev/wwan0qmi0

@@ -1,0 +1,248 @@
+using System.Collections.Concurrent;
+using NetworkOptimizer.AgentProtocol;
+using NetworkOptimizer.Threats.Blocking;
+
+namespace NetworkOptimizer.Web.Services;
+
+/// <summary>
+/// Sends Automatic Blocking's gateway set to the On-Site Agents running on each site's gateway, and
+/// tracks what each one reports it has applied. The blocking cycle pushes every minute; a set goes
+/// out when an agent does not hold it yet, when it connects, and every few minutes regardless, which
+/// renews the public list entries' time to live.
+/// </summary>
+public sealed class GatewayAgentBlocklist : IGatewayAgentBlocklist
+{
+    /// <summary>The capability string, shared by agent and server.</summary>
+    public const string Capability = "gateway-blocklist";
+
+    /// <summary>The agent takes the public lists in their own set, with exceptions to them.</summary>
+    public const string ExceptionsCapability = "gateway-blocklist-exceptions";
+
+    private static readonly TimeSpan ResendEvery = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan AckWait = TimeSpan.FromMinutes(2);
+
+    private readonly AgentTunnelRegistry _registry;
+    private readonly ILogger<GatewayAgentBlocklist> _logger;
+    // The set each site should hold, keyed by site slug.
+    private readonly ConcurrentDictionary<string, Desired> _desired = new();
+    // When each agent was last sent a set, and which one.
+    private readonly ConcurrentDictionary<int, (string Fingerprint, DateTime At)> _sent = new();
+    // What each agent last reported.
+    private readonly ConcurrentDictionary<int, GatewayBlocklistStatus> _status = new();
+
+    private sealed record Desired(bool Enabled, IReadOnlyList<GatewayAgentEntry> Entries, IReadOnlyList<GatewayAgentEntry> Outbound,
+        string Fingerprint, IReadOnlyList<GatewayAgentEntry> Feeds, IReadOnlyList<BlockingException> Exceptions);
+
+    // Resolved on first use, never injected: the collection service depends (through the list lookup)
+    // on the blocking service, which depends on this one, and a constructor cycle hangs startup.
+    private readonly IServiceProvider _services;
+
+    public GatewayAgentBlocklist(AgentTunnelRegistry registry, ILogger<GatewayAgentBlocklist> logger, IServiceProvider services)
+    {
+        _registry = registry;
+        _logger = logger;
+        _services = services;
+    }
+
+    private static string Slug(string? site) => string.IsNullOrEmpty(site) ? SiteManagementService.DefaultSiteSlug : site;
+
+    private List<AgentTunnelConnection> Capable(string slug) =>
+        _registry.GetForSite(slug).Where(c => c.OnGateway == true && c.HasCapability(Capability) && !c.IsStale).ToList();
+
+    public bool Push(string? site, bool enabled, IReadOnlyList<GatewayAgentEntry> entries, IReadOnlyList<GatewayAgentEntry> outbound,
+        string fingerprint, IReadOnlyList<GatewayAgentEntry>? feeds = null, IReadOnlyList<BlockingException>? exceptions = null)
+    {
+        var slug = Slug(site);
+        var desired = new Desired(enabled, entries, outbound, fingerprint, feeds ?? [], exceptions ?? []);
+        _desired[slug] = desired;
+        var agents = Capable(slug);
+        var now = DateTime.UtcNow;
+        foreach (var agent in agents)
+        {
+            var applied = _status.TryGetValue(agent.AgentId, out var status) && status.Fingerprint == fingerprint && status.Ok;
+            var sent = _sent.TryGetValue(agent.AgentId, out var last);
+            if (applied && sent && last.Fingerprint == fingerprint && now - last.At < ResendEvery) continue;
+            // An unanswered send is repeated each cycle only after a minute's wait, not on every call.
+            if (!applied && sent && last.Fingerprint == fingerprint && now - last.At < TimeSpan.FromSeconds(55)) continue;
+            Send(agent, desired, now);
+        }
+        return agents.Count > 0;
+    }
+
+    // An agent whose last report was good still counts while a newer set is on its way: its ack lands
+    // a second after the push, so requiring the current fingerprint would never count a busy site.
+    public bool IsEnforcing(string? site, string fingerprint) =>
+        Capable(Slug(site)).Any(agent => _status.TryGetValue(agent.AgentId, out var s) && s.Ok && s.HookPresent
+            && (s.Fingerprint == fingerprint
+                || (_sent.TryGetValue(agent.AgentId, out var sent) && sent.Fingerprint == fingerprint
+                    && DateTime.UtcNow - sent.At < AckWait)));
+
+    public bool HasGatewayAgent(string? site) => Capable(Slug(site)).Count > 0;
+
+    public bool EnforcesExceptions(string? site) => Capable(Slug(site)).All(c => c.HasCapability(ExceptionsCapability));
+
+    public GatewayAgentSent? LastSent(string? site)
+    {
+        var slug = Slug(site);
+        if (!_desired.TryGetValue(slug, out var desired) || !desired.Enabled || Capable(slug).Count == 0) return null;
+        var now = DateTime.UtcNow;
+        var split = EnforcesExceptions(slug);
+        // Counted as the agent applies them: it refuses what is not a public range and files mapped IPv4 as IPv4.
+        (int V4, int V6) Count(IEnumerable<GatewayAgentEntry> entries)
+        {
+            var live = entries.Where(e => e.ExpiresAt > now)
+                .Select(e => NetworkOptimizer.Core.Helpers.BlocklistEntry.Canonical(e.Address))
+                .OfType<(string Text, bool IsV6)>()
+                .ToList();
+            var v6 = live.Count(e => e.IsV6);
+            return (live.Count - v6, v6);
+        }
+        var block = Count(split ? desired.Entries : desired.Entries.Concat(desired.Feeds));
+        var outbound = Count(desired.Outbound);
+        var feeds = split ? Count(desired.Feeds) : (V4: 0, V6: 0);
+        return new GatewayAgentSent(split, block.V4, block.V6, outbound.V4, outbound.V6, feeds.V4, feeds.V6);
+    }
+
+    public string? Problem(string? site, string fingerprint)
+    {
+        var now = DateTime.UtcNow;
+        foreach (var agent in Capable(Slug(site)))
+        {
+            if (_status.TryGetValue(agent.AgentId, out var s) && !s.Ok)
+                return string.IsNullOrWhiteSpace(s.Error) ? "Blocklist not applied" : s.Error;
+            if (s is { HookPresent: false })
+                return "Rules not in place";
+            var awaited = _sent.TryGetValue(agent.AgentId, out var sent) && now - sent.At >= AckWait;
+            if (s?.Fingerprint != fingerprint && awaited)
+                return "Not confirming the current blocklist";
+        }
+        return null;
+    }
+
+    /// <summary>Sends a newly connected gateway agent its site's set, if there is one yet.</summary>
+    public void OnAgentConnected(AgentTunnelConnection connection)
+    {
+        _sent.TryRemove(connection.AgentId, out _);
+        _status.TryRemove(connection.AgentId, out _);
+        if (connection.OnGateway != true || !connection.HasCapability(Capability)) return;
+        if (_desired.TryGetValue(connection.SiteSlug, out var desired))
+            Send(connection, desired, DateTime.UtcNow);
+    }
+
+    public void OnAgentDisconnected(AgentTunnelConnection connection)
+    {
+        _sent.TryRemove(connection.AgentId, out _);
+        _status.TryRemove(connection.AgentId, out _);
+    }
+
+    /// <summary>
+    /// Hands the devices an agent saw trying to reach an outbound-blocked address to Threat Intelligence,
+    /// which tags, de-duplicates, and alerts on them with the site's next collection.
+    /// </summary>
+    public void OnHits(AgentTunnelConnection connection, GatewayBlocklistHits hits)
+    {
+        // Only the agent that enforces the blocklist can have seen its drops; any other agent of the
+        // site sending them would be writing Threat events and alerts it has no business raising.
+        if (connection.OnGateway != true || !connection.HasCapability(Capability))
+        {
+            _logger.LogWarning("Ignored gateway blocklist hits from agent {Agent} ({Site}): not a gateway agent with the blocklist",
+                connection.AgentName, connection.SiteSlug);
+            return;
+        }
+        if (hits.Hits.Count == 0 || _services.GetService<NetworkOptimizer.Threats.ThreatCollectionService>() is not { } collection) return;
+        var drops = hits.Hits
+            .Where(h => !string.IsNullOrWhiteSpace(h.ClientIp) && !string.IsNullOrWhiteSpace(h.DestIp))
+            .Select(h => new NetworkOptimizer.Threats.Models.ThreatEvent
+            {
+                Timestamp = DateTimeOffset.FromUnixTimeMilliseconds(h.LastUnixMs).UtcDateTime,
+                SourceIp = h.ClientIp,
+                SourceMac = string.IsNullOrEmpty(h.ClientMac) ? null : h.ClientMac,
+                DestIp = h.DestIp,
+                DestPort = h.DestPort,
+                Protocol = h.Protocol,
+                Action = NetworkOptimizer.Threats.Models.ThreatAction.Blocked,
+                EventSource = NetworkOptimizer.Threats.Models.EventSource.TrafficFlow,
+                Direction = "outgoing",
+                Category = PublicListContact.Category,
+                SignatureName = "",
+                InnerAlertId = $"gateway-agent:{h.ClientIp}:{h.DestIp}:{h.Protocol}:{h.DestPort}:{h.FirstUnixMs}",
+            })
+            .ToList();
+        collection.QueueGatewayDrops(connection.SiteSlug, drops);
+    }
+
+    /// <summary>Records an agent's report of what it applied.</summary>
+    public void OnStatus(AgentTunnelConnection connection, GatewayBlocklistStatus status)
+    {
+        var previous = _status.TryGetValue(connection.AgentId, out var p) ? p : null;
+        _status[connection.AgentId] = status;
+        if (!status.Ok)
+            _logger.LogWarning("Gateway blocklist on agent {Agent} ({Site}) failed: {Error}", connection.AgentName, connection.SiteSlug, status.Error);
+        else if (!status.HookPresent)
+        {
+            // An agent sent "off" tears its rules down and reports no hooks: that is the wanted state.
+            if (!(_desired.TryGetValue(connection.SiteSlug, out var desired) && !desired.Enabled))
+                _logger.LogWarning("Gateway blocklist on agent {Agent} ({Site}): its rules are not in place", connection.AgentName, connection.SiteSlug);
+        }
+        else if (previous?.Fingerprint != status.Fingerprint)
+            _logger.LogInformation("Gateway blocklist on agent {Agent} ({Site}): {V4} IPv4 and {V6} IPv6 entries applied",
+                connection.AgentName, connection.SiteSlug, status.V4Entries, status.V6Entries);
+    }
+
+    private static IEnumerable<GatewayBlockEntry> Wire(IEnumerable<GatewayAgentEntry> entries, DateTime now) => entries
+        .Select(e => (e.Address, Ttl: (e.ExpiresAt - now).TotalSeconds))
+        .Where(e => e.Ttl >= 1)
+        .Select(e => new GatewayBlockEntry { Address = e.Address, TtlSeconds = (int)Math.Min(int.MaxValue, Math.Ceiling(e.Ttl)) });
+
+    private static GatewayBlockException ToWire(BlockingException e)
+    {
+        var wire = new GatewayBlockException
+        {
+            Inbound = e.Direction == ExceptionDirection.Inbound,
+            Device = e.Device ?? "",
+            Address = e.Address ?? "",
+            PortFrom = e.PortFrom ?? 0,
+            PortTo = e.PortTo ?? 0,
+        };
+        wire.Protocols.AddRange(e.Protocols);
+        return wire;
+    }
+
+    private void Send(AgentTunnelConnection agent, Desired desired, DateTime now)
+    {
+        var message = new GatewayBlocklistSet { Enabled = desired.Enabled, Fingerprint = desired.Fingerprint };
+        message.Entries.AddRange(Wire(desired.Entries, now));
+        message.Outbound.AddRange(Wire(desired.Outbound, now));
+        // An agent before exceptions holds the public lists with the site's own blocks, and enforces none.
+        if (agent.HasCapability(ExceptionsCapability))
+        {
+            message.FeedsSplit = true;
+            message.Feeds.AddRange(Wire(desired.Feeds, now));
+            message.Exceptions.AddRange(desired.Exceptions.Select(ToWire));
+        }
+        else
+        {
+            message.Entries.AddRange(Wire(desired.Feeds, now));
+        }
+        // gRPC's default receive limit is 4 MB, and agents before this release keep it: a larger set
+        // drops the tunnel on every send. The agent keeps enforcing its last set instead.
+        if (message.CalculateSize() > MaxSetBytes)
+        {
+            _status[agent.AgentId] = new GatewayBlocklistStatus
+            {
+                Fingerprint = desired.Fingerprint,
+                Ok = false,
+                HookPresent = true,
+                Error = $"The blocklist is too large to send ({message.Entries.Count:N0} entries); turn off a public block list",
+            };
+            _logger.LogWarning("Gateway blocklist for agent {Agent} ({Site}) not sent: {Bytes:N0} bytes is over the tunnel's limit",
+                agent.AgentName, agent.SiteSlug, message.CalculateSize());
+            _sent[agent.AgentId] = (desired.Fingerprint, now);
+            return;
+        }
+        if (_registry.TrySend(agent.AgentId, new ServerMessage { GatewayBlocklist = message }))
+            _sent[agent.AgentId] = (desired.Fingerprint, now);
+    }
+
+    private const int MaxSetBytes = 3_500_000;
+}

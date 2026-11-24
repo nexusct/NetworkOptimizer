@@ -77,17 +77,24 @@ public class AgentEnrollmentService : IAgentEnrollmentService
         }
     }
 
-    /// <summary>Agents registered for a site, newest first.</summary>
-    public async Task<List<SiteAgent>> GetAgentsForSiteAsync(int siteId)
+    /// <summary>Agents registered for a site, newest first. Unnarrowed: the system view.</summary>
+    public Task<List<SiteAgent>> GetAgentsForSiteAsync(int siteId) => GetAgentsForSiteAsync(siteId, siteAccess: null);
+
+    /// <summary>
+    /// Agents registered for a site, newest first, or none when <paramref name="siteAccess"/> does
+    /// not authorize the caller for it. Null skips the check.
+    /// </summary>
+    public async Task<List<SiteAgent>> GetAgentsForSiteAsync(int siteId, Authorization.ISiteAccessFilter? siteAccess)
     {
         await using var db = await _mainDbFactory.CreateDbContextAsync();
         // The site id arrives from the caller, so authorization for it is asked here rather than
-        // assumed from whatever page supplied it. The filter is scoped (caller context), so this
-        // singleton resolves it per call instead of capturing it at construction.
-        var slug = await db.Sites.Where(x => x.Id == siteId).Select(x => x.Slug).FirstOrDefaultAsync();
-        using var scope = _serviceProvider.CreateScope();
-        if (slug is not null && !await scope.ServiceProvider.GetRequiredService<Authorization.ISiteAccessFilter>().IsAuthorizedAsync(slug))
-            return new List<SiteAgent>();
+        // assumed from whatever page supplied it.
+        if (siteAccess is not null)
+        {
+            var slug = await db.Sites.Where(x => x.Id == siteId).Select(x => x.Slug).FirstOrDefaultAsync();
+            if (slug is not null && !await siteAccess.IsAuthorizedAsync(slug))
+                return new List<SiteAgent>();
+        }
 
         return await db.SiteAgents
             .Where(a => a.SiteId == siteId)
@@ -95,18 +102,20 @@ public class AgentEnrollmentService : IAgentEnrollmentService
             .ToListAsync();
     }
 
-    /// <summary>All agents across sites (for the overview card).</summary>
-    public async Task<List<SiteAgent>> GetAllAgentsAsync()
+    /// <summary>All agents across sites. Unnarrowed: the system view.</summary>
+    public Task<List<SiteAgent>> GetAllAgentsAsync() => GetAllAgentsAsync(siteAccess: null);
+
+    /// <summary>All agents on the sites <paramref name="siteAccess"/> authorizes. Null skips the narrowing.</summary>
+    public async Task<List<SiteAgent>> GetAllAgentsAsync(Authorization.ISiteAccessFilter? siteAccess)
     {
         await using var db = await _mainDbFactory.CreateDbContextAsync();
         var agents = await db.SiteAgents.ToListAsync();
+        if (siteAccess is null)
+            return agents;
 
-        // Agent rows name the sites they serve, so the same narrowing the site list gets applies
-        // here. Background scopes are unfiltered, as always. Scoped filter resolved per call.
+        // Agent rows name the sites they serve, so the same narrowing the site list gets applies here.
         var slugsById = await db.Sites.AsNoTracking().ToDictionaryAsync(x => x.Id, x => x.Slug);
-        using var scope = _serviceProvider.CreateScope();
-        return await scope.ServiceProvider.GetRequiredService<Authorization.ISiteAccessFilter>()
-            .FilterAsync(agents, a => slugsById.GetValueOrDefault(a.SiteId) ?? "");
+        return await siteAccess.FilterAsync(agents, a => slugsById.GetValueOrDefault(a.SiteId) ?? "");
     }
 
     /// <summary>
@@ -374,6 +383,28 @@ public class AgentEnrollmentService : IAgentEnrollmentService
 
         if (!enabled)
             DropLiveTunnel(agent.Id, agent.Name, "disabled");
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> RenameAgentAsync(string siteSlug, int agentId, string name)
+    {
+        name = name?.Trim() ?? "";
+        if (name.Length == 0)
+            return false;
+
+        await using var db = await _mainDbFactory.CreateDbContextAsync();
+        var agent = await AgentOnSiteAsync(db, siteSlug, agentId);
+        if (agent == null)
+            return false;
+
+        agent.Name = name;
+        agent.UpdatedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync();
+
+        // The connection carries the name for status lines and logs; without this it keeps the old one until a reconnect.
+        foreach (var connection in _tunnelRegistry.GetAll().Where(c => c.AgentId == agentId))
+            connection.AgentName = name;
+        return true;
     }
 
     /// <summary>Whether a last-seen timestamp counts as online right now.</summary>

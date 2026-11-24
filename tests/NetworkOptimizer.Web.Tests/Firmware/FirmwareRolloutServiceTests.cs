@@ -1,6 +1,7 @@
 using FluentAssertions;
 using NetworkOptimizer.Core.Enums;
 using NetworkOptimizer.Storage.Models;
+using NetworkOptimizer.UniFi.Models;
 using NetworkOptimizer.Web.Services.Firmware;
 using Xunit;
 
@@ -158,7 +159,13 @@ public class FirmwareRolloutServiceTests
         harness.Commands.SnapshotConsoleInfoPerRead = true;
         // The console has not noticed the update itself; the shared catalog is offering it.
         harness.Commands.ConsoleInfo!.NetworkApplication!.UpdateAvailable = null;
-        await harness.SharedCatalog.UpsertNetworkAppBuildAsync("release", "9.1.0", null);
+        harness.Commands.NetworkPackages = new ConsoleNetworkPackages("uos-deb13-arm64", []);
+        await harness.SharedCatalog.UpsertNetworkAppBuildAsync("uos-deb13-arm64", "release", "9.1.0", null);
+        await harness.SharedCatalog.UpsertNetworkAppPackagesAsync([new SharedNetworkAppPackage
+        {
+            Platform = "uos-deb13-arm64", Version = "9.1.0",
+            Url = "https://fw-download.example.test/data/unifi-native/aaaa-uos-deb13-arm64-9.1.0-1-1-00000000.deb",
+        }]);
 
         var preview = await harness.Service.BuildPreviewAsync(Settings(s => s.IncludeUniFiNetwork = true));
 
@@ -166,6 +173,342 @@ public class FirmwareRolloutServiceTests
         preview.NetworkApplication.Should().NotBeNull();
         preview.NetworkApplication!.TargetVersion.Should().Be("9.1.0");
         preview.NetworkApplication.UpdateAvailable.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task BuildPreviewAsync_LeavesOutAConsoleSurfaceTheConsoleWouldNotMoveToThePlannedChannel()
+    {
+        using var harness = HarnessWithTwoAps();
+        harness.Commands.ConsoleInfo!.NetworkApplication!.ReleaseChannel = "beta";
+        harness.Commands.ConsoleChannelsAccepted = false;
+
+        var preview = await harness.Service.BuildPreviewAsync(Settings(s =>
+        {
+            s.IncludeUniFiNetwork = true;
+            s.GlobalChannel = FirmwareChannels.ReleaseCandidate;
+        }));
+
+        preview.Plan.IncludesUniFiNetworkUpdate.Should().BeFalse("the console still offers beta's build, not the planned channel's");
+        preview.Plan.Notes.Should().ContainSingle(n => n.Contains("left out of this rollout"));
+    }
+
+    // --- Shared device builds -------------------------------------------------------------------
+
+    private static Task SeedSharedDeviceBuildAsync(RolloutHarness harness, string version) =>
+        harness.SharedCatalog.UpsertDeviceBuildsAsync(
+        [
+            new SharedFirmwareBuild
+            {
+                Model = "SKU-AP1", Channel = FirmwareChannels.Release, Version = version,
+                Url = $"https://example.test/unifi-firmware/SKU-AP1-{version}.bin",
+            },
+        ]);
+
+    [Fact]
+    public async Task BuildPreviewAsync_ANewerSharedDeviceBuildReplacesTheConsolesOlderOffer()
+    {
+        using var harness = HarnessWithTwoAps();
+        await SeedSharedDeviceBuildAsync(harness, "1.2.0");
+
+        var preview = await harness.Service.BuildPreviewAsync(Settings());
+
+        preview.Plan.Waves.SelectMany(w => w.Steps).Where(s => s.Mac == ApMac)
+            .Should().ContainSingle().Which.ToVersion.Should().Be("1.2.0");
+        preview.Plan.TargetImages.Should().ContainSingle(i => i.Mac == ApMac)
+            .Which.Url.Should().Be("https://example.test/unifi-firmware/SKU-AP1-1.2.0.bin",
+                "the image must name the new target, or the step installs the console's own build");
+    }
+
+    [Fact]
+    public async Task BuildPreviewAsync_AnOlderSharedDeviceBuildLeavesTheConsolesOffer()
+    {
+        using var harness = HarnessWithTwoAps();
+        await SeedSharedDeviceBuildAsync(harness, "1.0.5");
+
+        var preview = await harness.Service.BuildPreviewAsync(Settings());
+
+        preview.Plan.Waves.SelectMany(w => w.Steps).Where(s => s.Mac == ApMac)
+            .Should().ContainSingle().Which.ToVersion.Should().Be("1.1.0");
+    }
+
+    // --- A build chosen by hand ----------------------------------------------------------------
+
+    [Fact]
+    public async Task BuildPreviewAsync_APinnedDeviceBuildWinsOverNewerOffers()
+    {
+        // The console offers 1.1.0 and another site was offered 1.2.0; the admin chose 1.0.5.
+        using var harness = HarnessWithTwoAps();
+        await SeedSharedDeviceBuildAsync(harness, "1.2.0");
+        var pin = new RolloutBuildPin(FirmwareUrlKind.Device, "SKU-AP1", "1.0.5", "https://example.test/SKU-AP1-1.0.5.bin");
+
+        var preview = await harness.Service.BuildPreviewAsync(Settings(), pin: pin);
+
+        preview.Plan.Waves.SelectMany(w => w.Steps).Select(s => s.ToVersion).Should().AllBe("1.0.5");
+        preview.Plan.TargetImages.Should().HaveCount(2).And.OnlyContain(i => i.Pinned && i.Url == pin.Url);
+    }
+
+    [Fact]
+    public async Task BuildPreviewAsync_APinnedFamilyBuildCoversEveryModelInTheFamily()
+    {
+        // One image for two model codes, as dl.ui.com publishes it; a third model stays on its offer.
+        using var harness = HarnessWithTwoAps();
+        harness.Planning.Devices.Add(Ap("aa:bb:cc:dd:ee:03", "AP 3", model: "SKU-AP2"));
+        harness.Planning.Devices.Add(Ap("aa:bb:cc:dd:ee:05", "AP 5", model: "SKU-OTHER"));
+        var pin = new RolloutBuildPin(FirmwareUrlKind.Device, "SKU-AP1", "1.0.5", "https://example.test/family-1.0.5.bin",
+            ["SKU-AP1", "SKU-AP2"]);
+
+        var preview = await harness.Service.BuildPreviewAsync(Settings(), pin: pin);
+
+        var steps = preview.Plan.Waves.SelectMany(w => w.Steps).ToList();
+        steps.Where(s => s.Model is "SKU-AP1" or "SKU-AP2").Select(s => s.ToVersion).Should().HaveCount(3).And.AllBe("1.0.5");
+        steps.Single(s => s.Model == "SKU-OTHER").ToVersion.Should().Be("1.1.0");
+    }
+
+    [Fact]
+    public async Task BuildPreviewAsync_APinnedDeviceBuildAlreadyInstalledPlansNothingForThatModel()
+    {
+        using var harness = HarnessWithTwoAps();
+        var pin = new RolloutBuildPin(FirmwareUrlKind.Device, "SKU-AP1", "1.0.0", "https://example.test/SKU-AP1-1.0.0.bin");
+
+        var preview = await harness.Service.BuildPreviewAsync(Settings(), pin: pin);
+
+        LiveMacs(preview).Should().BeEmpty("the newest build must not stand in for the one that was chosen");
+    }
+
+    [Fact]
+    public async Task BuildPreviewAsync_APinnedDeviceBuildOlderThanInstalledPlansADowngrade()
+    {
+        using var harness = HarnessWithTwoAps();
+        var pin = new RolloutBuildPin(FirmwareUrlKind.Device, "SKU-AP1", "0.9.8", "https://example.test/SKU-AP1-0.9.8.bin");
+
+        var preview = await harness.Service.BuildPreviewAsync(Settings(), pin: pin);
+
+        preview.Plan.Waves.SelectMany(w => w.Steps).Select(s => s.ToVersion).Should().HaveCount(2).And.AllBe("0.9.8");
+        preview.Plan.TargetImages.Should().HaveCount(2).And.OnlyContain(i => i.Pinned && i.Url == pin.Url);
+    }
+
+    [Fact]
+    public async Task BuildPreviewAsync_APinnedUniFiOsBuildWinsOverTheConsolesNewerOffer()
+    {
+        using var harness = CloudGatewayHarness();
+        await SeedSharedOsBuildAsync(harness);
+        var pin = new RolloutBuildPin(FirmwareUrlKind.UniFiOs, Platform, "6.0.8", "https://example.test/unifi-dream/UCGF-6.0.8.bin");
+
+        var preview = await harness.Service.BuildPreviewAsync(EarlyAccessOs(), pin: pin);
+
+        preview.Plan.IncludesUniFiOsUpdate.Should().BeTrue();
+        preview.Plan.UniFiOsUpdate.TargetVersion.Should().Be("6.0.8");
+        preview.Plan.UniFiOsUpdate.Url.Should().Be(pin.Url);
+        preview.Plan.UniFiOsUpdate.Pinned.Should().BeTrue();
+        preview.UniFiOs!.TargetVersion.Should().Be("6.0.8");
+    }
+
+    [Fact]
+    public async Task BuildPreviewAsync_APinnedUniFiOsBuildWithoutGatewaySshPlansNoUniFiOsUpdate()
+    {
+        // The console's own install command would take its newest build, so nothing can install the pin.
+        using var harness = CloudGatewayHarness();
+        harness.Commands.GatewaySshConfigured = false;
+        var pin = new RolloutBuildPin(FirmwareUrlKind.UniFiOs, Platform, "6.0.8", "https://example.test/unifi-dream/UCGF-6.0.8.bin");
+
+        var preview = await harness.Service.BuildPreviewAsync(EarlyAccessOs(), pin: pin);
+
+        preview.Plan.IncludesUniFiOsUpdate.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task BuildPreviewAsync_APinnedUniFiOsBuildOlderThanInstalledIsNeverADowngrade()
+    {
+        // Only device firmware downgrades by URL; the Console runs 6.0.7.
+        using var harness = CloudGatewayHarness();
+        await SeedSharedOsBuildAsync(harness);
+        var pin = new RolloutBuildPin(FirmwareUrlKind.UniFiOs, Platform, "6.0.6", "https://example.test/unifi-dream/UCGF-6.0.6.bin");
+
+        var preview = await harness.Service.BuildPreviewAsync(EarlyAccessOs(), pin: pin);
+
+        preview.Plan.IncludesUniFiOsUpdate.Should().BeFalse();
+    }
+
+    // --- Shared UniFi OS builds -----------------------------------------------------------------
+
+    private const string Platform = "UCGF";
+    private const string SharedUrl = "https://example.test/unifi-dream/UCGF-6.0.11.bin";
+
+    /// <summary>
+    /// A UCG-Fiber site on Early Access whose console offers 6.0.9 while running 6.0.7. Each
+    /// /api/system read is a fresh snapshot, so an adoption only lives on the plan's own object.
+    /// </summary>
+    private static RolloutHarness CloudGatewayHarness(string platform = Platform)
+    {
+        var harness = HarnessWithTwoAps();
+        harness.Planning.Devices.Add(new PlannerDevice
+        {
+            Mac = "aa:bb:cc:dd:ee:04",
+            Name = "Gateway",
+            Model = "UDMA6A8",
+            DisplayModel = "UDMA6A8",
+            Type = DeviceType.Gateway,
+            Upgradable = false,
+            FromVersion = "6.0.7",
+            IpAddress = "192.0.2.1",
+        });
+        harness.Commands.SnapshotConsoleInfoPerRead = true;
+        harness.Commands.ConsoleInfo = RolloutFixtures.Console(osChannel: "beta", installedOs: "6.0.7");
+        harness.Commands.ConsoleInfo.Hardware!.Shortname = platform;
+        harness.Commands.ConsoleInfo.Firmware!.LatestByChannel["beta"] = new NetworkOptimizer.UniFi.Models.UniFiConsoleFirmwareRelease
+        {
+            Channel = "beta",
+            Version = "v6.0.9+bbb2222",
+            Created = new DateTime(2026, 9, 1, 0, 0, 0, DateTimeKind.Utc),
+            Links = new NetworkOptimizer.UniFi.Models.UniFiConsoleFirmwareLinks
+            {
+                Data = new NetworkOptimizer.UniFi.Models.UniFiConsoleFirmwareLink { Href = "https://example.test/unifi-dream/UCGF-6.0.9.bin" },
+            },
+        };
+        return harness;
+    }
+
+    private static FirmwareRolloutSettings EarlyAccessOs() => Settings(s =>
+    {
+        s.GlobalChannel = FirmwareChannels.Beta;
+        s.IncludeUniFiOs = true;
+    });
+
+    private static Task SeedSharedOsBuildAsync(RolloutHarness harness, string platform = Platform, string channel = "beta") =>
+        harness.SharedCatalog.UpsertUniFiOsBuildsAsync(
+        [
+            new SharedUniFiOsBuild
+            {
+                Platform = platform,
+                Channel = channel,
+                Version = "v6.0.11+ccc3333",
+                Url = SharedUrl,
+                PublishedUtc = new DateTime(2026, 10, 2, 0, 0, 0, DateTimeKind.Utc),
+            },
+        ]);
+
+    [Fact]
+    public async Task BuildPreviewAsync_RecordsEveryChannelsUniFiOsBuildUnderThePlatform()
+    {
+        using var harness = CloudGatewayHarness();
+
+        await harness.Service.BuildPreviewAsync(EarlyAccessOs());
+
+        // Release may also be recorded: the public feed patches a stale GA entry before this runs.
+        using var db = harness.NewContext();
+        var row = db.SharedUniFiOsBuilds.Should().ContainSingle(b => b.Channel == "beta").Subject;
+        row.Platform.Should().Be(Platform);
+        row.Version.Should().Be("v6.0.9+bbb2222");
+        row.Url.Should().Be("https://example.test/unifi-dream/UCGF-6.0.9.bin");
+        row.PublishedUtc.Should().Be(new DateTime(2026, 9, 1, 0, 0, 0, DateTimeKind.Utc));
+    }
+
+    [Fact]
+    public async Task BuildPreviewAsync_AdoptsANewerUniFiOsBuildAnotherConsoleWasOffered()
+    {
+        using var harness = CloudGatewayHarness();
+        await SeedSharedOsBuildAsync(harness);
+
+        var preview = await harness.Service.BuildPreviewAsync(EarlyAccessOs());
+
+        preview.UniFiOs!.TargetVersion.Should().Be("v6.0.11+ccc3333");
+        preview.UniFiOs.UpdateAvailable.Should().BeTrue();
+        preview.Plan.IncludesUniFiOsUpdate.Should().BeTrue();
+        preview.Plan.UniFiOsUpdate.TargetVersion.Should().Be("v6.0.11+ccc3333");
+        preview.Plan.UniFiOsUpdate.Url.Should().Be(SharedUrl);
+        preview.Plan.UniFiOsUpdate.PublishedAt.Should().Be(new DateTime(2026, 10, 2, 0, 0, 0, DateTimeKind.Utc));
+    }
+
+    [Fact]
+    public async Task BuildPreviewAsync_AdoptsASharedBuildFromALessAggressiveChannel()
+    {
+        // Early Access sees every channel at or below it, so a newer RC from elsewhere qualifies.
+        using var harness = CloudGatewayHarness();
+        await SeedSharedOsBuildAsync(harness, channel: "release-candidate");
+
+        var preview = await harness.Service.BuildPreviewAsync(EarlyAccessOs());
+
+        preview.Plan.UniFiOsUpdate.TargetVersion.Should().Be("v6.0.11+ccc3333");
+        preview.UniFiOs!.TargetVersion.Should().Be("v6.0.11+ccc3333", "the preview names the build the plan installs");
+    }
+
+    [Fact]
+    public async Task BuildPreviewAsync_KeepsTheConsolesOwnBuildWithoutGatewaySsh()
+    {
+        // The console has not staged the shared build, so SSH by URL is the only way to install it.
+        using var harness = CloudGatewayHarness();
+        harness.Commands.GatewaySshConfigured = false;
+        await SeedSharedOsBuildAsync(harness);
+
+        var preview = await harness.Service.BuildPreviewAsync(EarlyAccessOs());
+
+        preview.Plan.UniFiOsUpdate.TargetVersion.Should().Be("v6.0.9+bbb2222");
+    }
+
+    [Fact]
+    public async Task BuildPreviewAsync_AdoptsABuildFiledUnderTheSameProductsOtherCode()
+    {
+        // A link names the UCG-Ultra by its model code; the console reports its shortname.
+        using var harness = CloudGatewayHarness(platform: "UCG-ULTRA");
+        await SeedSharedOsBuildAsync(harness, platform: "UDRULT");
+
+        var preview = await harness.Service.BuildPreviewAsync(EarlyAccessOs());
+
+        preview.Plan.UniFiOsUpdate.TargetVersion.Should().Be("v6.0.11+ccc3333");
+    }
+
+    [Theory]
+    [InlineData("UCGF", "UCGF", true)]
+    [InlineData("UDRULT", "UCG-ULTRA", true)]
+    [InlineData("UCGF", "UCGMAX", false)]
+    [InlineData("UNKNOWN1", "UNKNOWN2", false)]
+    public void SamePlatform_MatchesCodesForTheSameProduct(string a, string b, bool expected)
+    {
+        RolloutPlanComposer.SamePlatform(a, b).Should().Be(expected);
+    }
+
+    [Fact]
+    public async Task BuildPreviewAsync_IgnoresASharedBuildForAnotherPlatform()
+    {
+        using var harness = CloudGatewayHarness();
+        await SeedSharedOsBuildAsync(harness, platform: "UDMPRO");
+
+        var preview = await harness.Service.BuildPreviewAsync(EarlyAccessOs());
+
+        preview.Plan.UniFiOsUpdate.TargetVersion.Should().Be("v6.0.9+bbb2222");
+    }
+
+    [Fact]
+    public async Task BuildPreviewAsync_IgnoresASharedBuildFromAMoreAggressiveChannel()
+    {
+        // A site on Official never takes an Early Access build, wherever it was seen.
+        using var harness = CloudGatewayHarness();
+        await SeedSharedOsBuildAsync(harness);
+
+        var preview = await harness.Service.BuildPreviewAsync(Settings(s =>
+        {
+            s.GlobalChannel = FirmwareChannels.Release;
+            s.IncludeUniFiOs = true;
+        }));
+
+        preview.Plan.UniFiOsUpdate.TargetVersion.Should().NotBe("v6.0.11+ccc3333");
+    }
+
+    [Fact]
+    public async Task BuildPreviewAsync_ASelfHostedConsoleNeitherRecordsNorAdoptsUniFiOsBuilds()
+    {
+        using var harness = CloudGatewayHarness();
+        harness.Commands.ConsoleInfo!.Firmware!.Latest = new NetworkOptimizer.UniFi.Models.UniFiConsoleFirmwareRelease
+        {
+            Product = NetworkOptimizer.UniFi.Models.UniFiConsoleSystemInfo.StandaloneConsoleProduct,
+        };
+        await SeedSharedOsBuildAsync(harness, platform: "OTHER");
+
+        var preview = await harness.Service.BuildPreviewAsync(EarlyAccessOs());
+
+        using var db = harness.NewContext();
+        db.SharedUniFiOsBuilds.Should().ContainSingle(b => b.Platform == "OTHER", "only the seeded row exists");
+        preview.UniFiOs.Should().BeNull("a self-hosted console has no UniFi OS step");
     }
 
     [Fact]
@@ -193,15 +536,41 @@ public class FirmwareRolloutServiceTests
     }
 
     [Fact]
-    public async Task BuildPreviewAsync_WarnsWhenTheConsoleUpgradesDevicesItself()
+    public async Task BuildPreviewAsync_ReportsWhenTheConsoleUpgradesDevicesItself()
     {
         using var harness = HarnessWithTwoAps();
         harness.Commands.AutoUpgradeEnabled = true;
 
         var preview = await harness.Service.BuildPreviewAsync(Settings());
 
+        // The page words the warning from the current scope, so the preview only reports the flag.
         preview.ConsoleAutoUpgradeEnabled.Should().BeTrue();
-        preview.Warnings.Should().Contain(w => w.Contains("UniFi updates devices on its own schedule"));
+        preview.Warnings.Should().NotContain(w => w.Contains("own schedule"));
+    }
+
+    [Fact]
+    public async Task TurnOffUniFiAutoUpdateAsync_ReportsOnlyTheLayersThatTurnedOff()
+    {
+        using var harness = HarnessWithTwoAps();
+        harness.Commands.AutoUpdateDisableAccepted[UniFiConsoleAutoUpdateRequest.NetworkApplication] = false;
+
+        var off = await harness.Service.TurnOffUniFiAutoUpdateAsync(
+            UniFiAutoUpdateLayers.Devices | UniFiAutoUpdateLayers.NetworkApplication | UniFiAutoUpdateLayers.UniFiOs);
+
+        off.Should().Be(UniFiAutoUpdateLayers.Devices | UniFiAutoUpdateLayers.UniFiOs);
+        harness.Commands.AutoUpdateDisables.Should().Equal(
+            "devices", UniFiConsoleAutoUpdateRequest.NetworkApplication, UniFiConsoleAutoUpdateRequest.UniFiOs);
+    }
+
+    [Fact]
+    public async Task TurnOffUniFiAutoUpdateAsync_TouchesOnlyTheLayersAskedFor()
+    {
+        using var harness = HarnessWithTwoAps();
+
+        var off = await harness.Service.TurnOffUniFiAutoUpdateAsync(UniFiAutoUpdateLayers.Devices);
+
+        off.Should().Be(UniFiAutoUpdateLayers.Devices);
+        harness.Commands.AutoUpdateDisables.Should().Equal("devices");
     }
 
     [Fact]
@@ -210,11 +579,11 @@ public class FirmwareRolloutServiceTests
         using var harness = HarnessWithTwoAps();
 
         var withoutEa = await harness.Service.BuildPreviewAsync(Settings());
-        withoutEa.Channels.EarlyAccessAvailable.Should().BeFalse();
+        withoutEa.Channels.DeviceEarlyAccessAvailable.Should().BeFalse();
 
         harness.Commands.AvailableDeviceChannels = ["release", "release-candidate", "beta"];
         var withEa = await harness.Service.BuildPreviewAsync(Settings());
-        withEa.Channels.EarlyAccessAvailable.Should().BeTrue();
+        withEa.Channels.DeviceEarlyAccessAvailable.Should().BeTrue();
     }
 
     [Fact]
@@ -227,8 +596,42 @@ public class FirmwareRolloutServiceTests
 
         var preview = await harness.Service.BuildPreviewAsync(Settings(s => s.GlobalChannel = "beta"));
 
-        preview.Channels.EarlyAccessAvailable.Should().BeTrue();
+        preview.Channels.DeviceEarlyAccessAvailable.Should().BeTrue();
         preview.Warnings.Should().NotContain(w => w.Contains("does not offer early access"));
+    }
+
+    [Fact]
+    public void ChannelAvailability_EachSurfaceAnswersForItself()
+    {
+        // Devices offer only GA while the console itself is on Early Access.
+        var channels = new RolloutChannelAvailability
+        {
+            CurrentDeviceChannel = "release",
+            AvailableDeviceChannels = ["release"],
+            CurrentNetworkAppChannel = "beta",
+            AvailableNetworkAppChannels = ["release"],
+            CurrentUniFiOsChannel = "release",
+            AvailableUniFiOsChannels = ["release", "beta"],
+        };
+
+        channels.DeviceEarlyAccessAvailable.Should().BeFalse();
+        channels.NetworkAppEarlyAccessAvailable.Should().BeTrue();
+        channels.UniFiOsEarlyAccessAvailable.Should().BeTrue();
+    }
+
+    [Fact]
+    public void ChannelAvailability_ReadableSurfaceWithoutBeta_WithholdsEarlyAccess()
+    {
+        var channels = new RolloutChannelAvailability
+        {
+            CurrentNetworkAppChannel = "release",
+            AvailableNetworkAppChannels = ["release", "release-candidate"],
+            CurrentUniFiOsChannel = "release",
+            AvailableUniFiOsChannels = ["release"],
+        };
+
+        channels.NetworkAppEarlyAccessAvailable.Should().BeFalse();
+        channels.UniFiOsEarlyAccessAvailable.Should().BeFalse();
     }
 
     // --- Scheduling and starting ----------------------------------------------------------------
@@ -354,7 +757,8 @@ public class FirmwareRolloutServiceTests
 
         (await harness.Repository.GetPlanAsync(planId))!.Status.Should().Be(FirmwareRolloutStatus.Aborted);
         (await harness.Repository.GetStepsAsync(planId))
-            .Should().OnlyContain(s => s.State == FirmwareRolloutStepState.AbortedSku);
+            .Should().OnlyContain(s => s.State == FirmwareRolloutStepState.AbortedByAdmin
+                                       && RolloutSkipReasons.IsAdminStop(s.State, s.Error));
     }
 
     [Fact]
@@ -456,6 +860,28 @@ public class FirmwareRolloutServiceTests
         row.WaveCount.Should().BeGreaterThan(0);
         row.CreatedBy.Should().Be(RolloutHarness.Actor);
         row.HasReport.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task GetPlanHistoryPageAsync_MarksAnAdminStopAndPages()
+    {
+        using var harness = HarnessWithTwoAps();
+        var planId = await harness.Service.SchedulePlanAsync(Settings(), RolloutHarness.Start.AddHours(6));
+        var plan = (await harness.Repository.GetPlanAsync(planId))!;
+        plan.Status = FirmwareRolloutStatus.Aborted;
+        await harness.Repository.UpdatePlanAsync(plan);
+        foreach (var step in await harness.Repository.GetStepsAsync(planId))
+        {
+            step.State = FirmwareRolloutStepState.AbortedSku;
+            step.Error = RolloutSkipReasons.RolloutAbortedPrefix + "admin stopped it";
+            await harness.Repository.UpdateStepAsync(step);
+        }
+
+        var page = await harness.Service.GetPlanHistoryPageAsync(1, 20);
+
+        page.Total.Should().Be(1);
+        page.Rows.Should().ContainSingle().Which.StoppedByAdmin.Should().BeTrue();
+        (await harness.Service.GetPlanHistoryPageAsync(2, 20)).Rows.Should().BeEmpty();
     }
 
     [Fact]

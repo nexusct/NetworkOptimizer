@@ -53,6 +53,8 @@ public class MonitoringCollectionAgent : BackgroundService
     private readonly Monitoring.RebootReason.DeviceRebootTracker _rebootTracker;
     private readonly Monitoring.DeviceTransitionTracker _deviceTransitions;
     private readonly Monitoring.DeviceStateAlertEvaluator _deviceStateAlertEvaluator;
+    private readonly Monitoring.WanLinkSpeedAlertEvaluator _wanLinkSpeedAlertEvaluator;
+    private readonly Monitoring.GatewayLinkSpeedSnapshots _linkSpeedSnapshots = new();
     private readonly ICredentialProtectionService _credentialProtection;
     private readonly LocalProbeExecutor _localProbe;
     private readonly NetworkOptimizer.Web.Services.Monitoring.MonitoringAlertEvaluator _alertEvaluator;
@@ -64,15 +66,15 @@ public class MonitoringCollectionAgent : BackgroundService
     private readonly ApAgent.ApAgentTelemetryCollector _apAgentTelemetry;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<MonitoringCollectionAgent> _logger;
+    private readonly Auditing.IAuditLogger _audit;
     private readonly Licensing.LicenseStateService _licenseState;
+    private readonly Monitoring.PathLocalization.PathEpisodeWatcher _pathEpisodes;
     private readonly string _siteSlug;
     private readonly bool _isDefault;
 
-    // Throttles the agent-site console reconnect done inside ReconcileFabricTargetsAsync.
-    private DateTime _lastConsoleEnsureAt;
-
     // Counter delta cache for server-side rate computation. Key = "deviceMac/ifName".
     private readonly ConcurrentDictionary<string, InterfaceRateCalculator.State> _counterCache = new();
+    private readonly FanSpeedGuard _fanGuard = new();
     private bool _fabricSeeded;
     // Per-target last-probed time, for per-target poll intervals on a shared loop.
     private readonly ConcurrentDictionary<int, DateTime> _targetLastProbed = new();
@@ -134,9 +136,10 @@ public class MonitoringCollectionAgent : BackgroundService
     /// agent. False is a standing condition, not a transient one - the server never hands probing
     /// back for a non-default site - so latency and path measurement cannot run here at all until
     /// an agent is enrolled. SNMP is unaffected: it stands down only when an agent IS present.
+    /// An enrolled agent counts while disconnected, so a tunnel bounce never reads as "no agent".
     /// </summary>
     public bool SiteCanProbe =>
-        ServerProbesThisSite || _tunnelRegistry.GetForSite(_siteSlug).Count > 0 || _siteAgentEnrolled;
+        ServerProbesThisSite || _tunnelRegistry.GetForSite(_siteSlug).Count > 0 || _siteHasEnrolledAgent;
 
     /// <summary>
     /// Lets the Setup page's interactive re-check override the cached self-heal sighting
@@ -169,10 +172,13 @@ public class MonitoringCollectionAgent : BackgroundService
         IEnumerable<IOntProvider> ontProviders,
         SiteTunnelRouting tunnelRouting,
         ApAgent.ApAgentTelemetryRegistry apAgentTelemetryRegistry,
+        Monitoring.PathLocalization.PathEpisodeRegistry pathEpisodeRegistry,
+        Auditing.IAuditLogger audit,
         ILoggerFactory loggerFactory,
         ILogger<MonitoringCollectionAgent> logger,
         string siteSlug = SiteManagementService.DefaultSiteSlug)
     {
+        _audit = audit;
         _dbFactory = dbFactory;
         _siteDbFactory = siteDbFactory;
         _tunnelRegistry = tunnelRegistry;
@@ -192,12 +198,14 @@ public class MonitoringCollectionAgent : BackgroundService
         _sfpAlertEvaluator = evaluators.Sfp;
         _deviceHealthAlertEvaluator = evaluators.DeviceHealth;
         _deviceStateAlertEvaluator = evaluators.DeviceState;
+        _wanLinkSpeedAlertEvaluator = evaluators.WanLinkSpeed;
         _ontAlertEvaluator = evaluators.Ont;
         _supplementalOntProviders = ontProviders
             .OfType<ISfpSupplementalOntProvider>()
             .ToDictionary(p => p.ProviderKey, StringComparer.OrdinalIgnoreCase);
         _tunnelRouting = tunnelRouting;
         _apAgentTelemetry = apAgentTelemetryRegistry.GetFor(_siteSlug);
+        _pathEpisodes = pathEpisodeRegistry.GetFor(_siteSlug);
         _loggerFactory = loggerFactory;
         _logger = logger;
     }
@@ -242,21 +250,28 @@ public class MonitoringCollectionAgent : BackgroundService
     // targets from its own stack: false LAN packet-loss, and the server's own RTT on shared
     // (anycast) targets. Refreshed on a throttle from the tier loop.
     private volatile bool _siteAgentEnrolled;
+
+    // The same read on every site, for SiteCanProbe only. Kept apart from _siteAgentEnrolled because
+    // the default site's SNMP must still fall back to the server while its agent is disconnected.
+    private volatile bool _siteHasEnrolledAgent;
     private DateTime _agentCoverageCheckedAt = DateTime.MinValue;
     private static readonly TimeSpan AgentCoverageTtl = TimeSpan.FromSeconds(30);
 
     private async Task RefreshAgentCoverageAsync(CancellationToken ct)
     {
-        if (_isDefault) return;
         if (DateTime.UtcNow - _agentCoverageCheckedAt < AgentCoverageTtl) return;
         try
         {
             await using var db = await _dbFactory.CreateDbContextAsync(ct);
             var site = await db.Sites.AsNoTracking().FirstOrDefaultAsync(s => s.Slug == _siteSlug, ct);
-            var wasEnrolled = _siteAgentEnrolled;
-            _siteAgentEnrolled = site != null && await db.SiteAgents.AsNoTracking()
+            var enrolled = site != null && await db.SiteAgents.AsNoTracking()
                 .AnyAsync(a => a.SiteId == site.Id && a.Enabled && a.EnrolledAt != null, ct);
+            _siteHasEnrolledAgent = enrolled;
             _agentCoverageCheckedAt = DateTime.UtcNow;
+            if (_isDefault) return;
+
+            var wasEnrolled = _siteAgentEnrolled;
+            _siteAgentEnrolled = enrolled;
 
             // The moment an external site first gains an agent, activate the default internet
             // targets that were seeded disabled while it had none - the agent can now probe them
@@ -287,8 +302,7 @@ public class MonitoringCollectionAgent : BackgroundService
         // Resolve agent coverage before seeding so an external (non-default) site seeds its
         // default internet targets disabled until an agent is deployed - otherwise the central
         // server, which can't see the site's network, would probe anycast DNS from its own
-        // stack and log that as the site's ISP latency. No-op on the default site (always seeds
-        // enabled), where this returns immediately.
+        // stack and log that as the site's ISP latency. The default site always seeds enabled.
         await RefreshAgentCoverageAsync(stoppingToken);
 
         // Seed default targets on startup so the latency tier has something to probe even
@@ -522,7 +536,7 @@ public class MonitoringCollectionAgent : BackgroundService
                     return;
                 try
                 {
-                    var pollIp = ResolveSnmpAddress(device, gatewayLanIp);
+                    var pollIp = ResolveSnmpAddress(device, devices, gatewayLanIp);
                     if (!IPAddress.TryParse(pollIp, out var ip)) return;
                     var interfaces = await poller.GetInterfaceMetricsAsync(ip, device.Name);
                     var now = DateTime.UtcNow;
@@ -777,7 +791,7 @@ public class MonitoringCollectionAgent : BackgroundService
             var row = await db.MonitoringSettings.FirstOrDefaultAsync(ct);
             if (row == null) return;
             var before = row.SnmpDetectionState;
-            SnmpDetectionService.ApplyToSettings(row, detected, _credentialProtection);
+            SnmpDetectionService.ApplyToSettings(row, detected, _credentialProtection, _siteSlug);
             row.LastSnmpDetection = DateTime.UtcNow;
             row.UpdatedAt = DateTime.UtcNow;
             await db.SaveChangesAsync(ct);
@@ -897,7 +911,7 @@ public class MonitoringCollectionAgent : BackgroundService
                 if (!Monitoring.SnmpDeviceRules.HasSnmpEnabled(device))
                     return;
                 if (IsSnmpExcluded(NormalizeMac(device.Mac))) return;
-                var pollIp = ResolveSnmpAddress(device, gatewayLanIp);
+                var pollIp = ResolveSnmpAddress(device, devices, gatewayLanIp);
                 if (!IPAddress.TryParse(pollIp, out var ip)) return;
                 var metrics = await poller.GetDeviceMetricsAsync(ip, device.Name);
                 if (!metrics.IsReachable)
@@ -912,7 +926,7 @@ public class MonitoringCollectionAgent : BackgroundService
                 var memPct = metrics.MemoryUsage > 0 ? metrics.MemoryUsage : (double?)null;
                 var temp = metrics.Temperature > 0 ? metrics.Temperature : (double?)null;
                 var uptime = metrics.Uptime > 0 ? metrics.Uptime / 100 : (long?)null;
-                var fanRpm = metrics.FanSpeedRpm;
+                var fanRpm = _fanGuard.Accept(NormalizeMac(device.Mac), metrics.FanSpeedRpm);
 
                 if (cpu != null || memPct != null)
                     snmpHealthHits[NormalizeMac(device.Mac)] = true;
@@ -1087,9 +1101,10 @@ public class MonitoringCollectionAgent : BackgroundService
             s => (s.DeviceMac, s.PortName), s => s, ct);
 
         // Supplemental PON stats: poll ONT configs attached to a monitored SFP module
-        // (Network Optimizer Custom endpoints) so their PON-layer metrics can merge into
+        // (Network Optimizer Custom endpoints, Realtek sticks) so their PON-layer metrics can merge into
         // the sfp measurement alongside the DDM values below.
-        var ponSupplemental = await CollectPonSupplementalAsync(db, existingSfps, settings, ct);
+        var attachedPolls = new List<AttachedOntPoll>();
+        var ponSupplemental = await CollectPonSupplementalAsync(db, existingSfps, settings, attachedPolls, ct);
 
         // SFP collection (spec 5.9): write DDM values to the sfp measurement for every port
         // where UniFi reports sfp_found, and reconcile the MonitoredSfps relational row.
@@ -1115,15 +1130,36 @@ public class MonitoringCollectionAgent : BackgroundService
                 if (string.IsNullOrEmpty(sfpPortName)) continue;
                 var sfpCategory = existingSfps.TryGetValue((sfpMac, sfpPortName), out var sfpRow)
                     ? sfpRow.Category : SfpCategory.Standard;
+                // The module's chosen sensor; DDM whenever the attached ONT reported none this cycle.
+                var alertTempC = sfpRow?.UseOntTemperature == true
+                    && ponSupplemental.TryGetValue((sfpMac, sfpPortName), out var sfpPon)
+                    && sfpPon.TemperatureC.HasValue
+                        ? sfpPon.TemperatureC
+                        : port.SfpTemperature;
                 try
                 {
                     await _sfpAlertEvaluator.EvaluateAsync(
                         sfpMac, sfpPortName, device.Name, sfpCategory,
-                        port.SfpRxPower, port.SfpTxPower, port.SfpTemperature, sfpThresholds, ct);
+                        port.SfpRxPower, port.SfpTxPower, alertTempC, sfpThresholds, ct);
                 }
                 catch (Exception ex)
                 {
                     _logger.LogDebug(ex, "SFP alert evaluation failed for {Mac} port {Port}", sfpMac, sfpPortName);
+                }
+
+                // The module's own DDM RX, never the ONT's fallback: the question is whether the
+                // optics still read light while the ONT's page has stopped answering.
+                foreach (var poll in attachedPolls.Where(p => p.DeviceMac == sfpMac && p.PortName == sfpPortName))
+                {
+                    try
+                    {
+                        await _ontAlertEvaluator.EvaluateManagementAsync(poll.OntId, poll.Name, poll.Succeeded,
+                            port.SfpRxPower, sfpThresholds.PonRxPowerLowDbm, poll.SourceUrl, ct);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "ONT management alert evaluation failed for {Name}", poll.Name);
+                    }
                 }
             }
         }
@@ -1136,7 +1172,7 @@ public class MonitoringCollectionAgent : BackgroundService
             if (IsSnmpExcluded(NormalizeMac(device.Mac))) continue;
             try
             {
-                var pollIp = ResolveSnmpAddress(device, gatewayLanIp);
+                var pollIp = ResolveSnmpAddress(device, devices, gatewayLanIp);
                 if (!IPAddress.TryParse(pollIp, out var ip)) continue;
                 var interfaces = await poller!.GetInterfaceMetricsAsync(ip, device.Name);
                 if (interfaces.Count == 0)
@@ -1679,6 +1715,16 @@ public class MonitoringCollectionAgent : BackgroundService
 
             if (ct.IsCancellationRequested) return;
 
+            var (cleanMin, cleanAvg, cleanMax, cleanJitter) = Monitoring.LatencySanity.Clean(
+                ping.RttMinMs, ping.RttAvgMs, ping.RttMaxMs, ping.JitterMs);
+            if (cleanMax != ping.RttMaxMs || cleanAvg != ping.RttAvgMs)
+            {
+                _logger.LogWarning(
+                    "Dropped an impossible round trip for target {Target}: ping reported max {Max} ms",
+                    target.TargetId, ping.RttMaxMs);
+                ping = ping with { RttMinMs = cleanMin, RttAvgMs = cleanAvg, RttMaxMs = cleanMax, JitterMs = cleanJitter };
+            }
+
             await _influx.WriteLatencyAsync(
                 targetId: target.TargetId,
                 vantagePoint: vantage,
@@ -1694,6 +1740,10 @@ public class MonitoringCollectionAgent : BackgroundService
                 received: ping.Received,
                 timestamp: ping.Timestamp,
                 wanContext: wanContext?.InfluxWanTag);
+
+            // Path Localization watches the same result from the same vantage and bind it was taken with.
+            _pathEpisodes.Observe(target, wanContext, new Monitoring.PathLocalization.PathVantage(null, wanContext?.ProbeSourceIp),
+                ping.Timestamp, ping.RttAvgMs, ping.Sent, ping.Received, ping.JitterMs);
 
             // Surface fabric probe results on the dashboard's device cards (5.6). Other
             // target types (WAN, transit) feed cloud nodes on the 3D map; the per-device
@@ -1900,7 +1950,7 @@ public class MonitoringCollectionAgent : BackgroundService
         {
             if (string.IsNullOrEmpty(d.Ip) || string.IsNullOrEmpty(d.Mac)) continue;
             var mac = NormalizeMac(d.Mac);
-            var address = ResolveSnmpAddress(d, gatewayLanIp);
+            var address = ResolveSnmpAddress(d, devices, gatewayLanIp);
             var siblings = liveByMac.TryGetValue(mac, out var rows) ? rows : new List<MonitoringTarget>();
             var current = siblings.FirstOrDefault(
                 t => string.Equals(t.Address, address, StringComparison.OrdinalIgnoreCase));
@@ -1923,6 +1973,22 @@ public class MonitoringCollectionAgent : BackgroundService
                         "Disabled latency probing for Flex 2.5G target {Name} ({Mac})",
                         current.Name, current.DeviceMac);
                 }
+                var before = current.Name;
+                if (ApplyConsoleName(current, d.Name))
+                {
+                    changed = true;
+                    _logger.LogInformation(
+                        "Fabric target {Mac} renamed from '{From}' to '{To}' to match the UniFi Console",
+                        current.DeviceMac, before, current.Name);
+                    _audit.Log(Auditing.AuditEventBuilder.FromSystem(
+                        NetworkOptimizer.Storage.Models.Identity.AuditCategories.Settings,
+                        NetworkOptimizer.Storage.Models.Identity.AuditActions.MonitoringSetupChanged,
+                        targetType: "monitoring_target",
+                        targetId: current.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        targetName: current.Name,
+                        siteSlug: _siteSlug,
+                        details: new { field = "Name", from = before, to = current.Name, reason = "Renamed in the UniFi Console" }));
+                }
                 continue;
             }
 
@@ -1937,8 +2003,8 @@ public class MonitoringCollectionAgent : BackgroundService
                 // answered yet ResolveSnmpAddress hands back UniFi's WAN public IP instead.
                 // Acting on that would retire a working target in favour of an address nothing
                 // on the LAN answers, so a gateway waits for a resolved LAN IP.
-                if (d.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.Gateway
-                    && string.IsNullOrEmpty(gatewayLanIp))
+                if (string.IsNullOrEmpty(gatewayLanIp)
+                    && Monitoring.SnmpDeviceRules.IsSiteGateway(d, devices))
                     continue;
 
                 foreach (var stale in siblings.Where(t => t.AutoDiscovered))
@@ -2070,6 +2136,20 @@ public class MonitoringCollectionAgent : BackgroundService
     }
 
     /// <summary>
+    /// Keeps a device's target named as the UniFi Console names the device. These names are not
+    /// editable in Network Optimizer (<see cref="Monitoring.MonitoringTargetNaming.IsConsoleNamed"/>),
+    /// so the console is their only source. A console with no name for the device leaves the name as
+    /// is. True when the name changed.
+    /// </summary>
+    internal static bool ApplyConsoleName(MonitoringTarget target, string? consoleName)
+    {
+        if (!Monitoring.MonitoringTargetNaming.IsConsoleNamed(target) || string.IsNullOrWhiteSpace(consoleName)) return false;
+        if (target.Name == consoleName) return false;
+        target.Name = consoleName;
+        return true;
+    }
+
+    /// <summary>
     /// Put a retired target back into service, restoring the enabled state retirement took from it.
     /// </summary>
     /// <param name="target">The retired row.</param>
@@ -2162,6 +2242,11 @@ public class MonitoringCollectionAgent : BackgroundService
                     mac, ifName, calc.RejectedRateInBps ?? 0, calc.RejectedRateOutBps ?? 0, speedBps,
                     InterfaceRateCalculator.LinkSpeedToleranceFactor);
                 break;
+            case InterfaceRateCalculator.Outcome.CeilingHeld:
+                _logger.LogDebug(
+                    "Holding SNMP baseline for {Mac}/{IfName}: in={RateIn:F0} out={RateOut:F0} bps is marginally over link speed {LinkBps} bps; the next window absorbs it.",
+                    mac, ifName, calc.RejectedRateInBps ?? 0, calc.RejectedRateOutBps ?? 0, speedBps);
+                break;
         }
 
         if (rateInBps.HasValue && rateOutBps.HasValue)
@@ -2176,7 +2261,7 @@ public class MonitoringCollectionAgent : BackgroundService
 
         // A read the calculator does not trust is not stored either: one zero or corrupt sample in
         // the counter series reads as the whole counter's worth of traffic once differenced.
-        if (calc.Outcome is InterfaceRateCalculator.Outcome.ResetPending or InterfaceRateCalculator.Outcome.ImplausibleRate)
+        if (calc.IsUntrusted)
             return (rateInBps, rateOutBps);
 
         _ = _influx.WriteInterfaceCountersAsync(
@@ -2339,6 +2424,8 @@ public class MonitoringCollectionAgent : BackgroundService
                 cfg.AuthenticationPassword = string.IsNullOrEmpty(settings.SnmpV3AuthPassword)
                     ? string.Empty
                     : _credentialProtection.Decrypt(settings.SnmpV3AuthPassword);
+                // UniFi's v3 user is authPriv, SHA and AES, both keyed by the one password it shows.
+                cfg.PrivacyPassword = cfg.AuthenticationPassword;
                 if (string.IsNullOrEmpty(cfg.Username))
                 {
                     _logger.LogDebug("SNMP v3 selected but no username available");
@@ -2417,8 +2504,9 @@ public class MonitoringCollectionAgent : BackgroundService
     /// Poll address for a device (SNMP and fabric latency targets). Rule shared
     /// with the agent-tunnel SNMP config push via SnmpDeviceRules.
     /// </summary>
-    private static string ResolveSnmpAddress(UniFiDeviceResponse device, string? gatewayLanIp) =>
-        Monitoring.SnmpDeviceRules.ResolvePollAddress(device, gatewayLanIp);
+    private static string ResolveSnmpAddress(
+        UniFiDeviceResponse device, IEnumerable<UniFiDeviceResponse> devices, string? gatewayLanIp) =>
+        Monitoring.SnmpDeviceRules.ResolvePollAddress(device, devices, gatewayLanIp);
 
     /// <summary>
     /// Feeds upgrade/provisioning state and offline/recovered alerting for every adopted device.
@@ -2460,30 +2548,113 @@ public class MonitoringCollectionAgent : BackgroundService
                 _logger.LogDebug(ex, "Device state alert evaluation failed for {Device}", device.Mac);
             }
         }
+
+        try
+        {
+            await _deviceStateAlertEvaluator.CompletePassAsync(now, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "Device state alert pass completion failed for site {Slug}", _siteSlug);
+        }
+
+        try
+        {
+            await RecordGatewayLinkSpeedsAsync(all, now, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "Gateway link speed pass failed for site {Slug}", _siteSlug);
+        }
+    }
+
+    // WAN profiles for the link speed pass, re-read on a throttle: they change only when the
+    // console's WAN config does.
+    private IReadOnlyList<WanProfile> _wanProfiles = Array.Empty<WanProfile>();
+    private DateTime _wanProfilesLoadedAt = DateTime.MinValue;
+    private static readonly TimeSpan WanProfilesTtl = TimeSpan.FromMinutes(5);
+
+    // Per WAN port: the fastest speed recorded over the baseline window, re-queried on a throttle,
+    // and the fastest seen since that query (already in InfluxDB, so a refresh folds it in).
+    private readonly Dictionary<string, (int? Max, DateTime ComputedAt)> _linkSpeedBaselines = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _linkSpeedMaxSinceBaseline = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly TimeSpan LinkSpeedBaselineRefresh = TimeSpan.FromHours(6);
+
+    /// <summary>
+    /// Records each gateway port's console-reported link speed and feeds the WAN ports to the link
+    /// speed alert. Gateways only: their built-in switch ports read the 10G switch conduit over
+    /// SNMP, while every other device's SNMP speed is already correct in <c>speed_bps</c>.
+    /// </summary>
+    private async Task RecordGatewayLinkSpeedsAsync(IReadOnlyList<UniFiDeviceResponse> devices, DateTime now, CancellationToken ct)
+    {
+        var readings = _linkSpeedSnapshots.Take(devices);
+        if (readings.Count == 0) return;
+
+        foreach (var r in readings)
+        {
+            if (r.SpeedMbps is int speed)
+                _ = _influx.WriteLinkSpeedAsync(r.DeviceMac, r.IfName, speed, r.FullDuplex, now);
+        }
+
+        if (DateTime.UtcNow - _wanProfilesLoadedAt > WanProfilesTtl)
+        {
+            await using var db = await CreateSiteDbAsync(ct);
+            _wanProfiles = await db.WanProfiles.AsNoTracking().ToListAsync(ct);
+            _wanProfilesLoadedAt = DateTime.UtcNow;
+        }
+
+        foreach (var r in readings)
+        {
+            var wan = Monitoring.WanLinkSpeedExpectations.MatchWan(r.DeviceMac, r.IfName, r.NetworkName, _wanProfiles);
+            if (!Monitoring.WanLinkSpeedExpectations.IsWanPort(r.NetworkName, wan)) continue;
+
+            var key = Monitoring.WanLinkSpeedAlertEvaluator.PortKey(r.DeviceMac, r.IfName);
+            var baseline = await GetLinkSpeedBaselineAsync(key, r.DeviceMac, r.IfName, now, ct);
+            if (r.SpeedMbps is int speed && speed > _linkSpeedMaxSinceBaseline.GetValueOrDefault(key))
+                _linkSpeedMaxSinceBaseline[key] = speed;
+
+            var seenExpected = Monitoring.WanLinkSpeedExpectations.Expected(
+                baseline, _linkSpeedMaxSinceBaseline.TryGetValue(key, out var seen) ? seen : null);
+            var planFloor = Monitoring.WanLinkSpeedExpectations.PlanFloorMbps(wan, r.Media);
+
+            await _wanLinkSpeedAlertEvaluator.EvaluateAsync(new Monitoring.WanLinkSpeedObservation(
+                r.DeviceMac, r.DeviceName, r.IfName, r.PortName, wan?.Name,
+                r.SpeedMbps, r.FullDuplex, r.Autoneg,
+                Monitoring.WanLinkSpeedExpectations.Expected(seenExpected, planFloor),
+                ExpectedFromPlan: planFloor > (seenExpected ?? 0)), now, ct);
+        }
+    }
+
+    private async Task<int?> GetLinkSpeedBaselineAsync(string key, string mac, string ifName, DateTime now, CancellationToken ct)
+    {
+        if (_linkSpeedBaselines.TryGetValue(key, out var cached) && now - cached.ComputedAt < LinkSpeedBaselineRefresh)
+            return cached.Max;
+        if (!_influx.IsConfigured) return cached.Max;
+
+        try
+        {
+            using var queryCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            queryCts.CancelAfter(TimeSpan.FromSeconds(10));
+            var max = await _influx.QueryMaxLinkSpeedAsync(
+                mac, ifName, now - Monitoring.WanLinkSpeedExpectations.BaselineWindow, now, queryCts.Token);
+            _linkSpeedBaselines[key] = (max, now);
+            // Everything seen so far is in the window just queried.
+            _linkSpeedMaxSinceBaseline.Remove(key);
+            return max;
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            // Keep the last baseline and try again next refresh rather than every pass.
+            _linkSpeedBaselines[key] = (cached.Max, now);
+            _logger.LogDebug(ex, "Link speed baseline query failed for {Mac} {IfName}", mac, ifName);
+            return cached.Max;
+        }
     }
 
     private async Task<List<UniFiDeviceResponse>> GetMonitorableDevicesAsync(CancellationToken ct)
     {
-        // The console can read disconnected between operations: an agent site's tunnel drops,
-        // and a directly-connected self-hosted console returns 502/503 while its backend restarts,
-        // upgrades, or reprovisions - including right when the optimizer starts up, which fails the
-        // one-shot startup connect and, for the default site, previously left it dark until a
-        // schedule ran or the process restarted. Reconnect it (throttled) so every tier that
-        // enumerates devices - fabric targets, interface name map, device stats - recovers on its
-        // own. Skipped while an agent tunnel is still coming up; OnAgentConnectedAsync reconnects
-        // that case when the tunnel opens.
-        if (!_connectionService.IsConnected
-            && !_connectionService.IsAwaitingAgent
-            && DateTime.UtcNow - _lastConsoleEnsureAt > TimeSpan.FromSeconds(30))
-        {
-            _lastConsoleEnsureAt = DateTime.UtcNow;
-            try { await _connectionService.ReconnectAsync(); }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Console reconnect for device fetch failed for site {Slug}", _siteSlug);
-            }
-        }
-
+        // A lost console comes back through UniFiConnectionService's own background reconnect. Never
+        // add one here: it runs only while Monitoring is on, which is how a site sat down for hours.
         if (!_connectionService.IsConnected || _connectionService.Client == null)
             return new List<UniFiDeviceResponse>();
 
@@ -2580,7 +2751,10 @@ public class MonitoringCollectionAgent : BackgroundService
         NetworkOptimizerDbContext db,
         Dictionary<(string DeviceMac, string PortName), MonitoredSfp> sfps,
         MonitoringSettings settings,
-        CancellationToken ct)
+        List<AttachedOntPoll> outcomes,
+        CancellationToken ct,
+        (string DeviceMac, string PortName)? onlyModule = null,
+        bool evaluateAlerts = true)
     {
         var result = new Dictionary<(string, string), PonSupplementalStats>();
         List<OntConfiguration> attached;
@@ -2604,10 +2778,15 @@ public class MonitoringCollectionAgent : BackgroundService
         {
             if (!sfpById.TryGetValue(config.AttachedSfpId!.Value, out var sfp))
             {
-                config.LastError = "Attached SFP module no longer exists";
-                config.UpdatedAt = DateTime.UtcNow;
+                if (onlyModule == null)
+                {
+                    config.LastError = "Attached SFP module no longer exists";
+                    config.UpdatedAt = DateTime.UtcNow;
+                }
                 continue;
             }
+            if (onlyModule is { } only && (sfp.DeviceMac != only.DeviceMac || sfp.PortName != only.PortName))
+                continue;
             if (!_supplementalOntProviders.TryGetValue(config.Provider, out var provider))
             {
                 config.LastError = $"Provider '{config.Provider}' does not support SFP module attachment";
@@ -2615,24 +2794,37 @@ public class MonitoringCollectionAgent : BackgroundService
                 continue;
             }
 
+            // Attached ONTs surface on SFP Stats, so their alerts link to that module.
+            var sfpUrl = Monitoring.MonitoringLinks.HardwareStats("sfp", DateTime.UtcNow,
+                $"&sfp={sfp.DeviceMac.Replace("-", ":").ToLowerInvariant()}:{sfp.PortName}");
+            var succeeded = false;
             try
             {
-                // Same tunnel-proxy routing the standalone ONT poll path uses, so
-                // attached endpoints on agent sites are reached through the relay.
-                var (host, port) = await _tunnelRouting.RouteAsync(_siteSlug, config.Host, config.Port);
+                // Same dialer the standalone ONT poll path uses, so attached endpoints on
+                // agent sites are reached through the site's agent.
+                string? password = null;
+                if (!string.IsNullOrEmpty(config.Password))
+                {
+                    try { password = _credentialProtection.Decrypt(config.Password); }
+                    catch { password = config.Password; }
+                }
                 var context = new OntPollContext
                 {
                     Id = config.Id,
                     SiteSlug = _siteSlug,
                     Name = config.Name,
-                    Host = host,
-                    ConfiguredHost = config.Host,
-                    Port = port,
+                    Host = config.Host,
+                    Port = config.Port,
+                    Dialer = _tunnelRouting.DialerFor(_siteSlug),
+                    // Web-UI sticks (Realtek) log in; the JSON contract ignores these.
+                    Username = string.IsNullOrEmpty(config.Username) ? null : config.Username,
+                    Password = password,
                 };
 
                 var stats = await provider.PollSupplementalAsync(context, ct);
                 if (stats != null)
                 {
+                    succeeded = true;
                     result[(sfp.DeviceMac, sfp.PortName)] = stats;
                     config.LastPolled = DateTime.UtcNow;
                     config.LastError = null;
@@ -2645,27 +2837,40 @@ public class MonitoringCollectionAgent : BackgroundService
                     bool? fecEnabled = stats.DsFecEnabled.HasValue || stats.UsFecEnabled.HasValue
                         ? stats.DsFecEnabled == 1 || stats.UsFecEnabled == 1
                         : null;
-                    // Attached ONTs surface on SFP Stats, so link the alert to that module.
-                    var sfpUrl = Monitoring.MonitoringLinks.HardwareStats("sfp", DateTime.UtcNow,
-                        $"&sfp={sfp.DeviceMac.Replace("-", ":").ToLowerInvariant()}:{sfp.PortName}");
-                    try
+                    // A manual refresh skips alerts: an extra poll mid-cycle would shrink the
+                    // per-poll error deltas the spike thresholds are sized for.
+                    if (evaluateAlerts)
                     {
-                        await _ontAlertEvaluator.EvaluateAsync(
-                            config.Id, config.Name,
-                            rxPowerDbm: null,
-                            NetOptCustomPonOntProvider.ToPonLinkState(stats.PloamStateRaw),
-                            stats.FecErrors,
-                            temperatureC: null,
-                            thresholds.PonRxPowerLowDbm, thresholds.PonTempHighC,
-                            bipErrors: stats.BipErrors,
-                            hecErrors: stats.HecUncorrected,
-                            fecEnabled: fecEnabled,
-                            sourceUrl: sfpUrl,
-                            ct: ct);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogDebug(ex, "PON alert evaluation failed for {Name}", config.Name);
+                        try
+                        {
+                            await _ontAlertEvaluator.EvaluateAsync(
+                                config.Id, config.Name,
+                                rxPowerDbm: null,
+                                NetOptCustomPonOntProvider.ToPonLinkState(stats.PloamStateRaw),
+                                stats.FecErrors,
+                                temperatureC: null,
+                                thresholds.PonRxPowerLowDbm, thresholds.PonTempHighC,
+                                bipErrors: stats.BipErrors,
+                                hecErrors: stats.HecUncorrected,
+                                fecEnabled: fecEnabled,
+                                sourceUrl: sfpUrl,
+                                uptimeSeconds: stats.SfpUptimeS,
+                                aesActive: stats.AesActive,
+                                gemPorts: stats.GemPorts,
+                                gemPortsEncrypted: stats.GemPortsEncrypted,
+                                ct: ct);
+                            await _ontAlertEvaluator.EvaluatePathLossAsync(
+                                config.Id, config.Name,
+                                PonSupplementalStats.PathLossDb(stats.OltLaunchPowerDbm, stats.RxPowerDbm), stats.OdnClass,
+                                sourceUrl: sfpUrl, ct: ct,
+                                priorLevel: OntAlertEvaluator.PriorPathLossFrom(
+                                    _influx, "sfp", ("device_mac", sfp.DeviceMac), ("port_name", sfp.PortName)),
+                                launchDbm: stats.OltLaunchPowerDbm);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogDebug(ex, "PON alert evaluation failed for {Name}", config.Name);
+                        }
                     }
                 }
                 else
@@ -2680,9 +2885,49 @@ public class MonitoringCollectionAgent : BackgroundService
                 config.LastError = ex.Message;
                 config.UpdatedAt = DateTime.UtcNow;
             }
+            outcomes.Add(new AttachedOntPoll(config.Id, config.Name, sfp.DeviceMac, sfp.PortName, succeeded, sfpUrl));
         }
         return result;
     }
+
+    /// <summary>
+    /// Reads one module's DDM from the UniFi Console now and polls the ONT attached to it, if any,
+    /// through the same write path as the slow tier. Alerts are left to the tier. Callers go through
+    /// the gated <see cref="ISfpModulePollService"/>. Returns why the read fell short, or null.
+    /// </summary>
+    public async Task<string?> PollModuleAsync(string deviceMac, string portName, CancellationToken ct = default)
+    {
+        if (!_connectionService.IsConnected || _connectionService.Client == null)
+            return "The UniFi Console is not connected.";
+
+        var mac = NormalizeMac(deviceMac);
+        // Straight from the console, not the device cache: the point of a refresh is a fresh DDM read.
+        var devices = await _connectionService.Client.GetDevicesAsync(ct);
+        var device = devices?.FirstOrDefault(d => NormalizeMac(d.Mac) == mac);
+        if (device == null)
+            return "The device this module sits in was not found on the UniFi Console.";
+
+        await using var db = await CreateSiteDbAsync(ct);
+        var existingSfps = await db.MonitoredSfps.ToDictionaryAsync(s => (s.DeviceMac, s.PortName), s => s, ct);
+        var settings = await db.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync(ct) ?? new MonitoringSettings();
+
+        var polls = new List<AttachedOntPoll>();
+        var supplemental = await CollectPonSupplementalAsync(db, existingSfps, settings, polls, ct,
+            onlyModule: (mac, portName), evaluateAlerts: false);
+        CollectSfpForDevice(device, db, existingSfps, supplemental, DateTime.UtcNow);
+        await db.SaveChangesAsync(ct);
+
+        var failed = polls.FirstOrDefault(p => !p.Succeeded);
+        if (failed != null)
+        {
+            var error = db.OntConfigurations.Local.FirstOrDefault(o => o.Id == failed.OntId)?.LastError;
+            return $"DDM refreshed, but the attached ONT did not answer{(string.IsNullOrEmpty(error) ? "." : $": {error}")}";
+        }
+        return null;
+    }
+
+    /// <summary>One attached ONT's poll this cycle, judged against its module's DDM once that is read.</summary>
+    private sealed record AttachedOntPoll(int OntId, string Name, string DeviceMac, string PortName, bool Succeeded, string SourceUrl);
 
     private void CollectSfpForDevice(
         UniFiDeviceResponse device,
@@ -2741,7 +2986,10 @@ public class MonitoringCollectionAgent : BackgroundService
                     : null;
                 _liveStats.RecordSfpPon(mac, portName, ponStats.PonLinkStatus,
                     ponStats.BipErrors, ponStats.FecErrors, ponStats.HecUncorrected, fecEnabled,
-                    ponStats.GemRxDropped, timestamp);
+                    ponStats.GemRxDropped, timestamp,
+                    ponStats.RegistrationStatus, ponStats.KeyExchangeStatus,
+                    ontTemperatureC: port.SfpTemperature.HasValue ? ponStats.TemperatureC : null,
+                    oltVendorId: ponStats.OltVendorId, oltModel: ponStats.OltModel);
             }
 
             // Mirror the values into the live-stats cache so the dashboard SFP card can

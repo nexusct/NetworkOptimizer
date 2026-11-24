@@ -227,6 +227,16 @@ public sealed class ApAgentTelemetryCollector
         return known != null && _coverage.Covers(known.ApMac, DateTime.UtcNow) ? known : null;
     }
 
+    /// <summary>
+    /// The covered client with this MAC right now, or null. For an IPv6 source, whose MAC comes
+    /// from the gateway's neighbor table, where <see cref="FindClientByIp"/> (IPv4) cannot match.
+    /// </summary>
+    public ApAgentKnownClient? FindClientByMac(string mac)
+    {
+        var known = _membership.FindByMac(mac, DateTime.UtcNow);
+        return known != null && _coverage.Covers(known.ApMac, DateTime.UtcNow) ? known : null;
+    }
+
     /// <summary>Roster-refresh hints for consumers caching the Console's client list.</summary>
     public ConsoleRosterNudge RosterNudge { get; } = new();
 
@@ -465,6 +475,9 @@ public sealed class ApAgentTelemetryCollector
             // would drop the whole site. Only trust it where something in this payload is true.
             var authorizedIsReported = payload.Clients.Any(c => c.Authorized);
 
+            // One read stamps every station alike, and a radio's clients share a series, so each
+            // throughput point needs its own tick or InfluxDB keeps only the last one written.
+            long tickOffset = 0;
             lock (accumulator)
             {
                 foreach (var client in payload.Clients)
@@ -513,7 +526,7 @@ public sealed class ApAgentTelemetryCollector
                             txThroughputBps: pass.Tx ?? 0,
                             rxThroughputBps: pass.Rx ?? 0,
                             signalDbm: sample.SignalDbm,
-                            timestamp: StampFor(sample.BytesAt ?? sample.CollectedAt, now),
+                            timestamp: StampFor(sample.BytesAt ?? sample.CollectedAt, now).AddTicks(tickOffset++),
                             txRateKbps: sample.TxRateKbps,
                             rxRateKbps: sample.RxRateKbps);
                     }

@@ -14,12 +14,14 @@
 @inject MfaEnrollmentCodes EnrollmentCodes
 @inject Microsoft.Extensions.Options.IOptions<Microsoft.AspNetCore.Identity.IdentityOptions> IdentityOptions
 @inject ILogger<AccountSecurity> Logger
+@inject IDisplayTimeZone DisplayTime
 
 <PageTitle>Security - Network Optimizer</PageTitle>
 
 <div class="page-header">
+    <PageBackButton />
     <h1>Security</h1>
-    <p class="page-description">Password, two-factor authentication, and passkeys for your account.</p>
+    <p class="page-description">Date and time, password, two-factor authentication, and passkeys for your account.</p>
 </div>
 
 @* Only when the passkey really is the sole way in: the role demands a second factor, a passkey
@@ -35,41 +37,54 @@
     </div>
 }
 
+@* Hidden while the session is confined to replacing an administrator-set password. *@
+@if (!_passwordChangeRequired)
+{
+    <div class="card" id="time-zone" data-tour="date-time">
+        <div class="card-header"><span class="card-title">Date &amp; Time</span></div>
+        <div class="card-body">
+            <PersonalTimeZoneField />
+        </div>
+    </div>
+}
+
 @* Only for an account that actually signs in with one. A passkey-only or federated account has
    nothing to prove and nothing to replace, so offering the form would be a dead end. *@
 @if (_hasPassword)
 {
-    <div class="card">
+    @if (_passwordChangeRequired)
+    {
+        <div class="alert alert-warning">
+            Your password was set by an administrator. Choose your own password to continue.
+        </div>
+    }
+    <div class="card @(_passwordChangeRequired ? "card-highlight" : null)">
         <div class="card-header"><span class="card-title">Password</span></div>
         <div class="card-body">
-            @if (_passwordChanged)
+            @* With a factor still owed, the MFA notice carries this instead: it is where the next step is. *@
+            @if (_passwordChanged && !_setupRequired)
             {
-                <div class="alert alert-success">Your password has been changed.</div>
+                <div class="alert alert-success">Your password has been changed. Your other sessions have been signed out.</div>
             }
-            @if (_passwordUnchanged)
+            @if (PasswordMessage is { } message)
             {
-                <div class="alert alert-danger">Your new password has to be different from your current one.</div>
-            }
-            @if (_passwordFailed)
-            {
-                <div class="alert alert-danger">
-                    That did not work. Check your current password and that the new one meets the
-                    requirements.
-                </div>
+                <div class="alert alert-danger">@message</div>
             }
             @* Posted, not handled in the circuit: a password change rotates the security stamp, and
                only an HTTP response can re-issue the cookie that carries it. *@
             <form method="post" action="/api/account/password">
                 <AntiforgeryToken />
                 <div class="form-group">
-                    <label class="form-label" for="current-password">Current password</label>
-                    <input id="current-password" name="currentPassword" type="password"
-                           class="form-control" autocomplete="current-password" />
+                    <label class="form-label" for="current-password">@(_passwordChangeRequired ? "Temporary password" : "Current password")</label>
+                    <PasswordInput Id="current-password" Name="currentPassword" AutoComplete="current-password" />
+                    @if (_passwordChangeRequired)
+                    {
+                        <p class="form-help">The one you just signed in with.</p>
+                    }
                 </div>
                 <div class="form-group">
                     <label class="form-label" for="new-password">New password <span class="tooltip-icon tooltip-icon-sm" data-tooltip="@_passwordPolicy">?</span></label>
-                    <input id="new-password" name="newPassword" type="password"
-                           class="form-control" autocomplete="new-password" />
+                    <PasswordInput Id="new-password" Name="newPassword" AutoComplete="new-password" />
                 </div>
                 <button type="submit" class="btn btn-primary btn-sm">Change password</button>
             </form>
@@ -79,8 +94,15 @@
 
 @if (_setupRequired)
 {
-    <div class="alert alert-warning">
-        Multi-factor authentication is required for your role. Set up either option below.
+    <div class="alert alert-warning" id="@MfaSetupId">
+        @if (_passwordChanged)
+        {
+            @:Your password has been changed. Your role also requires multi-factor authentication: set up either option below.
+        }
+        else
+        {
+            @:Multi-factor authentication is required for your role. Set up either option below.
+        }
     </div>
 }
 
@@ -101,7 +123,11 @@
         {
             <p class="account-note">Two-factor authentication is <strong>enabled</strong>.</p>
             <button class="btn btn-secondary btn-sm" @onclick="RegenerateCodesAsync">Regenerate recovery codes</button>
-            <button class="btn btn-danger btn-sm" @onclick="DisableMfaAsync">Disable</button>
+            @* Posted, like enabling: turning it off rotates the security stamp. *@
+            <form method="post" action="/api/auth/mfa/disable" class="account-inline-form">
+                <AntiforgeryToken />
+                <button type="submit" class="btn btn-danger btn-sm">Disable</button>
+            </form>
             @if (!string.IsNullOrEmpty(_mfaMessage)) { <div class="alert alert-warning">@_mfaMessage</div> }
         }
         else if (_setup is not null)
@@ -198,7 +224,7 @@
                         <li class="account-credential-item">
                             <div class="account-credential-info">
                                 <span class="account-credential-name">@(string.IsNullOrEmpty(pk.Name) ? "Passkey" : pk.Name)</span>
-                                <span class="account-credential-meta">Added @pk.CreatedAt.ToLocalTime().ToString("d MMM yyyy")</span>
+                                <span class="account-credential-meta">Added @pk.CreatedAt.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.Date, DisplayFormat.Culture)</span>
                             </div>
                             <button class="btn btn-tertiary btn-sm" @onclick="() => RemovePasskeyAsync(pk.CredentialId)">Remove</button>
                         </li>
@@ -255,6 +281,7 @@
 @code {
     [SupplyParameterFromQuery(Name = "setup")] private string? Setup { get; set; }
     [SupplyParameterFromQuery(Name = "enroll")] private string? Enroll { get; set; }
+    [SupplyParameterFromQuery(Name = "mfa")] private string? MfaResult { get; set; }
 
     private ApplicationUser? _user;
     private bool _mfaEnabled;
@@ -272,6 +299,12 @@
     private bool _passkeyIsOnlyWayIn;
     private bool _hasPassword;
 
+    /// <summary>
+    /// Read from the cookie rather than the account: the claim is what confines the session, and the
+    /// password change re-issues the cookie, so the notice clears exactly when the confinement does.
+    /// </summary>
+    private bool _passwordChangeRequired;
+
     /// <summary>The configured policy, so the hint cannot drift from what the validator enforces.</summary>
     private string _passwordPolicy => PasswordPolicyText.Describe(IdentityOptions.Value.Password);
 
@@ -281,9 +314,25 @@
     private bool _sessionsRevoked => SessionsResult == "done";
     private bool _sessionsFailed => SessionsResult == "failed";
 
-    private bool _passwordChanged => PasswordResult == "done";
-    private bool _passwordFailed => PasswordResult == "failed";
-    private bool _passwordUnchanged => PasswordResult == "same";
+    /// <summary>
+    /// The pw= result, captured once: the parameter is stripped from the address so a reload does
+    /// not repeat a stale outcome.
+    /// </summary>
+    private string? _passwordResult;
+    private bool _passwordChanged => _passwordResult == "done";
+
+    /// <summary>One message per refusal, naming the field that is wrong.</summary>
+    private string? PasswordMessage => _passwordResult switch
+    {
+        "missing" => "Fill in both fields.",
+        "wrong" => _passwordChangeRequired
+            ? "The temporary password is not correct."
+            : "Your current password is not correct.",
+        "same" => "Your new password has to be different from your current one.",
+        "policy" => $"Your new password does not meet the requirements: {_passwordPolicy}",
+        "failed" => "That did not work. Reload the page and try again.",
+        _ => null,
+    };
     private AuthenticatorSetup? _setup;
     private bool _enrollError;
     private IReadOnlyList<string>? _recoveryCodes;
@@ -302,6 +351,7 @@
         {
             _mfaEnabled = await Mfa.IsEnabledAsync(_user);
             _hasPassword = await Mfa.HasPasswordAsync(_user);
+            _passwordChangeRequired = principal.HasClaim(c => c.Type == NetOptClaims.PasswordChangePending);
             _passkeys = await Passkeys.ListAsync(principal);
 
             // The requirement, not how they arrived. Asked of the role every time, so the guidance
@@ -333,6 +383,25 @@
             // Codes minted by the enrollment endpoint, handed over once and only once.
             if (Enroll == "done")
                 _recoveryCodes = EnrollmentCodes.Take(_user.Id);
+
+            // A wrong code comes back as a fresh page load. Reopen the setup with the same key, or the
+            // QR, the key and the error all vanish behind the "Set up authenticator" button.
+            if (_enrollError && !_mfaEnabled)
+                _setup = await Mfa.BeginEnrollmentAsync(_user);
+
+            if (MfaResult == "failed")
+                _mfaMessage = "That could not be saved - reload the page and try again.";
+
+            _passwordResult = PasswordResult;
+
+            // An administrator-set password comes first, and its card is already at the top. A
+            // password error stays in view: it is what the user came back to read.
+            _scrollToSetup = _setupRequired && !_passwordChangeRequired && PasswordMessage is null;
+
+            // One-shot results: drop them so a reload does not repeat a stale message.
+            if (Enroll == "failed" || MfaResult is not null || PasswordResult is not null)
+                Navigation.NavigateTo(Navigation.GetUriWithQueryParameters(
+                    new Dictionary<string, object?> { ["enroll"] = null, ["mfa"] = null, ["pw"] = null }), replace: true);
         }
     }
 
@@ -353,6 +422,38 @@
             }
 
             StateHasChanged();
+        }
+
+        // On whichever render follows the load, not the first one: the first render runs before
+        // OnInitializedAsync has read the account, when every flag still holds its default.
+        if (_scrollToSetup)
+        {
+            _scrollToSetup = false;
+            await ScrollToMfaSetupAsync();
+        }
+    }
+
+    private const string MfaSetupId = "mfa-setup";
+
+    /// <summary>Set once the load has decided the MFA step should be brought into view.</summary>
+    private bool _scrollToSetup;
+
+    /// <summary>
+    /// Brings the owed MFA step into view on arrival: sign-in, a finished password change and every
+    /// refused page all land here, and the step sits below Date &amp; Time and Password.
+    /// </summary>
+    private async Task ScrollToMfaSetupAsync()
+    {
+        // After ScrollRestoration's own scroll-to-top, which runs 50 ms after a redirect from another
+        // page; scrolling first would be undone.
+        await Task.Delay(150);
+        try
+        {
+            // The notice is an alert, not a card: the ring takes the alert's corners.
+            await JS.InvokeVoidAsync("noHighlightTarget", MfaSetupId, null, "var(--border-radius)");
+        }
+        catch (JSDisconnectedException)
+        {
         }
     }
 
@@ -379,19 +480,6 @@
         _recoveryCodes = await Mfa.GenerateRecoveryCodesAsync(_user);
     }
 
-    private async Task DisableMfaAsync()
-    {
-        if (_user is null) return;
-        _mfaMessage = null;
-        if (!await Mfa.DisableAsync(_user))
-        {
-            _mfaMessage = "That could not be saved - reload the page and try again.";
-            return;
-        }
-        _mfaEnabled = false;
-        _recoveryCodes = null;
-    }
-
     private async Task RegisterPasskeyAsync()
     {
         _passkeyMessage = null;
@@ -411,7 +499,7 @@
                 // refusing - enrol, then get bounced back here by the very redirect that sent you.
                 // Enabling an authenticator does not hit this because it posts, and only an HTTP
                 // response can re-issue the cookie. This is that response.
-                if (principal.IsConfinedToMfaEnrollment())
+                if (principal.OwesSecondFactor())
                 {
                     Navigation.NavigateTo(
                         "/api/account/session?returnUrl=/account/security", forceLoad: true);

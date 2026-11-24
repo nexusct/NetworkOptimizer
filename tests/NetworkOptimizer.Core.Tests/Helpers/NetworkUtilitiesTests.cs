@@ -292,6 +292,19 @@ public class NetworkUtilitiesTests
     [InlineData("192.168.1.1", false)]    // Private
     [InlineData("10.0.0.1", false)]       // Private
     [InlineData("127.0.0.1", false)]      // Loopback
+    [InlineData("100.64.0.1", false)]     // CGNAT
+    [InlineData("169.254.1.1", false)]    // Link-local
+    [InlineData("::ffff:8.8.8.8", true)]  // IPv4-mapped public
+    [InlineData("::ffff:192.168.1.1", false)] // IPv4-mapped private
+    [InlineData("2001:4860:4860::8888", true)] // IPv6 global unicast
+    [InlineData("2606:4700:4700::1111", true)]
+    [InlineData("3fff::1", true)]         // Top of 2000::/3
+    [InlineData("fd00::1", false)]        // ULA
+    [InlineData("fe80::1", false)]        // Link-local
+    [InlineData("::1", false)]            // Loopback
+    [InlineData("::", false)]             // Unspecified
+    [InlineData("ff02::1", false)]        // Multicast
+    [InlineData("4000::1", false)]        // Outside 2000::/3
     public void IsPublicIpAddress_ValidCases(string ip, bool expected)
     {
         NetworkUtilities.IsPublicIpAddress(ip).Should().Be(expected);
@@ -301,6 +314,39 @@ public class NetworkUtilitiesTests
     public void IsPublicIpAddress_InvalidIp_ReturnsFalse()
     {
         NetworkUtilities.IsPublicIpAddress("invalid").Should().BeFalse();
+    }
+
+    #endregion
+
+    #region UrlHost Tests
+
+    [Theory]
+    [InlineData("192.0.2.1", "192.0.2.1")]
+    [InlineData("2001:db8::53", "[2001:db8::53]")]
+    [InlineData("[2001:db8::53]", "[2001:db8::53]")]  // Already bracketed
+    [InlineData("pihole.example.com", "pihole.example.com")]
+    public void UrlHost_ReturnsExpected(string host, string expected)
+    {
+        NetworkUtilities.UrlHost(host).Should().Be(expected);
+    }
+
+    #endregion
+
+    #region IpAddressesAreEqual Tests
+
+    [Theory]
+    [InlineData("192.0.2.1", "192.0.2.1", true)]
+    [InlineData("192.0.2.1", "192.0.2.2", false)]
+    [InlineData("2001:db8::53", "2001:0db8:0000:0000:0000:0000:0000:0053", true)]  // Compressed vs expanded
+    [InlineData("2001:DB8::53", "2001:db8::53", true)]                              // Hex case
+    [InlineData("fd00::1", "fd00::2", false)]
+    [InlineData("192.0.2.1", "::ffff:192.0.2.1", false)]  // Different families stay distinct
+    [InlineData("invalid", "invalid", false)]
+    [InlineData(null, "192.0.2.1", false)]
+    [InlineData("", "", false)]
+    public void IpAddressesAreEqual_ReturnsExpected(string? ip1, string? ip2, bool expected)
+    {
+        NetworkUtilities.IpAddressesAreEqual(ip1, ip2).Should().Be(expected);
     }
 
     #endregion
@@ -709,6 +755,36 @@ public class NetworkUtilitiesTests
         NetworkUtilities.IsPppoeInterface(ifName).Should().Be(expected);
     }
 
+    [Theory]
+    [InlineData("gre0", true)]
+    [InlineData("gre1", true)]
+    [InlineData("GRE1", true)]              // case-insensitive
+    [InlineData("gretap0", false)]          // anchored: not a UniFi Cellular Modem tunnel
+    [InlineData("wwan0", false)]            // built-in modem, no tunnel
+    [InlineData("eth4", false)]
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void IsUniFiCellularModemTunnel_MatchesOnlyGreInterfaces(string? ifName, bool expected)
+    {
+        NetworkUtilities.IsUniFiCellularModemTunnel(ifName).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("wwan0", true)]
+    [InlineData("wwan1", true)]
+    [InlineData("WWAN0", true)]             // case-insensitive
+    [InlineData("wwan0qmi0", false)]        // the QMI device node name, not a netdev
+    [InlineData("wwan", false)]             // no unit number
+    [InlineData("xwwan0", false)]           // anchored: no leading junk
+    [InlineData("gre1", false)]
+    [InlineData("eth8", false)]
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void IsWwanInterface_MatchesOnlyWwanInterfaces(string? ifName, bool expected)
+    {
+        NetworkUtilities.IsWwanInterface(ifName).Should().Be(expected);
+    }
+
     #endregion
 
     #region ComposeAuthority Tests
@@ -809,6 +885,29 @@ public class NetworkUtilitiesTests
             .OrderBy(NetworkUtilities.IpSortKey, StringComparer.Ordinal).ToList();
         sorted.Should().Equal("198.51.100.7", "2001:db8::1", null, "not-an-ip");
     }
+
+    #endregion
+
+    #region IsIpInEntry Tests
+
+    [Theory]
+    [InlineData("10.0.1.20", "10.0.1.20", true)]
+    [InlineData("10.0.1.20", "10.0.1.21", false)]
+    [InlineData("10.0.1.20", "10.0.1.10-10.0.1.30", true)]
+    [InlineData("10.0.1.10", "10.0.1.10-10.0.1.30", true)]
+    [InlineData("10.0.1.30", "10.0.1.10 - 10.0.1.30", true)]
+    [InlineData("10.0.1.31", "10.0.1.10-10.0.1.30", false)]
+    [InlineData("10.0.2.20", "10.0.1.10-10.0.1.30", false)]
+    [InlineData("10.0.1.20", "10.0.1.0/24", true)]
+    [InlineData("10.0.2.20", "10.0.1.0/24", false)]
+    [InlineData("2001:db8::5", "2001:db8::1-2001:db8::9", true)]
+    [InlineData("10.0.1.20", "2001:db8::1-2001:db8::9", false)]
+    [InlineData("10.0.1.20", "", false)]
+    [InlineData("10.0.1.20", null, false)]
+    [InlineData("not-an-ip", "10.0.1.0/24", false)]
+    [InlineData("10.0.1.20", "10.0.1.x-10.0.1.30", false)]
+    public void IsIpInEntry_SingleRangeAndCidr(string address, string? entry, bool inside) =>
+        NetworkUtilities.IsIpInEntry(address, entry).Should().Be(inside);
 
     #endregion
 }

@@ -17,7 +17,7 @@ using StorageAuditResult = NetworkOptimizer.Storage.Models.AuditResult;
 
 namespace NetworkOptimizer.Web.Services;
 
-public class AuditService : IAuditScanService
+public partial class AuditService : IAuditScanService
 {
     // Cache keys for IMemoryCache, scoped per site so the app-wide cache never
     // leaks one site's audit state (score, findings, dismissals, running flag)
@@ -55,8 +55,12 @@ public class AuditService : IAuditScanService
     private readonly Audit.Analyzers.FirewallRuleParser _firewallParser;
     private readonly IAlertEventBus? _alertEventBus;
     private readonly IThreatRepository? _threatRepository;
+    private readonly Alerts.Interfaces.INotificationTimeZoneResolver? _timeZones;
     private readonly SiteContextService _siteContext;
     private readonly Licensing.LicenseStateService _licenseState;
+    private readonly SiteTunnelRouting? _tunnelRouting;
+    private readonly Ssh.IGatewaySshService? _gatewaySsh;
+    private readonly NetworkOptimizer.Threats.Blocking.IGatewayAgentBlocklist? _gatewayBlocklist;
 
     public AuditService(
         ILogger<AuditService> logger,
@@ -71,9 +75,17 @@ public class AuditService : IAuditScanService
         SiteContextService siteContext,
         Licensing.LicenseStateService licenseState,
         IAlertEventBus? alertEventBus = null,
-        IThreatRepository? threatRepository = null)
+        IThreatRepository? threatRepository = null,
+        SiteTunnelRouting? tunnelRouting = null,
+        Alerts.Interfaces.INotificationTimeZoneResolver? timeZones = null,
+        Ssh.IGatewaySshService? gatewaySsh = null,
+        NetworkOptimizer.Threats.Blocking.IGatewayAgentBlocklist? gatewayBlocklist = null)
     {
+        _gatewaySsh = gatewaySsh;
+        _gatewayBlocklist = gatewayBlocklist;
+        _timeZones = timeZones;
         _siteContext = siteContext;
+        _tunnelRouting = tunnelRouting;
         _licenseState = licenseState;
         _logger = logger;
         _connectionService = connectionService;
@@ -194,6 +206,7 @@ public class AuditService : IAuditScanService
             var dnatExcludedVlans = await _settingsRepository.GetSystemSettingAsync("audit:dnatExcludedVlans");
             var piholeEndpoint = await _settingsRepository.GetSystemSettingAsync("audit:piholeManagementPort");
             var trustedDnsTargets = await _settingsRepository.GetSystemSettingAsync("audit:trustedDnsRedirectTargets");
+            var allowGuestPublicDns = await _settingsRepository.GetSystemSettingAsync(AuditOptions.AllowGuestPublicDnsKey);
             var unusedPortDays = await _settingsRepository.GetSystemSettingAsync("audit:unusedPortInactivityDays");
             var namedPortDays = await _settingsRepository.GetSystemSettingAsync("audit:namedPortInactivityDays");
 
@@ -217,6 +230,8 @@ public class AuditService : IAuditScanService
             }
             // Trusted DNS redirect targets (VIPs, anycast IPs not in LAN DNS config)
             options.TrustedDnsRedirectTargets = ParseIpList(trustedDnsTargets);
+            // Guest and Hotspot networks are checked for DNS control unless the operator allows them public DNS
+            options.AllowGuestPublicDns = allowGuestPublicDns?.ToLower() == "true";
             // Unused port thresholds (defaults: 15 days unnamed, 45 days named)
             options.UnusedPortInactivityDays = int.TryParse(unusedPortDays, out var unusedDays) && unusedDays > 0 ? unusedDays : 15;
             options.NamedPortInactivityDays = int.TryParse(namedPortDays, out var namedDays) && namedDays > 0 ? namedDays : 45;
@@ -249,10 +264,52 @@ public class AuditService : IAuditScanService
     public DateTime? LastAuditTime => LastAuditTimeCached;
 
     /// <summary>
-    /// Get a unique key for an issue (for tracking dismissals)
+    /// Get a unique key for an issue (for tracking dismissals).
+    /// Findings with no port and no client (firewall rules, DNS, network-level) carry their identity
+    /// only in the text, so a hash of <see cref="AuditIssue.DismissalScope"/> (or the message) is
+    /// appended; without it one dismissal hides every finding that shares the title.
     /// </summary>
-    public static string GetIssueKey(AuditIssue issue) =>
-        $"{issue.Title}|{issue.DeviceName}|{issue.Port}";
+    public static string GetIssueKey(AuditIssue issue)
+    {
+        var key = $"{issue.Title}|{issue.DeviceName}|{issue.Port}";
+        if (!string.IsNullOrEmpty(issue.Port) || !string.IsNullOrEmpty(issue.ClientMac))
+            return key;
+
+        var scope = issue.DismissalScope ?? issue.Description ?? "";
+        var hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(scope));
+        return $"{key}|{Convert.ToHexString(hash, 0, 8)}";
+    }
+
+    /// <summary>
+    /// The stable part of a portless finding's identity, when its message carries live counts.
+    /// Null means the message itself identifies the finding.
+    /// </summary>
+    internal static string? GetDismissalScope(AuditModels.AuditIssue issue) => issue.Type switch
+    {
+        // One per gateway (or per management network); the counts and lists change between audits
+        Audit.IssueTypes.UpnpPortsExposed or Audit.IssueTypes.UpnpPrivilegedPort or
+        Audit.IssueTypes.StaticPortForward or Audit.IssueTypes.StaticPrivilegedPort or
+        Audit.IssueTypes.MgmtNoFixedIps or Audit.IssueTypes.DnsDeviceMisconfigured => issue.CurrentNetwork ?? "",
+        // One per console; the list of credentials and their ages change between audits
+        Audit.IssueTypes.UnusedApiKeys or Audit.IssueTypes.UnusedLocalAdmins => "",
+        // One per gateway; the interfaces, policies, and sets named change between audits
+        _ when IsGatewayFirewallIssue(issue.Type) => "",
+        // Rule Order Issue text names the slice taken, which can change; the analyzer supplies the stable text
+        Audit.IssueTypes.AllowSubvertsDeny when issue.Metadata?.TryGetValue("dismissal_scope", out var scope) == true => scope?.ToString(),
+        // One per forwarded port; the threat count changes every audit. A change of source restriction re-raises it.
+        Audit.IssueTypes.ThreatExposedPortForward => $"{GetMetadata(issue, "port")}|{GetMetadata(issue, "source_restriction")}",
+        _ => null
+    };
+
+    private static string GetMetadata(AuditModels.AuditIssue issue, string key) =>
+        issue.Metadata?.TryGetValue(key, out var value) == true ? value?.ToString() ?? "" : "";
+
+    private static bool IsGatewayFirewallIssue(string type) => type is
+        Audit.IssueTypes.GatewayWanNotExternal or Audit.IssueTypes.GatewayNetworkZoneMismatch or
+        Audit.IssueTypes.GatewayPolicyNotEnforced or Audit.IssueTypes.GatewayDisabledPolicyEnforced or
+        Audit.IssueTypes.GatewayZonePairUnwired or Audit.IssueTypes.GatewayWanZoneReference or
+        Audit.IssueTypes.GatewayBlocklistNotHooked or Audit.IssueTypes.GatewayBlocklistHookDuplicated or
+        Audit.IssueTypes.GatewayBlocklistChainDrift or Audit.IssueTypes.GatewayBlocklistSetEmpty;
 
     /// <summary>
     /// Dismiss an issue (excludes it from counts, persisted to database)
@@ -590,7 +647,7 @@ public class AuditService : IAuditScanService
             try
             {
                 var threatSummary = await BuildThreatSummaryAsync();
-                var pdfReportData = BuildReportData(result, threatSummary: threatSummary);
+                var pdfReportData = BuildReportData(result, threatSummary: threatSummary, timeZone: await ReportTimeZoneAsync());
                 await _pdfStorageService.SavePdfAsync(auditId, pdfReportData);
             }
             catch (Exception pdfEx)
@@ -605,7 +662,11 @@ public class AuditService : IAuditScanService
         }
     }
 
-    private async Task PublishAuditAlertsAsync(AuditResult result, bool isScheduled = false)
+    /// <param name="alertedKeys">Findings a Change Control alert already reported; left out of these alerts.</param>
+    /// <param name="incidentKey">The change's incident, which these alerts join. What they add beyond the change alert is
+    /// delivered (<see cref="AlertEvent.AlwaysDeliver"/>); the completed event is recorded there without a delivery of its own.</param>
+    private async Task PublishAuditAlertsAsync(AuditResult result, bool isScheduled = false, IReadOnlySet<string>? alertedKeys = null,
+        string? incidentKey = null)
     {
         if (_alertEventBus == null) return;
 
@@ -614,6 +675,7 @@ public class AuditService : IAuditScanService
             // Filter out dismissed issues so we only alert on active findings
             await EnsureDismissedIssuesLoadedAsync();
             var activeIssues = result.Issues.Where(i => !IsIssueDismissed(i)).ToList();
+            var addsToChange = incidentKey != null;
             // Exclude system-level issues (e.g., fingerprint DB unavailable) from severity counts
             // so they don't inflate audit.completed severity or trigger critical_findings alerts
             var activeCritical = activeIssues.Count(i => i.Severity == Audit.Models.AuditSeverity.Critical && i.Category != "System");
@@ -634,7 +696,8 @@ public class AuditService : IAuditScanService
                 {
                     ["criticalCount"] = activeCritical.ToString(),
                     ["warningCount"] = activeWarning.ToString()
-                }
+                },
+                CorrelationKey = incidentKey
             });
 
             // Check for score drop vs previous audit
@@ -656,7 +719,8 @@ public class AuditService : IAuditScanService
                 }
 
                 var previousScore = history.Count > 1 ? (int)history[1].ComplianceScore : (int?)null;
-                if (previousScore.HasValue && result.Score < previousScore.Value)
+                if (previousScore.HasValue && result.Score < previousScore.Value
+                    && !OnlyAlertedAreNew(activeIssues, history[1].FindingsJson, alertedKeys))
                 {
                     var drop = previousScore.Value - result.Score;
                     var dropPercent = previousScore.Value > 0
@@ -679,7 +743,9 @@ public class AuditService : IAuditScanService
                             ["currentScore"] = result.Score.ToString(),
                             ["drop"] = drop.ToString(),
                             ["drop_percent"] = dropPercent.ToString("F0")
-                        }
+                        },
+                        CorrelationKey = incidentKey,
+                        AlwaysDeliver = addsToChange
                     });
                 }
             }
@@ -688,8 +754,9 @@ public class AuditService : IAuditScanService
                 _logger.LogDebug(scoreEx, "Failed to check audit score drop");
             }
 
-            // Publish if active (non-dismissed) critical findings exist
-            if (activeCritical > 0)
+            // Publish if active (non-dismissed) critical findings exist that a change alert has not already reported
+            var alertableCritical = AlertableCriticals(activeIssues, alertedKeys);
+            if (alertableCritical.Count > 0)
             {
                 await _alertEventBus.PublishAsync(new AlertEvent
                 {
@@ -697,17 +764,16 @@ public class AuditService : IAuditScanService
                     SiteSlug = _siteContext.IsDefault ? null : _siteContext.Slug,
                     Severity = AlertSeverity.Critical,
                     Source = "audit",
-                    Title = $"{activeCritical} critical security findings detected",
-                    Message = string.Join("; ", activeIssues
-                        .Where(i => i.Severity == Audit.Models.AuditSeverity.Critical && i.Category != "System")
-                        .Take(5)
-                        .Select(i => i.Title)),
-                    MetricValue = activeCritical,
+                    Title = $"{alertableCritical.Count} critical security findings detected",
+                    Message = string.Join("; ", alertableCritical.Take(5).Select(i => i.Title)),
+                    MetricValue = alertableCritical.Count,
                     SourceUrl = "/audit",
                     Context = new Dictionary<string, string>
                     {
                         ["score"] = result.Score.ToString()
-                    }
+                    },
+                    CorrelationKey = incidentKey,
+                    AlwaysDeliver = addsToChange
                 });
             }
         }
@@ -715,6 +781,29 @@ public class AuditService : IAuditScanService
         {
             _logger.LogDebug(ex, "Failed to publish audit alert events");
         }
+    }
+
+    /// <summary>Active critical findings, System ones aside, that no change alert in <paramref name="alertedKeys"/> reported.</summary>
+    internal static List<AuditIssue> AlertableCriticals(IEnumerable<AuditIssue> activeIssues, IReadOnlySet<string>? alertedKeys) =>
+        activeIssues
+            .Where(i => i.Severity == Audit.Models.AuditSeverity.Critical && i.Category != "System"
+                        && alertedKeys?.Contains(ChangeControl.ImpactAnalyzer.IssueKey(i)) != true)
+            .ToList();
+
+    /// <summary>
+    /// True when a change alert already reported every active finding the previous audit lacked, so a score drop says
+    /// nothing new. False with no alerted findings or no previous findings: the drop then alerts as usual.
+    /// </summary>
+    internal static bool OnlyAlertedAreNew(List<AuditIssue> activeIssues, string? previousFindingsJson, IReadOnlySet<string>? alertedKeys)
+    {
+        if (alertedKeys is not { Count: > 0 } || string.IsNullOrEmpty(previousFindingsJson))
+            return false;
+        var previousKeys = (JsonSerializer.Deserialize<List<AuditIssue>>(
+                previousFindingsJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? [])
+            .Select(ChangeControl.ImpactAnalyzer.IssueKey)
+            .ToHashSet(StringComparer.Ordinal);
+        return activeIssues.Select(ChangeControl.ImpactAnalyzer.IssueKey)
+            .All(k => previousKeys.Contains(k) || alertedKeys.Contains(k));
     }
 
     /// <summary>
@@ -764,7 +853,9 @@ public class AuditService : IAuditScanService
     /// Builds a ReportData object from an AuditResult for PDF generation.
     /// Derives client name from gateway device name if not explicitly provided.
     /// </summary>
-    public async Task<Reports.ThreatSummaryData?> BuildThreatSummaryAsync()
+    public async Task<Reports.ThreatSummaryData?> BuildThreatSummaryAsync(
+        int topSourcesLimit = Reports.ThreatSummaryData.DefaultTopSourcesRows,
+        int categorySubTableLimit = Reports.ThreatSummaryData.DefaultCategoryRows)
     {
         if (_threatRepository == null) return null;
 
@@ -772,11 +863,36 @@ public class AuditService : IAuditScanService
         {
             var thirtyDaysAgo = DateTime.UtcNow.AddDays(-30);
             var now = DateTime.UtcNow;
+
+            topSourcesLimit = Math.Clamp(topSourcesLimit, 1, Reports.ThreatSummaryData.MaxRows);
+            categorySubTableLimit = Math.Clamp(categorySubTableLimit, 1, Reports.ThreatSummaryData.MaxRows);
+            var categoryQueryLimit = categorySubTableLimit * 2;
+
+            // Apply enabled noise filters so the audit report matches what the user
+            // sees on the threat dashboard. Without this, the audit always sees raw
+            // events including infrastructure self-scans and trusted-user noise.
+            var allFilters = await _threatRepository.GetNoiseFiltersAsync();
+            var enabledFilters = allFilters.Where(f => f.Enabled).ToList();
+            _threatRepository.SetNoiseFilters(enabledFilters);
+
             var summary = await _threatRepository.GetThreatSummaryAsync(thirtyDaysAgo, now);
             if (summary.TotalEvents == 0) return null;
 
-            var topSources = await _threatRepository.GetTopSourcesAsync(thirtyDaysAgo, now, 5);
+            var topSources = await _threatRepository.GetTopSourcesAsync(thirtyDaysAgo, now, topSourcesLimit);
             var killChain = await _threatRepository.GetKillChainDistributionAsync(thirtyDaysAgo, now);
+
+            // Categorized sub-tables: events matching Infrastructure / TrustedUser
+            // filters are excluded from TopSources above but surfaced here so the
+            // user can see what was suppressed and why.
+            var infraSources = enabledFilters.Any(f => f.Category == ThreatFilterCategory.Infrastructure && f.SourceIp != null)
+                ? await _threatRepository.GetSourcesByCategoryAsync(thirtyDaysAgo, now, ThreatFilterCategory.Infrastructure, categoryQueryLimit)
+                : new List<NetworkOptimizer.Threats.Interfaces.SourceIpSummary>();
+
+            var trustedSources = enabledFilters.Any(f => f.Category == ThreatFilterCategory.TrustedUser && f.SourceIp != null)
+                ? await _threatRepository.GetSourcesByCategoryAsync(thirtyDaysAgo, now, ThreatFilterCategory.TrustedUser, categoryQueryLimit)
+                : new List<NetworkOptimizer.Threats.Interfaces.SourceIpSummary>();
+
+            var suppressedEventCount = infraSources.Sum(s => s.EventCount) + trustedSources.Sum(s => s.EventCount);
 
             return new Reports.ThreatSummaryData
             {
@@ -792,7 +908,24 @@ public class AuditService : IAuditScanService
                     CountryCode = s.CountryCode,
                     AsnOrg = s.AsnOrg,
                     EventCount = s.EventCount
-                }).ToList()
+                }).ToList(),
+                InfrastructureSources = infraSources.Take(categorySubTableLimit).Select(s => new Reports.ThreatSourceEntry
+                {
+                    Ip = s.SourceIp,
+                    CountryCode = s.CountryCode,
+                    AsnOrg = s.AsnOrg,
+                    EventCount = s.EventCount,
+                    Label = s.Label
+                }).ToList(),
+                TrustedUserSources = trustedSources.Take(categorySubTableLimit).Select(s => new Reports.ThreatSourceEntry
+                {
+                    Ip = s.SourceIp,
+                    CountryCode = s.CountryCode,
+                    AsnOrg = s.AsnOrg,
+                    EventCount = s.EventCount,
+                    Label = s.Label
+                }).ToList(),
+                SuppressedEventCount = suppressedEventCount
             };
         }
         catch (Exception ex)
@@ -802,7 +935,16 @@ public class AuditService : IAuditScanService
         }
     }
 
-    public Reports.ReportData BuildReportData(AuditResult result, string? clientName = null, Reports.ThreatSummaryData? threatSummary = null)
+    /// <summary>
+    /// The clock a stored report is written on. It is generated with no one viewing it and
+    /// downloaded later by anyone, so it takes the notification clock, not a viewer's.
+    /// </summary>
+    private async Task<TimeZoneInfo> ReportTimeZoneAsync() =>
+        _timeZones == null ? TimeZoneInfo.Local : await _timeZones.ResolveAsync(_siteContext.Slug);
+
+    /// <param name="timeZone">The clock the generated time is printed on, labeled; UTC with no label when null.</param>
+    public Reports.ReportData BuildReportData(AuditResult result, string? clientName = null, Reports.ThreatSummaryData? threatSummary = null,
+        TimeZoneInfo? timeZone = null)
     {
         // Derive client name from gateway device if not provided
         if (string.IsNullOrEmpty(clientName))
@@ -817,7 +959,8 @@ public class AuditService : IAuditScanService
         {
             ThreatSummary = threatSummary,
             ClientName = clientName,
-            GeneratedAt = result.CompletedAt,
+            GeneratedAt = timeZone == null ? result.CompletedAt : DateTimeUtilities.ToZone(result.CompletedAt, timeZone),
+            TimeZoneLabel = timeZone == null ? null : DateTimeUtilities.ZoneAbbreviation(timeZone, result.CompletedAt),
 
             // Security score
             SecurityScore = new Reports.SecurityScore
@@ -907,6 +1050,7 @@ public class AuditService : IAuditScanService
                 DoqBlocked = result.DnsSecurity.DoqBlocked,
                 DoqProvidesFullCoverage = result.DnsSecurity.DoqProvidesFullCoverage,
                 DohBypassBlocked = result.DnsSecurity.DohBypassBlocked,
+                DohProvidesFullCoverage = result.DnsSecurity.DohProvidesFullCoverage,
                 FullyProtected = result.DnsSecurity.FullyProtected,
                 WanDnsServers = result.DnsSecurity.WanDnsServers.ToList(),
                 WanDnsPtrResults = result.DnsSecurity.WanDnsPtrResults.ToList(),
@@ -1031,7 +1175,9 @@ public class AuditService : IAuditScanService
     /// Gets the PDF bytes for a specific audit by ID.
     /// If PDF doesn't exist but audit data does, regenerates the PDF on-demand.
     /// </summary>
-    public async Task<(byte[]? PdfBytes, string? FileName)> GetAuditPdfAsync(int auditId)
+    /// <param name="viewerZone">The downloader's clock; null keeps the stored copy's.</param>
+    public async Task<(byte[]? PdfBytes, string? FileName)> GetAuditPdfAsync(int auditId, ThreatReportRows? rows = null,
+        TimeZoneInfo? viewerZone = null)
     {
         var audit = await _auditRepository.GetAuditResultAsync(auditId);
         if (audit == null)
@@ -1039,14 +1185,16 @@ public class AuditService : IAuditScanService
             _logger.LogWarning("Audit {AuditId} not found", auditId);
             return (null, null);
         }
-        return await GetPdfForAuditAsync(audit);
+        return await GetPdfForAuditAsync(audit, rows, viewerZone);
     }
 
     /// <summary>
     /// Gets the PDF bytes for the most recent audit.
     /// If PDF doesn't exist but audit data does, regenerates the PDF on-demand.
     /// </summary>
-    public async Task<(byte[]? PdfBytes, string? FileName)> GetLatestAuditPdfAsync()
+    /// <param name="viewerZone">The downloader's clock; null keeps the stored copy's.</param>
+    public async Task<(byte[]? PdfBytes, string? FileName)> GetLatestAuditPdfAsync(ThreatReportRows? rows = null,
+        TimeZoneInfo? viewerZone = null)
     {
         var audit = await _auditRepository.GetLatestAuditResultAsync();
         if (audit == null)
@@ -1054,19 +1202,33 @@ public class AuditService : IAuditScanService
             _logger.LogWarning("No audit results found");
             return (null, null);
         }
-        return await GetPdfForAuditAsync(audit);
+        return await GetPdfForAuditAsync(audit, rows, viewerZone);
     }
 
     /// <summary>
     /// Common logic for retrieving or regenerating a PDF for an audit.
+    /// Non-default row counts always regenerate, and that copy is not stored. So does a downloader
+    /// whose clock reads the audit time differently from the stored copy's (the notification clock).
     /// </summary>
-    private async Task<(byte[]? PdfBytes, string? FileName)> GetPdfForAuditAsync(StorageAuditResult audit)
+    private async Task<(byte[]? PdfBytes, string? FileName)> GetPdfForAuditAsync(StorageAuditResult audit, ThreatReportRows? rows,
+        TimeZoneInfo? viewerZone)
     {
-        var pdfBytes = await _pdfStorageService.GetPdfAsync(audit.Id);
-        if (pdfBytes == null)
+        rows ??= await GetConfiguredThreatReportRowsAsync();
+        var storedZone = await ReportTimeZoneAsync();
+        var zone = viewerZone ?? storedZone;
+        byte[]? pdfBytes;
+        if (rows is { IsDefault: false } || !SameClock(zone, storedZone, audit.AuditDate))
         {
-            _logger.LogInformation("PDF not found for audit {AuditId}, attempting to regenerate", audit.Id);
-            pdfBytes = await RegeneratePdfFromStoredDataAsync(audit);
+            pdfBytes = await RegeneratePdfFromStoredDataAsync(audit, rows is { IsDefault: false } ? rows : null, save: false, zone);
+        }
+        else
+        {
+            pdfBytes = await _pdfStorageService.GetPdfAsync(audit.Id);
+            if (pdfBytes == null)
+            {
+                _logger.LogInformation("PDF not found for audit {AuditId}, attempting to regenerate", audit.Id);
+                pdfBytes = await RegeneratePdfFromStoredDataAsync(audit, null, save: true, storedZone);
+            }
         }
 
         if (pdfBytes == null)
@@ -1080,10 +1242,26 @@ public class AuditService : IAuditScanService
     }
 
     /// <summary>
+    /// Threat table row counts saved in Settings - Security Audit, clamped to the allowed range.
+    /// Unset or invalid values fall back to the defaults.
+    /// </summary>
+    private async Task<ThreatReportRows> GetConfiguredThreatReportRowsAsync() =>
+        ThreatReportRows.FromSettings(
+            await _settingsRepository.GetSystemSettingAsync(ThreatReportRows.TopSourcesSettingKey),
+            await _settingsRepository.GetSystemSettingAsync(ThreatReportRows.CategoryRowsSettingKey));
+
+    /// <summary>Whether two clocks print an instant the same way, so one zone's copy serves the other.</summary>
+    private static bool SameClock(TimeZoneInfo a, TimeZoneInfo b, DateTime instant) =>
+        DateTimeUtilities.ToZone(instant, a) == DateTimeUtilities.ToZone(instant, b)
+        && DateTimeUtilities.ZoneAbbreviation(a, instant) == DateTimeUtilities.ZoneAbbreviation(b, instant);
+
+    /// <summary>
     /// Regenerates a PDF from the stored audit data (ReportDataJson and FindingsJson).
     /// Saves the regenerated PDF for future use.
     /// </summary>
-    private async Task<byte[]?> RegeneratePdfFromStoredDataAsync(StorageAuditResult audit)
+    /// <param name="timeZone">The clock the generated time is printed on.</param>
+    private async Task<byte[]?> RegeneratePdfFromStoredDataAsync(StorageAuditResult audit, ThreatReportRows? rows, bool save,
+        TimeZoneInfo timeZone)
     {
         if (string.IsNullOrEmpty(audit.ReportDataJson))
         {
@@ -1153,13 +1331,15 @@ public class AuditService : IAuditScanService
             }
 
             // Build ReportData and generate PDF
-            var threatSummaryForPdf = await BuildThreatSummaryAsync();
-            var reportData = BuildReportData(result, threatSummary: threatSummaryForPdf);
+            var threatSummaryForPdf = rows == null
+                ? await BuildThreatSummaryAsync()
+                : await BuildThreatSummaryAsync(rows.TopSources, rows.CategoryRows);
+            var reportData = BuildReportData(result, threatSummary: threatSummaryForPdf, timeZone: timeZone);
             var generator = new Reports.PdfReportGenerator();
             var pdfBytes = generator.GenerateReportBytes(reportData);
 
-            // Save for future use
-            await _pdfStorageService.SavePdfAsync(audit.Id, reportData);
+            if (save)
+                await _pdfStorageService.SavePdfAsync(audit.Id, reportData);
 
             _logger.LogInformation("Regenerated and saved PDF for audit {AuditId}: {Size} bytes", audit.Id, pdfBytes.Length);
             return pdfBytes;
@@ -1213,6 +1393,7 @@ public class AuditService : IAuditScanService
             _logger.LogWarning("Cannot run audit: UniFi controller not connected");
             return new AuditResult
             {
+                RunStatus = AuditRunStatus.ConsoleUnavailable,
                 Score = 0,
                 ScoreLabel = "UNAVAILABLE",
                 ScoreClass = "poor",
@@ -1230,6 +1411,8 @@ public class AuditService : IAuditScanService
                 CompletedAt = DateTime.UtcNow
             };
         }
+
+        var auditClient = _connectionService.Client;
 
         try
         {
@@ -1264,7 +1447,7 @@ public class AuditService : IAuditScanService
             }
 
             // Get fingerprint database for device name lookups
-            var fingerprintDb = await _fingerprintService.GetDatabaseAsync();
+            var fingerprintDb = await _fingerprintService.GetDatabaseAsync(_connectionService);
 
             // Fetch settings for DNS security analysis (DoH configuration)
             System.Text.Json.JsonElement? settingsData = null;
@@ -1463,6 +1646,22 @@ public class AuditService : IAuditScanService
                 _logger.LogWarning(ex, "Failed to fetch UPnP status or port forwarding rules");
             }
 
+            // Console accounts and API keys for the unused-credential checks. A connection that cannot read
+            // them gets 401/403, and the check is skipped.
+            List<NetworkOptimizer.UniFi.Models.UniFiOsUser>? consoleUsers = null;
+            List<NetworkOptimizer.UniFi.Models.UniFiOsApiKey>? consoleApiKeys = null;
+            try
+            {
+                consoleUsers = await _connectionService.Client.GetConsoleUsersAsync();
+                consoleApiKeys = await _connectionService.Client.GetConsoleApiKeysAsync();
+                _logger.LogInformation("Console access check: {Users} accounts, {Keys} API keys",
+                    consoleUsers?.Count.ToString() ?? "no access to", consoleApiKeys?.Count.ToString() ?? "no access to");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to fetch console accounts or API keys");
+            }
+
             // Fetch network configs for External zone ID detection (used for firewall rule analysis)
             List<NetworkOptimizer.UniFi.Models.UniFiNetworkConfig>? networkConfigs = null;
             try
@@ -1507,6 +1706,31 @@ public class AuditService : IAuditScanService
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to fetch firewall zones for zone validation");
+            }
+
+            // The gateway's own firewall, to check it enforces what UniFi Network says. Skipped without gateway SSH.
+            Audit.Models.GatewayFirewallSnapshot? gatewayFirewall = null;
+            List<Audit.Models.GatewayWanPath>? gatewayWans = null;
+            if (_gatewaySsh != null)
+            {
+                try
+                {
+                    gatewayFirewall = await new Ssh.GatewayFirewallReader(_gatewaySsh, _logger).ReadAsync();
+                    if (gatewayFirewall != null)
+                        gatewayWans = await GatewayWanPathsAsync(networkConfigs);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to read the gateway's firewall; the gateway firewall check is skipped");
+                }
+            }
+
+            // A read on a dropped connection either throws (logged and skipped above) or comes back empty.
+            // Scoring either one reports the missing firewall policies and port profiles as findings.
+            if (ConsoleConnectionLost(_connectionService.IsConnected, _connectionService.Client, auditClient))
+            {
+                _logger.LogWarning("Lost the UniFi Console connection while the audit read its configuration; nothing was saved");
+                return ConsoleConnectionLostResult();
             }
 
             // Convert options to allowance settings for the audit engine
@@ -1570,14 +1794,23 @@ public class AuditService : IAuditScanService
                 DnatExcludedVlanIds = options.DnatExcludedVlanIds,
                 PiholeManagementPort = options.PiholeManagementPort,
                 PiholeManagementUrl = options.PiholeManagementUrl,
+                // A site reached through its agent is probed from inside its network, not from here.
+                Dialer = _tunnelRouting?.DialerFor(_siteContext.Slug),
                 TrustedDnsRedirectTargets = options.TrustedDnsRedirectTargets,
+                AllowGuestPublicDns = options.AllowGuestPublicDns,
                 UpnpEnabled = upnpEnabled,
                 PortForwardRules = portForwardRules,
                 NetworkConfigs = networkConfigs,
+                ConsoleUsers = consoleUsers,
+                ConsoleApiKeys = consoleApiKeys,
+                ConnectedUsername = _connectionService.Client?.SignInUsername,
                 WlanConfigs = wlanConfigs,
                 FirewallZones = firewallZones,
                 NetworkPurposeOverrides = options.NetworkPurposeOverrides,
-                ThreatContext = threatContext
+                ThreatContext = threatContext,
+                GatewayFirewall = gatewayFirewall,
+                GatewayWanInterfaces = gatewayWans,
+                GatewayBlocklist = gatewayFirewall == null ? null : Ssh.GatewayFirewallReader.Expectation(_gatewayBlocklist, _siteContext.Slug),
             });
 
             // Convert audit result to web models
@@ -1608,7 +1841,7 @@ public class AuditService : IAuditScanService
                 webResult.Score, webResult.CriticalCount, webResult.WarningCount);
 
             // Publish alert events for audit results
-            await PublishAuditAlertsAsync(webResult, options.IsScheduled);
+            await PublishAuditAlertsAsync(webResult, options.IsScheduled, options.AlertedFindingKeys, options.IncidentKey);
 
             return webResult;
         }
@@ -1618,6 +1851,7 @@ public class AuditService : IAuditScanService
 
             return new AuditResult
             {
+                RunStatus = AuditRunStatus.Failed,
                 Score = 0,
                 ScoreLabel = "ERROR",
                 ScoreClass = "poor",
@@ -1636,6 +1870,57 @@ public class AuditService : IAuditScanService
             };
         }
     }
+
+    /// <summary>The page that fixes a finding: the site's agents in Settings - Multi-Site for an agent upgrade.</summary>
+    internal static string? ActionHrefFor(Audit.Models.AuditIssue issue, string? siteSlug) =>
+        issue.Metadata?.TryGetValue(Audit.Analyzers.GatewayFirewallAnalyzer.ActionKey, out var action) == true
+        && Audit.Analyzers.GatewayFirewallAnalyzer.UpgradeAgentAction.Equals(action?.ToString(), StringComparison.Ordinal)
+            ? $"/settings?tab=multisite&configure={Uri.EscapeDataString(siteSlug ?? "")}"
+            : null;
+
+    /// <summary>Each WAN network with the interface its traffic uses on the gateway, for the gateway firewall check.</summary>
+    private async Task<List<Audit.Models.GatewayWanPath>> GatewayWanPathsAsync(List<NetworkOptimizer.UniFi.Models.UniFiNetworkConfig>? networkConfigs)
+    {
+        var interfaces = await _connectionService.GetAllWanInterfacesAsync();
+        return GatewayWanPaths(networkConfigs, interfaces);
+    }
+
+    /// <summary>Pairs each WAN network with its WAN group's data-path interface (the physical port when it has none).</summary>
+    internal static List<Audit.Models.GatewayWanPath> GatewayWanPaths(
+        IReadOnlyList<NetworkOptimizer.UniFi.Models.UniFiNetworkConfig>? networkConfigs, IReadOnlyList<PrimaryWanInterfaces> interfaces) =>
+        (networkConfigs ?? [])
+            .Where(n => n.Enabled && string.Equals(n.Purpose, "wan", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(n.WanNetworkgroup))
+            .Select(n => (Network: n, Wan: interfaces.FirstOrDefault(i => string.Equals(i.NetworkGroup, n.WanNetworkgroup, StringComparison.OrdinalIgnoreCase))))
+            .Where(p => (p.Wan?.UplinkIfName ?? p.Wan?.PhysicalIfName) is { Length: > 0 })
+            .Select(p => new Audit.Models.GatewayWanPath(p.Network.Id, p.Network.Name, p.Wan!.UplinkIfName ?? p.Wan.PhysicalIfName!, p.Wan.PortDisabled))
+            .ToList();
+
+    /// <summary>
+    /// True when the console connection the audit started on is no longer the live, connected one.
+    /// A tunnel drop or a silent console marks it down, and a reconnect replaces the client.
+    /// </summary>
+    internal static bool ConsoleConnectionLost(bool isConnected, object? liveClient, object? auditClient) =>
+        !isConnected || !ReferenceEquals(liveClient, auditClient);
+
+    private static AuditResult ConsoleConnectionLostResult() => new()
+    {
+        RunStatus = AuditRunStatus.ConsoleUnavailable,
+        Score = 0,
+        ScoreLabel = "UNAVAILABLE",
+        ScoreClass = "poor",
+        Issues = new List<AuditIssue>
+        {
+            new AuditIssue
+            {
+                Severity = AuditModels.AuditSeverity.Critical,
+                Category = "Connection",
+                Title = "Lost Connection to the UniFi Console",
+                Description = "The connection to the UniFi Console dropped while the audit was reading its configuration. The result would have been incomplete, so it was not saved.",
+                Recommendation = "Run the audit again once the console is connected. A scheduled audit retries on its own."
+            }
+        },
+        CompletedAt = DateTime.UtcNow
+    };
 
     private AuditResult ConvertAuditResult(AuditModels.AuditResult engineResult, AuditOptions options)
     {
@@ -1663,11 +1948,17 @@ public class AuditService : IAuditScanService
 
             issues.Add(new AuditIssue
             {
+                Type = issue.Type,
                 Severity = issue.Severity,
                 Category = category,
-                Title = GetIssueTitle(issue.Type, issue.Message, issue.Severity, issue.Description, exceptionPattern),
+                // The suffix also keeps an IPv6-only finding's dismissal key apart from its IPv4 twin
+                Title = GetIssueTitle(issue.Type, issue.Message, issue.Severity, issue.Description, exceptionPattern)
+                        + Audit.Models.IpFamilyText.Suffix(Audit.Models.IpFamilyText.IsIpv6Only(issue.Metadata)),
                 Description = issue.Message,
+                DismissalScope = GetDismissalScope(issue),
                 Recommendation = issue.RecommendedAction ?? GetDefaultRecommendation(issue.Type),
+                ActionHref = ActionHrefFor(issue, _siteContext.Slug),
+                ActionLabel = ActionHrefFor(issue, _siteContext.Slug) == null ? null : "Upgrade Agent",
                 // Context fields
                 DeviceName = issue.DeviceName,
                 DeviceMac = issue.DeviceMac,
@@ -1798,6 +2089,7 @@ public class AuditService : IAuditScanService
                 DoqBlocked = dns.DoqBlocked,
                 DoqProvidesFullCoverage = dns.DoqProvidesFullCoverage,
                 DohBypassBlocked = dns.DohBypassBlocked,
+                DohProvidesFullCoverage = dns.DohProvidesFullCoverage,
                 Doh3Blocked = dns.Doh3Blocked,
                 FullyProtected = dns.FullyProtected,
                 WanDnsServers = dns.WanDnsServers.ToList(),
@@ -1906,7 +2198,8 @@ public class AuditService : IAuditScanService
         Audit.IssueTypes.FwAnyAny or
         Audit.IssueTypes.AllowSubvertsDeny or Audit.IssueTypes.AllowExceptionPattern or Audit.IssueTypes.DenyShadowsAllow or
         Audit.IssueTypes.PermissiveRule or Audit.IssueTypes.BroadRule or Audit.IssueTypes.OrphanedRule or
-        Audit.IssueTypes.MissingIsolation or Audit.IssueTypes.IsolationBypassed => "Firewall Rules",
+        Audit.IssueTypes.MissingIsolation or Audit.IssueTypes.IsolationBypassed or
+        Audit.IssueTypes.GatewayManagementExposed or Audit.IssueTypes.GatewayWanManagementExposed => "Firewall Rules",
         var t when t.StartsWith("FW-") => "Firewall Rules",
 
         // VLAN security issues (includes device placement - putting devices on correct VLAN)
@@ -1932,6 +2225,10 @@ public class AuditService : IAuditScanService
         Audit.IssueTypes.UpnpEnabled or Audit.IssueTypes.UpnpNonHomeNetwork or
         Audit.IssueTypes.UpnpPrivilegedPort or Audit.IssueTypes.UpnpPortsExposed or
         Audit.IssueTypes.StaticPortForward => "UPnP Security",
+
+        Audit.IssueTypes.UnusedApiKeys or Audit.IssueTypes.UnusedLocalAdmins => "Console Access",
+
+        _ when IsGatewayFirewallIssue(issueType) => "Gateway Firewall",
 
         _ => "General"
     };
@@ -1965,6 +2262,8 @@ public class AuditService : IAuditScanService
             Audit.IssueTypes.IsolationBypassed => "Firewall: VLAN Isolation Bypassed",
             Audit.IssueTypes.NetworkIsolationException => $"Firewall: VLAN Isolation Exception{(!string.IsNullOrEmpty(description) ? $" ({description})" : "")}",
             Audit.IssueTypes.InternetBlockBypassed => "Firewall: Internet Block Bypassed",
+            Audit.IssueTypes.GatewayManagementExposed => "Firewall: Gateway Management Exposed",
+            Audit.IssueTypes.GatewayWanManagementExposed => "Firewall: Gateway Management Open to Internet",
             "VLAN_VIOLATION" => "VLAN Policy Violation",
             "INTER_VLAN" => "Inter-VLAN Access Issue",
 
@@ -2052,6 +2351,22 @@ public class AuditService : IAuditScanService
 
             // Threat Intelligence
             Audit.IssueTypes.ThreatExposedPortForward => "Threat: Actively Targeted Port Forward",
+
+            // Console access
+            Audit.IssueTypes.UnusedApiKeys => "Console Access: Unused API Keys",
+            Audit.IssueTypes.UnusedLocalAdmins => "Console Access: Unused Local Admin Accounts",
+
+            // Gateway firewall: what the gateway enforces against UniFi Network
+            Audit.IssueTypes.GatewayWanNotExternal => "Gateway Firewall: WAN Not in External Zone",
+            Audit.IssueTypes.GatewayNetworkZoneMismatch => "Gateway Firewall: Network in a Different Zone",
+            Audit.IssueTypes.GatewayPolicyNotEnforced => "Gateway Firewall: Policies Missing on Gateway",
+            Audit.IssueTypes.GatewayDisabledPolicyEnforced => "Gateway Firewall: Disabled Policies Still Enforced",
+            Audit.IssueTypes.GatewayZonePairUnwired => "Gateway Firewall: Zone Policies Not Reached",
+            Audit.IssueTypes.GatewayWanZoneReference => "Gateway Firewall: WAN Zone Missing in UniFi Network",
+            Audit.IssueTypes.GatewayBlocklistNotHooked => "Automatic Blocking: Not in Effect on Gateway",
+            Audit.IssueTypes.GatewayBlocklistHookDuplicated => "Automatic Blocking: Duplicate Gateway Hooks",
+            Audit.IssueTypes.GatewayBlocklistChainDrift => "Automatic Blocking: Gateway Rules Changed",
+            Audit.IssueTypes.GatewayBlocklistSetEmpty => "Automatic Blocking: Gateway Blocklist Empty",
 
             _ => message.Split('.').FirstOrDefault() ?? type
         };
@@ -2172,6 +2487,8 @@ public class AuditService : IAuditScanService
         Audit.IssueTypes.BroadRule => "Restrict the source or destination to specific networks or devices.",
         Audit.IssueTypes.InternetBlockBypassed => "Remove the allow rule, or narrow internet access to specific IPs, MACs, or devices that need it to operate.",
         Audit.IssueTypes.IsolationBypassed => "Delete this rule or restrict to specific ports/protocols if necessary.",
+        Audit.IssueTypes.GatewayManagementExposed => "Block TCP 22, 80, and 443 from this network to the Gateway zone.",
+        Audit.IssueTypes.GatewayWanManagementExposed => "Block TCP management ports from the External zone to the Gateway zone, and turn off Direct Remote Connection.",
         Audit.IssueTypes.OrphanedRule => "Remove rules that reference non-existent objects.",
         Audit.IssueTypes.MacRestriction => "Consider enabling MAC-based port security on access ports where device churn is low.",
         Audit.IssueTypes.PortLock => "Enable Lock Port to UniFi Device on ports that carry a UniFi device.",
@@ -2219,10 +2536,24 @@ public class AuditOptions
     public bool AllowMediaPlayersOnMainNetwork { get; set; } = false;
     public bool AllowPrintersOnMainNetwork { get; set; } = true;
     public bool IsScheduled { get; set; }
+
+    /// <summary>
+    /// Findings (<see cref="ChangeControl.ImpactAnalyzer.IssueKey"/>) a Change Control security regression alert already
+    /// reported. This run's critical-findings and score-drop alerts leave them out.
+    /// </summary>
+    public IReadOnlySet<string>? AlertedFindingKeys { get; set; }
+
+    /// <summary>The Change Control incident this run's alerts join (<see cref="ChangeControl.ChangeAlerts.IncidentKey"/>).</summary>
+    public string? IncidentKey { get; set; }
+
     public List<int>? DnatExcludedVlanIds { get; set; }
     public int? PiholeManagementPort { get; set; }
     public string? PiholeManagementUrl { get; set; }
     public List<string>? TrustedDnsRedirectTargets { get; set; }
+
+    /// <summary>System setting: leave Guest and Hotspot networks out of DNS coverage checks and Fix it for me. Off by default.</summary>
+    public const string AllowGuestPublicDnsKey = "audit:allowGuestPublicDns";
+    public bool AllowGuestPublicDns { get; set; }
 
     // Unused port detection thresholds
     public int UnusedPortInactivityDays { get; set; } = 15;
@@ -2232,8 +2563,24 @@ public class AuditOptions
     public Dictionary<string, string>? NetworkPurposeOverrides { get; set; }
 }
 
+/// <summary>Whether an audit produced a score, or why it did not.</summary>
+public enum AuditRunStatus
+{
+    /// <summary>The audit read the console and scored it.</summary>
+    Completed,
+
+    /// <summary>The console was not connected, or the connection dropped mid-read. Nothing was saved.</summary>
+    ConsoleUnavailable,
+
+    /// <summary>The audit threw. Nothing was saved.</summary>
+    Failed
+}
+
 public class AuditResult
 {
+    /// <summary>Whether this result is a score. Only <see cref="AuditRunStatus.Completed"/> is saved.</summary>
+    public AuditRunStatus RunStatus { get; set; } = AuditRunStatus.Completed;
+
     public int Score { get; set; }
     public string ScoreLabel { get; set; } = "";
     public string ScoreClass { get; set; } = "";
@@ -2263,6 +2610,8 @@ public class DnsSecurityReference
     public bool DoqBlocked { get; set; }
     public bool DoqProvidesFullCoverage { get; set; }
     public bool DohBypassBlocked { get; set; }
+    /// <summary>True by default, so an audit stored before DoH coverage was tracked reads as it did.</summary>
+    public bool DohProvidesFullCoverage { get; set; } = true;
     public bool Doh3Blocked { get; set; }
     public bool FullyProtected { get; set; }
     public List<string> WanDnsServers { get; set; } = new();
@@ -2316,10 +2665,16 @@ public class AuditStatistics
 
 public class AuditIssue
 {
+    /// <summary>The engine's issue type (IssueTypes); empty on synthetic issues.</summary>
+    public string Type { get; set; } = "";
     public AuditModels.AuditSeverity Severity { get; set; }
     public string Category { get; set; } = "";
     public string Title { get; set; } = "";
     public string Description { get; set; } = "";
+    /// <summary>
+    /// Stable identity text for the dismissal key when <see cref="Description"/> carries live counts.
+    /// </summary>
+    public string? DismissalScope { get; set; }
     public string Recommendation { get; set; } = "";
     public string? DeviceName { get; set; }
     public string? DeviceMac { get; set; }
@@ -2339,6 +2694,12 @@ public class AuditIssue
     /// If set, UI shows a link to configure this setting
     /// </summary>
     public string? ConfigurableSetting { get; set; }
+
+    /// <summary>A page that fixes the finding, shown as a button under the recommendation; null for none.</summary>
+    public string? ActionHref { get; set; }
+
+    /// <summary>The button's label, as the target page names the action.</summary>
+    public string? ActionLabel { get; set; }
 
     /// <summary>
     /// Firewall/DNAT rules contributing partial coverage for this finding (with covered networks).
@@ -2448,4 +2809,35 @@ public class OfflineClientReference
     public bool IsIoT { get; set; }
     public bool IsCamera { get; set; }
     public NetworkOptimizer.Audit.Models.DeviceDetectionResult Detection { get; set; } = null!;
+}
+
+/// <summary>
+/// Row counts for the threat tables in a downloaded Security Audit PDF.
+/// </summary>
+public sealed record ThreatReportRows(int TopSources, int CategoryRows)
+{
+    /// <summary>System setting holding the Top Threat Sources row count.</summary>
+    public const string TopSourcesSettingKey = "audit:pdfTopSourcesRows";
+
+    /// <summary>System setting holding the rows per filter category.</summary>
+    public const string CategoryRowsSettingKey = "audit:pdfCategoryRows";
+
+    /// <summary>
+    /// Row counts from stored setting values, clamped to 1..MaxRows. Unset or non-numeric values
+    /// fall back to the defaults.
+    /// </summary>
+    public static ThreatReportRows FromSettings(string? topSources, string? categoryRows)
+    {
+        static int Parse(string? value, int fallback) =>
+            int.TryParse(value, out var n) ? Math.Clamp(n, 1, Reports.ThreatSummaryData.MaxRows) : fallback;
+
+        return new ThreatReportRows(
+            Parse(topSources, Reports.ThreatSummaryData.DefaultTopSourcesRows),
+            Parse(categoryRows, Reports.ThreatSummaryData.DefaultCategoryRows));
+    }
+
+    /// <summary>True when both counts match the stored PDF, so the stored copy can be served.</summary>
+    public bool IsDefault =>
+        TopSources == Reports.ThreatSummaryData.DefaultTopSourcesRows &&
+        CategoryRows == Reports.ThreatSummaryData.DefaultCategoryRows;
 }

@@ -4,6 +4,8 @@
 @implements IDisposable
 @using NetworkOptimizer.Web.Services
 @using NetworkOptimizer.Web.Services.Ssh
+@using NetworkOptimizer.Web.Services.CellularModemProviders
+@using NetworkOptimizer.Web.Components.Shared.Monitoring.LiveTraffic
 @using NetworkOptimizer.Storage.Models
 @using NetworkOptimizer.Storage.Interfaces
 @using NetworkOptimizer.Core.Interfaces
@@ -34,9 +36,14 @@
 @inject IEnumerable<NetworkOptimizer.Alerts.Delivery.IAlertDeliveryChannel> DeliveryChannels
 @inject NetworkOptimizer.Alerts.Delivery.ISecretDecryptor SecretDecryptor
 @inject NetworkOptimizer.Threats.Enrichment.GeoEnrichmentService GeoService
-@inject NetworkOptimizer.Threats.CrowdSec.CrowdSecClient CrowdSecClient
+@inject ICtiSettingsAdmin CtiSettings
 @inject NetworkOptimizer.Storage.Services.ICredentialProtectionService CredentialService
 @inject IHttpClientFactory HttpClientFactory
+@inject ISystemSettingsAdmin SettingsAdmin
+@inject ISiteSettingsAdmin SiteSettingsAdmin
+@inject NetworkOptimizer.Web.Services.Monitoring.LiveTraffic.ILiveTrafficService LiveTrafficSettings
+@inject Microsoft.AspNetCore.Authorization.IAuthorizationService Authz
+@inject NetworkOptimizer.Threats.ThreatCollectionService ThreatCollection
 @inject NavigationManager NavigationManager
 @inject ISiteManagementService SiteManagement
 @inject SiteRegistryChangeNotifier SiteChangeNotifier
@@ -54,7 +61,9 @@
 @inject SnmpDetectionService SnmpDetection
 @inject MonitoringInfluxClient InfluxClient
 @inject ICableModemService CmMonitorService
+@inject IEnumerable<NetworkOptimizer.Monitoring.Providers.ICableModemProvider> CmProviders
 @inject IOntMonitorService OntMonitorService
+@inject IMonitoringSettingsService MonitoringSettingsAdmin
 @inject IStarlinkMonitorService StarlinkMonitor
 @inject Microsoft.EntityFrameworkCore.IDbContextFactory<NetworkOptimizer.Storage.Models.NetworkOptimizerDbContext> DbFactory
 @inject NetworkOptimizer.Web.Services.Identity.IIdentityAdminService IdentityAdmin
@@ -63,10 +72,15 @@
 @inject Microsoft.Extensions.Options.IOptions<Microsoft.AspNetCore.Identity.IdentityOptions> IdentityOptions
 @using NetworkOptimizer.Alerts.Models
 @using NetworkOptimizer.Web.Components.Shared
+@inject Microsoft.AspNetCore.Mvc.ViewFeatures.IFileVersionProvider FileVersionProvider
+@inject IDisplayTimeZone DisplayTime
+
+<NavigationLock OnBeforeInternalNavigation="ConfirmLeaveAsync" />
 
 <PageTitle>Settings - Network Optimizer</PageTitle>
 
 <div class="page-header">
+    <PageBackButton />
     <h1>Settings</h1>
     @if (_multiSiteEnabled && !string.IsNullOrEmpty(_currentSiteName))
     {
@@ -76,7 +90,7 @@
 </div>
 
 <div class="wifi-view-tabs-wrapper settings-tabs-wrapper">
-    <button class="wifi-tabs-scroll-btn wifi-tabs-scroll-left" onclick="this.parentElement.querySelector('.wifi-view-tabs').scrollBy({left: -200, behavior: 'smooth'})">&#8249;</button>
+    <button class="wifi-tabs-scroll-btn wifi-tabs-scroll-left" onclick="this.parentElement.querySelector('.wifi-view-tabs').scrollBy({left: -200, behavior: 'smooth'})"><AppIcon Name="chevron-left" /></button>
     <div class="wifi-view-tabs">
         <button class="wifi-view-tab @(_activeTab == "connection" ? "active" : "")"
                 @onclick="@(() => SetActiveTab("connection"))">
@@ -149,14 +163,14 @@
             </NotAuthorized>
         </AuthorizeView>
     </div>
-    <button class="wifi-tabs-scroll-btn wifi-tabs-scroll-right" onclick="this.parentElement.querySelector('.wifi-view-tabs').scrollBy({left: 200, behavior: 'smooth'})">&#8250;</button>
+    <button class="wifi-tabs-scroll-btn wifi-tabs-scroll-right" onclick="this.parentElement.querySelector('.wifi-view-tabs').scrollBy({left: 200, behavior: 'smooth'})"><AppIcon Name="chevron-right" /></button>
     @* Every tab renders at once and is shown by class, so a hit is already on the page - selection
        switches tab and rings the card rather than navigating. *@
     <AppSearchBox Area="Settings" Placeholder="Search settings" OnSelect="GoToSearchHitAsync"
                   data-tour="settings-search" />
 </div>
 
-<div class="settings-container settings-tabbed active-@_activeTab">
+<div class="settings-container settings-tabbed active-@_activeTab" @ref="_settingsContainer">
     <!-- 1. UniFi Console Connection -->
     <div class="card settings-tab-connection" id="console-connection">
         <div class="card-header">
@@ -173,7 +187,7 @@
             <div class="form-group">
                 <label class="form-label">Console URL</label>
                 <input type="text" class="form-control" @bind="controllerUrl" @bind:event="oninput" placeholder="https://192.168.1.1" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
-                <small class="form-help">UniFi OS device (UDM, UCG, UDR, or Cloud Key) or self-hosted Network Server.</small>
+                <small class="form-help">UniFi OS device (UDM, UCG, UDR, or CloudKey), UniFi OS Server, or legacy UniFi Network Server.</small>
             </div>
 
             <div class="form-group">
@@ -239,13 +253,6 @@
                     </button>
                 </div>
                 <small class="form-help">Leave as "default" for most local UniFi OS devices. If you have multiple sites or are unsure, click "List Sites" to fetch available sites.</small>
-            </div>
-
-            <div class="form-group">
-                <label class="checkbox-label">
-                    <input type="checkbox" @bind="rememberCredentials" />
-                    <span>Remember credentials</span>
-                </label>
             </div>
 
             <div class="form-group">
@@ -335,20 +342,26 @@
                             <li>Uncheck <strong>Use a Predefined Role</strong></li>
                             <li>Set permissions:
                                 <ul>
-                                    <li><strong>Network:</strong> Site Admin</li>
-                                    <li><strong>Protect:</strong> View Only</li>
+                                    <li><strong>Network:</strong> Full (Site Admin in older versions)</li>
+                                    <li><strong>Protect:</strong> View (View Only in older versions)</li>
                                     <li><strong>User &amp; Account Management:</strong> None</li>
                                 </ul>
                             </li>
                             <li>Set a secure password and save</li>
                         </ol>
                         <p>Use this username and password in the fields above.</p>
-                        <p><strong>Why Site Admin?</strong> Network has no granular role between View Only and Site Admin, and the Channel Optimizer's on-demand RF spectrum scans need write access. View Only works for everything else, so pick it instead if you don't plan to run scans.</p>
+                        <p><strong>Why Full?</strong> Network has no granular role between View (View Only) and Full (Site Admin), and the Wi-Fi Optimizer's on-demand RF spectrum scans and Apply Recommended Channels need write access. UniFi Network 11 also withholds SNMP credentials from View, so SNMP monitoring needs Full. View works for everything else, so pick it instead if you don't plan to use any of these.</p>
                     </div>
                 </details>
             }
         </div>
     </div>
+
+    @if (SiteContext.IsDefault)
+    {
+    <!-- Time Zone -->
+    <TimeZoneSettingsCard />
+    }
 
     @* Admin login is instance-wide, so the password is only managed on the main site - and only by a
        global Admin. IsDefault alone answers "are we on the main site", not "may you do this": a Site
@@ -365,7 +378,7 @@
             <div class="card-header-badges">
                 @if (_multiSiteEnabled)
                 {
-                    <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                    <ScopeBadge />
                 }
                 <span class="status-badge status-@(adminPasswordSource == AdminPasswordSource.None ? "disconnected" : "connected")">
                     @GetAdminPasswordSourceLabel()
@@ -379,7 +392,7 @@
                 Database password takes priority when enabled.
             </p>
 
-            <div class="info-row" style="margin-bottom: 1rem; padding: 0.75rem; background: var(--bg-secondary); border-radius: 8px;">
+            <div class="info-row" style="margin-bottom: 1rem; padding: 0.75rem; background: var(--bg-secondary); border-radius: var(--border-radius-lg);">
                 <span class="info-label">Current Source:</span>
                 <span class="info-value">
                     @switch (adminPasswordSource)
@@ -401,13 +414,9 @@
             </div>
 
             <div class="form-group">
-                <label class="form-label">New Password <span class="tooltip-icon tooltip-icon-sm" data-tooltip="@_passwordPolicy">?</span></label>
-                <input type="password" class="form-control" @bind="adminNewPassword" @bind:event="oninput" @onclick:stopPropagation="true" @bind:after="OnAdminPasswordInput" placeholder="Enter new password" autocomplete="new-password" />
-            </div>
-
-            <div class="form-group">
-                <label class="form-label">Confirm Password</label>
-                <input type="password" class="form-control" @bind="adminConfirmPassword" @bind:event="oninput" @bind:after="OnAdminPasswordInput" placeholder="Confirm new password" autocomplete="new-password" />
+                <label class="form-label" for="admin-new-password">New Password <span class="tooltip-icon tooltip-icon-sm" data-tooltip="@_passwordPolicy">?</span></label>
+                <PasswordInput Id="admin-new-password" AutoComplete="new-password" Placeholder="Enter new password"
+                               @bind-Value="adminNewPassword" @bind-Value:after="OnAdminPasswordInput" />
             </div>
 
             <div class="action-buttons">
@@ -457,8 +466,8 @@
         </div>
         <div class="card-body">
             <p class="section-description">
-                Configure SSH credentials for your UniFi Gateway or UniFi OS Device. Used for
-                iperf3 speed tests against the gateway, Adaptive SQM, and gateway-based WAN speed testing.
+                Configure SSH credentials for your UniFi Gateway. Used for iperf3 speed tests against the
+                gateway, Adaptive SQM, gateway-based WAN speed testing, Performance Tweaks, and WAN Steering.
                 Not required for Security Audit, Client Speed Tests, or LAN Speed Tests to other devices.
             </p>
 
@@ -550,7 +559,7 @@
 
             @if (iperf3Status != null)
             {
-                <div class="iperf3-status" style="margin-top: 1rem; padding: 1rem; background: var(--bg-secondary); border-radius: 8px;">
+                <div class="iperf3-status" style="margin-top: 1rem; padding: 1rem; background: var(--bg-secondary); border-radius: var(--border-radius-lg);">
                     <h4 style="margin: 0 0 0.5rem 0;">iperf3 Status</h4>
                     <div class="info-row">
                         <span class="info-label">Installed:</span>
@@ -594,7 +603,7 @@
             @if (gatewaySettings?.LastTestedAt != null)
             {
                 <div class="form-help" style="margin-top: 1rem;">
-                    Last tested: @gatewaySettings.LastTestedAt?.ToLocalTime().ToString("g") - @gatewaySettings.LastTestResult
+                    Last tested: @gatewaySettings.LastTestedAt?.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DateTime, DisplayFormat.Culture) - @gatewaySettings.LastTestResult
                 </div>
             }
 
@@ -713,7 +722,7 @@
             @if (sshSettings?.LastTestedAt != null)
             {
                 <div class="form-help" style="margin-top: 1rem;">
-                    Last tested: @sshSettings.LastTestedAt?.ToLocalTime().ToString("g") - @sshSettings.LastTestResult
+                    Last tested: @sshSettings.LastTestedAt?.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DateTime, DisplayFormat.Culture) - @sshSettings.LastTestResult
                 </div>
             }
 
@@ -901,6 +910,8 @@
         </div>
     </div>
 
+    <TailscaleConnectionCard />
+
     <!-- Monitoring Configuration -->
     <div class="card settings-tab-monitoring" id="monitoring">
         <div class="card-header">
@@ -933,9 +944,17 @@
                 <div class="form-value">
                     @switch (_monitoringSettings?.SnmpDetectionState)
                     {
+                        case SnmpDetectionState.EnabledV2c when _monitoringSettings.SnmpCommunityMissing:
+                            <span class="status-indicator status-warning"></span>
+                            <span>Configured (v2c), Community String not returned</span>
+                            break;
                         case SnmpDetectionState.EnabledV2c:
                             <span class="status-indicator status-active"></span>
                             <span>Configured (v2c)</span>
+                            break;
+                        case SnmpDetectionState.EnabledV3Only when _monitoringSettings.SnmpV3PasswordMissing:
+                            <span class="status-indicator status-warning"></span>
+                            <span>Configured (v3), password not returned</span>
                             break;
                         case SnmpDetectionState.EnabledV3Only:
                             <span class="status-indicator status-active"></span>
@@ -965,7 +984,7 @@
             {
                 <div class="form-group">
                     <label class="form-label">Last Detected</label>
-                    <div class="form-value">@_monitoringSettings.LastSnmpDetection.Value.ToString("g")</div>
+                    <div class="form-value">@_monitoringSettings.LastSnmpDetection.Value.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DateTime, DisplayFormat.Culture)</div>
                 </div>
             }
 
@@ -1007,27 +1026,27 @@
             {
                 <div class="form-group">
                     <label class="form-label">InfluxDB URL</label>
-                    <input type="text" class="form-control" @bind="_influxUrl" @bind:event="oninput" placeholder="http://localhost:8086" />
+                    <input type="text" class="form-control" @bind="_influxUrl" @bind:event="oninput" placeholder="http://localhost:8086" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
                 </div>
 
                 <div class="form-group">
                     <label class="form-label">API Token</label>
-                    <input type="password" class="form-control" @bind="_influxToken" @bind:event="oninput" placeholder="@(_influxTokenIsSet ? "(saved, leave blank to keep)" : "Paste an InfluxDB API token")" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
+                    <input type="password" class="form-control" @bind="_influxToken" @bind:event="oninput" placeholder="@(_influxTokenIsSet ? "(saved, leave blank to keep)" : "Paste an InfluxDB API token")" autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore />
                 </div>
 
                 <div class="form-group">
                     <label class="form-label">Organization</label>
-                    <input type="text" class="form-control" @bind="_influxOrg" @bind:event="oninput" placeholder="network-optimizer" />
+                    <input type="text" class="form-control" @bind="_influxOrg" @bind:event="oninput" placeholder="network-optimizer" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
                 </div>
 
                 <div class="form-group">
                     <label class="form-label">Primary Bucket</label>
-                    <input type="text" class="form-control" @bind="_influxBucket" @bind:event="oninput" placeholder="network_monitoring" />
+                    <input type="text" class="form-control" @bind="_influxBucket" @bind:event="oninput" placeholder="network_monitoring" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
                 </div>
 
                 <div class="form-group">
                     <label class="form-label">Long-term Bucket</label>
-                    <input type="text" class="form-control" @bind="_influxLongtermBucket" @bind:event="oninput" placeholder="network_monitoring_longterm" />
+                    <input type="text" class="form-control" @bind="_influxLongtermBucket" @bind:event="oninput" placeholder="network_monitoring_longterm" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
                 </div>
             }
             else if (!_mainInfluxConfigured)
@@ -1147,35 +1166,33 @@
                 It's deployed automatically from the Adaptive SQM page. Only change this if you need to use a different port (default: 8088).
             </p>
 
-            <div class="form-row">
-                <div class="form-group" style="flex: 1;">
-                    <label class="form-label">Port</label>
-                    <input type="number" class="form-control" @bind="tcMonitorPort" @bind:event="oninput" min="1" max="65535" />
-                </div>
-                <div class="action-buttons">
-                    <button class="btn btn-secondary" @onclick="SaveTcMonitorPort" disabled="@savingTcMonitorPort">
-                        @if (savingTcMonitorPort)
-                        {
-                            <span class="spinner"></span>
-                            <span>Saving...</span>
-                        }
-                        else
-                        {
-                            <span>Save</span>
-                        }
-                    </button>
-                    <button class="btn btn-primary" @onclick="TestTcMonitor" disabled="@testingTcMonitor">
-                        @if (testingTcMonitor)
-                        {
-                            <span class="spinner"></span>
-                            <span>Testing...</span>
-                        }
-                        else
-                        {
-                            <span>Test</span>
-                        }
-                    </button>
-                </div>
+            <div class="form-group">
+                <label class="form-label">Port</label>
+                <input type="number" class="form-control" @bind="tcMonitorPort" @bind:event="oninput" min="1" max="65535" />
+            </div>
+            <div class="action-buttons">
+                <button class="btn btn-secondary" @onclick="SaveTcMonitorPort" disabled="@savingTcMonitorPort">
+                    @if (savingTcMonitorPort)
+                    {
+                        <span class="spinner"></span>
+                        <span>Saving...</span>
+                    }
+                    else
+                    {
+                        <span>Save</span>
+                    }
+                </button>
+                <button class="btn btn-primary" @onclick="TestTcMonitor" disabled="@testingTcMonitor">
+                    @if (testingTcMonitor)
+                    {
+                        <span class="spinner"></span>
+                        <span>Testing...</span>
+                    }
+                    else
+                    {
+                        <span>Test</span>
+                    }
+                </button>
             </div>
 
             @if (!string.IsNullOrEmpty(tcMonitorMessage))
@@ -1203,7 +1220,7 @@
         </div>
         <div class="card-body">
             <p class="section-description">
-                Monitor cellular modems (Ubiquiti U5G-Max/U5G Backup, Netgear Nighthawk hotspots, GL-iNet routers, etc.)
+                Monitor cellular modems (UniFi 5G Max / 5G Backup / LTE Backup / UDR 5G Max, Netgear Nighthawk hotspots, Inseego FX gateways, Zyxel 5G/LTE CPEs, GL-iNet routers, etc.)
                 for signal strength and cell info. Stats are polled every 5 minutes.
                 SSH credentials are required for Ubiquiti and GL-iNet modems.
             </p>
@@ -1212,14 +1229,14 @@
             {
                 <div class="form-group">
                     <label class="checkbox-label">
-                        <input type="checkbox" @bind="_monitoringSettings.ShowCellularTab" @bind:after="SaveTabVisibilityAsync" />
+                        <input type="checkbox" data-autosave @bind="_monitoringSettings.ShowCellularTab" @bind:after="SaveTabVisibilityAsync" />
                         <span>Show the Cellular Stats tab in Monitoring</span>
                     </label>
                 </div>
             }
 
-            @if (sshSettings?.HasCredentials != true &&
-                 modemConfigs.Any(m => string.IsNullOrWhiteSpace(m.Provider) || m.Provider == "qmicli"))
+            @if (!DeviceHasCredentials &&
+                 modemConfigs.Any(m => ModemProviderKeys.UsesSharedSsh(m.Provider)))
             {
                 <div class="alert alert-warning" style="margin-bottom: 1rem;">
                     <strong>SSH credentials required:</strong> One or more configured modems use the qmicli provider, which needs SSH credentials. Configure them in the Device SSH section above.
@@ -1227,10 +1244,24 @@
                 </div>
             }
 
+            @if (!GatewayHasCredentials &&
+                 modemConfigs.Any(m => ModemProviderKeys.UsesGatewaySsh(m.Provider)))
+            {
+                <div class="alert alert-warning" style="margin-bottom: 1rem;">
+                    <strong>Gateway SSH required:</strong> A UDR-5G-Max modem is polled with the Gateway SSH credentials. Configure them in the Gateway SSH section above.
+                    <a href="#gateway-ssh" style="margin-left: 0.5rem;">Go to Gateway SSH Settings</a>
+                </div>
+            }
+
             <!-- Discovered Modems from UniFi Console -->
-            <h4>Auto-Discovered Modems</h4>
-            <div class="action-buttons" style="margin-top: 0.5rem; margin-bottom: 1rem;">
-                <button class="btn btn-secondary" @onclick="LoadDiscoveredModems" disabled="@(!ConnectionService.IsConnected || loadingDiscoveredModems)">
+            <div class="modem-discovery-header">
+            <h4>Ubiquiti Modems (Auto-Discovered)</h4>
+            <div class="action-buttons">
+                @if (!string.IsNullOrEmpty(modemScanResult) && !loadingDiscoveredModems)
+                {
+                    <span class="modem-scan-result">@modemScanResult</span>
+                }
+                <button class="btn btn-secondary" @onclick="ScanForModems" disabled="@(!ConnectionService.IsConnected || loadingDiscoveredModems)">
                     @if (loadingDiscoveredModems)
                     {
                         <span class="spinner"></span>
@@ -1241,6 +1272,7 @@
                         <span>Scan for Modems</span>
                     }
                 </button>
+            </div>
             </div>
 
             @if (!ConnectionService.IsConnected)
@@ -1263,7 +1295,7 @@
                     <tbody>
                         @foreach (var discovered in discoveredModems)
                         {
-                            var isConfigured = modemConfigs.Any(m => m.Host == discovered.Host);
+                            var isConfigured = IsDiscoveredModemConfigured(discovered);
                             <tr>
                                 <td>@discovered.Name</td>
                                 <td><code>@discovered.Model</code></td>
@@ -1283,7 +1315,11 @@
                                     {
                                         <span class="status-badge status-connected">Configured</span>
                                     }
-                                    else if (sshSettings?.HasCredentials != true)
+                                    else if (discovered.IsGateway && !GatewayHasCredentials)
+                                    {
+                                        <span class="status-badge status-warning" data-tooltip="Configure Gateway SSH credentials first">Gateway SSH Required</span>
+                                    }
+                                    else if (!discovered.IsGateway && !DeviceHasCredentials)
                                     {
                                         <span class="status-badge status-warning" title="Configure SSH credentials first">SSH Required</span>
                                     }
@@ -1302,7 +1338,7 @@
             }
             else if (ConnectionService.IsConnected && !loadingDiscoveredModems)
             {
-                <p class="form-help">No cellular modems (UniFi 5G Max, 5G Backup, LTE Backup Pro) found. Click "Scan for Modems" to search.</p>
+                <p class="form-help">No cellular modems (UniFi 5G Max / 5G Backup / LTE Backup / UDR 5G Max) found. Click "Scan for Modems" to search.</p>
             }
 
             <!-- Configured Modems -->
@@ -1336,7 +1372,7 @@
                                         <span class="status-badge status-disconnected">Disabled</span>
                                     }
                                 </td>
-                                <td>@(modem.LastPolled?.ToLocalTime().ToString("g") ?? "Never")</td>
+                                <td>@(modem.LastPolled?.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DateTime, DisplayFormat.Culture) ?? "Never")</td>
                                 <td>
                                     <div class="btn-group-wrap">
                                         <button class="btn btn-secondary btn-sm" @onclick="() => EditModem(modem)">Edit</button>
@@ -1351,7 +1387,18 @@
                                                 <span>@(modem.Enabled ? "Disable" : "Enable")</span>
                                             }
                                         </button>
-                                        <button class="btn btn-danger btn-sm" @onclick="() => DeleteModem(modem)">Delete</button>
+                                        @if (_confirmDeleteKey == $"modem:{modem.Id}")
+                                        {
+                                            <span class="confirm-inline">
+                                                <span class="confirm-text">Delete?</span>
+                                                <button class="btn btn-danger btn-sm" @onclick="() => DeleteModem(modem)">Yes, delete</button>
+                                                <button class="btn btn-secondary btn-sm" @onclick="CancelConfirmDelete">Cancel</button>
+                                            </span>
+                                        }
+                                        else
+                                        {
+                                            <button class="btn btn-danger btn-sm" @onclick="@(() => ConfirmDelete($"modem:{modem.Id}"))">Delete</button>
+                                        }
                                     </div>
                                 </td>
                             </tr>
@@ -1362,26 +1409,36 @@
             }
             else
             {
-                <p class="empty-state">No modems configured. Scan for modems above or add one manually.</p>
+                <p class="empty-state">No modems configured. Scan for Ubiquiti modems above, or add any modem below.</p>
             }
 
             <!-- Manual Add Form (collapsed by default, expands when editing) -->
             <details class="add-form" open="@modemFormExpanded">
-                <summary @onclick="() => modemFormExpanded = !modemFormExpanded">@(editingModem?.Id > 0 ? "Edit Modem" : "Add Modem Manually")</summary>
+                <summary @onclick="() => modemFormExpanded = !modemFormExpanded">
+                    @(editingModem?.Id > 0 ? "Edit Modem" : "Add a Modem")
+                    @* Inside the summary so it shows while the form is collapsed. *@
+                    @if (!(editingModem?.Id > 0))
+                    {
+                        <small class="form-help add-form-summary-help">
+                            Ubiquiti modems are found automatically above. Add any other modem here: Netgear Nighthawk, GL-iNet / Quectel, Inseego FX, Zyxel or MikroTik.
+                        </small>
+                    }
+                </summary>
                 <div class="add-form-content">
-                    <p class="form-help" style="margin-bottom: 1rem;">
-                        Only use manual entry if auto-discovery doesn't find your modem.
-                    </p>
 
                     @if (editingModem != null)
                     {
                         <div class="form-row">
                             <div class="form-group" style="flex: 2;">
                                 <label class="form-label">Provider</label>
-                                <select class="form-control" @bind="editingModem.Provider">
+                                <select class="form-control" @bind="editingModem.Provider" @bind:after="OnModemProviderChanged">
                                     <option value="qmicli">Ubiquiti modem (SSH)</option>
+                                    <option value="unifi-gateway">UniFi UDR-5G-Max (Gateway SSH)</option>
                                     <option value="netgear-nighthawk-hotspot">Netgear Nighthawk hotspot (HTTP)</option>
                                     <option value="quectel-at">GL-iNet / Quectel modem (SSH)</option>
+                                    <option value="inseego-fx">Inseego FX gateway (HTTPS)</option>
+                                    <option value="zyxel-cpe">Zyxel 5G/LTE CPE (HTTPS)</option>
+                                    <option value="mikrotik-routeros">MikroTik RouterOS (SSH)</option>
                                 </select>
                                 <small class="form-help">Selects the transport used to poll this modem.</small>
                             </div>
@@ -1394,8 +1451,13 @@
                         <div class="form-row">
                             <div class="form-group" style="flex: 2;">
                                 <label class="form-label">Host / IP</label>
-                                <input type="text" class="form-control" @bind="editingModem.Host" @bind:event="oninput" placeholder="192.168.1.100" />
-                                @if (!IsUniFiSshModem(editingModem.Provider))
+                                <input type="text" class="form-control" @bind="editingModem.Host" @bind:event="oninput" placeholder="192.168.1.100"
+                                       disabled="@ModemProviderKeys.UsesGatewaySsh(editingModem.Provider)" />
+                                @if (ModemProviderKeys.UsesGatewaySsh(editingModem.Provider))
+                                {
+                                    <small class="form-help">The modem is built into the gateway, so it is polled at the Gateway SSH host with the Gateway SSH credentials. <a href="#gateway-ssh">Gateway SSH Settings</a></small>
+                                }
+                                else if (!IsUniFiSshModem(editingModem.Provider))
                                 {
                                     <small class="form-help">
                                         Can you only reach the management page of this device when directly connected?
@@ -1409,22 +1471,43 @@
                             </div>
                         </div>
 
-                        @if (editingModem.Provider == "qmicli")
+                        @if (ModemProviderKeys.IsUniFi(editingModem.Provider))
                         {
                             <div class="form-row">
                                 <div class="form-group" style="flex: 2;">
                                     <label class="form-label">QMI Device Path (optional)</label>
                                     <input type="text" class="form-control" @bind="editingModem.QmiDevice" @bind:event="oninput" placeholder="" />
-                                    <small class="form-help">Stats are polled automatically via uiwwand. Only needed as a fallback if uiwwand is unavailable on your firmware. LTE: <code>/dev/cdc-wdm0</code> · 5G-Max: <code>/dev/wwan0qmi0</code> · U5G-Backup: <code>qrtr://3</code></small>
+                                    <small class="form-help">Stats are polled automatically via uiwwand. Only needed as a fallback if uiwwand is unavailable on your firmware. LTE: <code>/dev/cdc-wdm0</code> · 5G-Max: <code>/dev/wwan0qmi0</code> · U5G-Backup: <code>qrtr://3</code> · UDR-5G-Max: <code>/dev/mhi_0308_02.01.00_pipe_12</code></small>
                                 </div>
                             </div>
                         }
-                        else if (editingModem.Provider == "quectel-at")
+                        else if (editingModem.Provider == ModemProviderKeys.MikroTikRouterOs)
                         {
                             <div class="form-row">
                                 <div class="form-group" style="flex: 1;">
                                     <label class="form-label">SSH Username</label>
-                                    <input type="text" class="form-control" @bind="editingModem.Username" @bind:event="oninput" placeholder="root" />
+                                    <input type="text" class="form-control" @bind="editingModem.Username" @bind:event="oninput" placeholder="netopt" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
+                                    <small class="form-help">A read-only user is enough: <code>/user add name=netopt group=read password=...</code></small>
+                                </div>
+                                <div class="form-group" style="flex: 1;">
+                                    <label class="form-label">SSH Password</label>
+                                    <input type="password" class="form-control" @bind="editingModem.Password" @bind:event="oninput" autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore />
+                                </div>
+                                <div class="form-group" style="flex: 1;">
+                                    <label class="form-label">LTE Interface (optional)</label>
+                                    <input type="text" class="form-control" @bind="editingModem.QmiDevice" @bind:event="oninput" placeholder="e.g. lte1" />
+                                    <small class="form-help">Leave empty when the router has one LTE interface. Set it when there is more than one.</small>
+                                </div>
+                            </div>
+
+                            @ModemManagedKeyField
+                        }
+                        else if (ModemProviderKeys.UsesPerModemSsh(editingModem.Provider))
+                        {
+                            <div class="form-row">
+                                <div class="form-group" style="flex: 1;">
+                                    <label class="form-label">SSH Username</label>
+                                    <input type="text" class="form-control" @bind="editingModem.Username" @bind:event="oninput" placeholder="root" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
                                 </div>
                                 <div class="form-group" style="flex: 1;">
                                     <label class="form-label">SSH Password</label>
@@ -1436,18 +1519,47 @@
                                     <small class="form-help">Leave empty to auto-detect. Set this only if detection fails: <code>cpu</code> for a modem built into the router, or a USB path like 1-1.2 for a plug-in module.</small>
                                 </div>
                             </div>
+
+                            @ModemManagedKeyField
                         }
-                        else if (editingModem.Provider == "netgear-nighthawk-hotspot")
+                        else if (editingModem.Provider is "netgear-nighthawk-hotspot" or "inseego-fx" or "zyxel-cpe")
                         {
                             <div class="form-row">
-                                <div class="form-group" style="flex: 2;">
-                                    <label class="form-label">Admin Password (optional)</label>
-                                    <input type="password" class="form-control" @bind="editingModem.Password" @bind:event="oninput" placeholder="Leave empty for anonymous mode" autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore />
-                                    <small class="form-help">
-                                        Without a password, signal/band/cell metrics are still polled.
-                                        Setting the admin password unlocks throughput counters.
-                                    </small>
-                                </div>
+                                @if (editingModem.Provider == "zyxel-cpe")
+                                {
+                                    <div class="form-group" style="flex: 1;">
+                                        <label class="form-label">Username</label>
+                                        <input type="text" class="form-control" @bind="editingModem.Username" @bind:event="oninput" placeholder="admin" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
+                                    </div>
+                                    <div class="form-group" style="flex: 1;">
+                                        <label class="form-label">Password</label>
+                                        <input type="password" class="form-control" @bind="editingModem.Password" @bind:event="oninput" autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore />
+                                        <small class="form-help">
+                                            Use a dedicated account (Maintenance - User Account - Add New Account, Group: User) with an Idle Timeout above the poll interval. The router allows one session per account, so polling as admin signs you out of its web interface.
+                                        </small>
+                                    </div>
+                                }
+                                else if (editingModem.Provider == "inseego-fx")
+                                {
+                                    <div class="form-group" style="flex: 2;">
+                                        <label class="form-label">Admin Password</label>
+                                        <input type="password" class="form-control" @bind="editingModem.Password" @bind:event="oninput" autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore />
+                                        <small class="form-help">
+                                            The password for the gateway's web interface. Signal data is only available when signed in.
+                                        </small>
+                                    </div>
+                                }
+                                else
+                                {
+                                    <div class="form-group" style="flex: 2;">
+                                        <label class="form-label">Admin Password (optional)</label>
+                                        <input type="password" class="form-control" @bind="editingModem.Password" @bind:event="oninput" placeholder="Leave empty for anonymous mode" autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore />
+                                        <small class="form-help">
+                                            Without a password, signal/band/cell metrics are still polled.
+                                            Setting the admin password unlocks throughput counters.
+                                        </small>
+                                    </div>
+                                }
                                 <div class="form-group" style="flex: 1; display: flex; align-items: flex-end;">
                                     <button class="btn btn-secondary" type="button" @onclick="ProbeModem" disabled="@probingModem">
                                         @if (probingModem)
@@ -1544,8 +1656,14 @@
             {
                 <div class="form-group">
                     <label class="checkbox-label">
-                        <input type="checkbox" @bind="_monitoringSettings.ShowCmTab" @bind:after="SaveTabVisibilityAsync" />
+                        <input type="checkbox" data-autosave @bind="_monitoringSettings.ShowCmTab" @bind:after="SaveTabVisibilityAsync" />
                         <span>Show the CM Stats tab in Monitoring</span>
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" data-autosave checked="@_monitoringSettings.CmErrorCountersLast24h" @onchange="e => SetCmErrorWindowAsync(e.Value is true)" />
+                        <span>Limit error counters on Dashboard Cards to last 24 hours</span>
                     </label>
                 </div>
             }
@@ -1581,7 +1699,7 @@
                                         <span class="status-badge status-disconnected">Disabled</span>
                                     }
                                 </td>
-                                <td>@(cm.LastPolled?.ToLocalTime().ToString("g") ?? "Never")</td>
+                                <td>@(cm.LastPolled?.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DateTime, DisplayFormat.Culture) ?? "Never")</td>
                                 <td>
                                     <div class="btn-group-wrap">
                                         <button class="btn btn-secondary btn-sm" @onclick="() => EditCm(cm)">Edit</button>
@@ -1605,7 +1723,18 @@
                                                 <span>@(cm.Enabled ? "Disable" : "Enable")</span>
                                             }
                                         </button>
-                                        <button class="btn btn-danger btn-sm" @onclick="() => DeleteCm(cm.Id)">Delete</button>
+                                        @if (_confirmDeleteKey == $"cm:{cm.Id}")
+                                        {
+                                            <span class="confirm-inline">
+                                                <span class="confirm-text">Delete?</span>
+                                                <button class="btn btn-danger btn-sm" @onclick="() => DeleteCm(cm.Id)">Yes, delete</button>
+                                                <button class="btn btn-secondary btn-sm" @onclick="CancelConfirmDelete">Cancel</button>
+                                            </span>
+                                        }
+                                        else
+                                        {
+                                            <button class="btn btn-danger btn-sm" @onclick="@(() => ConfirmDelete($"cm:{cm.Id}"))">Delete</button>
+                                        }
                                     </div>
                                 </td>
                             </tr>
@@ -1629,18 +1758,62 @@
                         </div>
                         <div class="form-group" style="flex: 2;">
                             <label class="form-label">Provider</label>
-                            <select class="form-control" @bind="_editingCm.Provider">
+                            <select class="form-control" @bind="_editingCm.Provider" @bind:after="OnCmProviderChanged">
+                                <option value="" disabled>Select a provider...</option>
                                 <option value="arris-surfboard">ARRIS Surfboard (HTTP)</option>
                                 <option value="arris-surfboard-hnap">ARRIS Surfboard S33/S34 (HNAP)</option>
+                                <option value="fritzbox-cable">FRITZ!Box Cable (HTTP)</option>
+                                <option value="hitron-coda">Hitron CODA (HTTP)</option>
                                 <option value="motorola-hnap">Motorola MB8611, MB8600 (HNAP)</option>
                                 <option value="netgear">Netgear / Nighthawk CM (HTTP)</option>
+                                <option value="sagemcom-f3896lg">Sagemcom F3896LG: Virgin Media Hub 5, Ziggo SmartWifi (HTTP)</option>
                                 <option value="technicolor-cga">Technicolor CGA Series (HTTP)</option>
+                                <option value="unifi-uci">UniFi Cable Internet (UCI)</option>
                                 <option value="vodafone-station">Vodafone Station (ARRIS TG3442DE)</option>
-                                <option value="xfinity-gateway">Xfinity XB8/XB10, Comcast Business CGA4332, Cox CGM4981 (HTTP)</option>
+                                <option value="xfinity-gateway">Xfinity XB7/XB8/XB10, Comcast Business CGA4332, Cox CGM4981 (HTTP)</option>
                             </select>
+                            @if (_editingCm.Provider == "fritzbox-cable")
+                            {
+                                <small class="form-help">Error totals cover DOCSIS 3.0 channels; OFDM error counts are not collected.</small>
+                            }
                         </div>
                     </div>
 
+                    @if (IsCmUciProvider(_editingCm.Provider))
+                    {
+                        <div class="form-row">
+                            <div class="form-group" style="flex: 2;">
+                                <label class="form-label">UniFi Cable Internet</label>
+                                @if (_cmUciDevices.Count == 0)
+                                {
+                                    <div class="alert alert-info" style="padding: 0.5rem 0.75rem; margin-bottom: 0.5rem;">No UniFi Cable Internet is adopted in this site's UniFi Console.</div>
+                                }
+                                else
+                                {
+                                    <select class="form-control" @bind="_editingCm.Host">
+                                        <option value="">Select a UCI...</option>
+                                        @foreach (var (mac, name) in _cmUciDevices)
+                                        {
+                                            <option value="@mac">@name (@mac)</option>
+                                        }
+                                    </select>
+                                }
+                                <small class="form-help">
+                                    Stats come from the On-Site Agent on the Gateway, which reads the updates the UCI sends through it.
+                                    @if (!_cmUciAgentReady)
+                                    {
+                                        <a href="/settings?tab=multisite">Install or update the On-Site Agent on the Gateway</a><text> to start them.</text>
+                                    }
+                                </small>
+                            </div>
+                            <div class="form-group" style="flex: 1;">
+                                <label class="form-label">Polling Interval (sec)</label>
+                                <input type="number" class="form-control" @bind="_editingCm.PollingIntervalSeconds" @bind:event="oninput" min="60" max="3600" />
+                            </div>
+                        </div>
+                    }
+                    else if (!string.IsNullOrEmpty(_editingCm.Provider))
+                    {
                     <div class="form-row">
                         <div class="form-group" style="flex: 2;">
                             <label class="form-label">Host / IP</label>
@@ -1656,18 +1829,35 @@
                         </div>
                     </div>
 
+                    @if (CmCredentialsFor(_editingCm.Provider) != NetworkOptimizer.Monitoring.Providers.CmCredentialRequirement.None)
+                    {
                     <div class="form-row">
                         <div class="form-group" style="flex: 1;">
                             <label class="form-label">Username</label>
-                            <input type="text" class="form-control" @bind="_editingCm.Username" @bind:event="oninput" placeholder="admin" />
+                            <input type="text" class="form-control" @bind="_editingCm.Username" @bind:event="oninput"
+                                   placeholder="@(CmProviderFor(_editingCm.Provider)?.BlankUsername ?? "")"
+                                   autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
+                            @if (_editingCm.Provider == "fritzbox-cable")
+                            {
+                                <small class="form-help">Enter your FRITZ!Box account name; it may differ from admin.</small>
+                            }
                         </div>
                         <div class="form-group" style="flex: 1;">
                             <label class="form-label">Password</label>
                             <input type="password" class="form-control" @bind="_editingCm.Password" @bind:event="oninput"
                                    placeholder="@(_editingCm.Id > 0 && !string.IsNullOrEmpty(_editingCm.Password) ? "••••••••" : "")"
                                    autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore />
+                            @if (CmCredentialsFor(_editingCm.Provider) == NetworkOptimizer.Monitoring.Providers.CmCredentialRequirement.Required)
+                            {
+                                <small class="form-help">Required for this modem.</small>
+                            }
+                            else
+                            {
+                                <small class="form-help">Only some models need a login. Leave both blank if yours has none.</small>
+                            }
                         </div>
                     </div>
+                    }
 
                     <div class="form-row">
                         <div class="form-group" style="flex: 2;">
@@ -1681,6 +1871,7 @@
                             <input type="number" class="form-control" @bind="_editingCm.PollingIntervalSeconds" @bind:event="oninput" min="60" max="3600" />
                         </div>
                     </div>
+                    }
 
                     <div class="form-group">
                         <label class="checkbox-label">
@@ -1725,7 +1916,7 @@
     </div>
 
     <!-- ONT Device Monitoring -->
-    <div class="card settings-tab-monitoring" id="ont-monitoring">
+    <div class="card settings-tab-monitoring" id="ont-monitoring" data-tour="ont-monitoring">
         <div class="card-header">
             <div class="card-header-left">
                 <h2 class="card-title">ONT Device Monitoring</h2>
@@ -1747,8 +1938,14 @@
             {
                 <div class="form-group">
                     <label class="checkbox-label">
-                        <input type="checkbox" @bind="_monitoringSettings.ShowOntTab" @bind:after="SaveTabVisibilityAsync" />
+                        <input type="checkbox" data-autosave @bind="_monitoringSettings.ShowOntTab" @bind:after="SaveTabVisibilityAsync" />
                         <span>Show the ONT Stats tab in Monitoring</span>
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" data-autosave checked="@_monitoringSettings.OntErrorCountersLast24h" @onchange="e => SetOntErrorWindowAsync(e.Value is true)" />
+                        <span>Limit error counters on Dashboard Cards to last 24 hours</span>
                     </label>
                 </div>
             }
@@ -1773,7 +1970,13 @@
                             <tr>
                                 <td>@ont.Name</td>
                                 <td><code>@ont.Host</code></td>
-                                <td>@GetOntProviderDisplayName(ont.Provider)</td>
+                                <td>
+                                    @GetOntProviderDisplayName(ont.Provider)
+                                    @if (ont.AttachedSfpId is int attachedId)
+                                    {
+                                        <span class="status-badge status-info" data-tooltip="@OntAttachmentTooltip(attachedId)" style="margin-left: 0.5rem;">SFP</span>
+                                    }
+                                </td>
                                 <td>
                                     @if (ont.Enabled)
                                     {
@@ -1784,7 +1987,7 @@
                                         <span class="status-badge status-disconnected">Disabled</span>
                                     }
                                 </td>
-                                <td>@(ont.LastPolled?.ToLocalTime().ToString("g") ?? "Never")</td>
+                                <td>@(ont.LastPolled?.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DateTime, DisplayFormat.Culture) ?? "Never")</td>
                                 <td>
                                     <div class="btn-group-wrap">
                                         <button class="btn btn-secondary btn-sm" @onclick="() => EditOnt(ont)">Edit</button>
@@ -1808,7 +2011,18 @@
                                                 <span>@(ont.Enabled ? "Disable" : "Enable")</span>
                                             }
                                         </button>
-                                        <button class="btn btn-danger btn-sm" @onclick="() => DeleteOnt(ont.Id)">Delete</button>
+                                        @if (_confirmDeleteKey == $"ont:{ont.Id}")
+                                        {
+                                            <span class="confirm-inline">
+                                                <span class="confirm-text">Delete?</span>
+                                                <button class="btn btn-danger btn-sm" @onclick="() => DeleteOnt(ont.Id)">Yes, delete</button>
+                                                <button class="btn btn-secondary btn-sm" @onclick="CancelConfirmDelete">Cancel</button>
+                                            </span>
+                                        }
+                                        else
+                                        {
+                                            <button class="btn btn-danger btn-sm" @onclick="@(() => ConfirmDelete($"ont:{ont.Id}"))">Delete</button>
+                                        }
                                     </div>
                                 </td>
                             </tr>
@@ -1835,18 +2049,21 @@
                             <select class="form-control" value="@_editingOnt.Provider" @onchange="OnOntProviderChanged">
                                 <option value="att-gateway">AT&T Gateway (HTTP)</option>
                                 <option value="realtek-ont">Realtek ONT Stick (HTTP)</option>
+                                <option value="odi-oss">odi-oss GPON Stick (Prometheus)</option>
                                 <option value="8311">8311 Community Firmware (HTTP)</option>
                                 <option value="quantum-q1000k">Quantum Fiber Q1000K (HTTP)</option>
                                 <option value="telekom-modem2">Telekom Glasfaser-Modem 2 (HTTP)</option>
                                 <option value="nokia-xs010x-q">Nokia XS-010X-Q (HTTP)</option>
                                 <option value="zyxel-gpon-sfp">Zyxel GPON-SFP PMG3000 (HTTP)</option>
+                                <option value="richerlink-ont">Richerlink RL821GWV-D (HTTP)</option>
+                                <option value="peter-pon">Peter-Pon GPON Firmware (HTTP)</option>
                                 <option value="netopt-custom">Network Optimizer Custom (HTTP JSON)</option>
                                 <option value="generic-http-ont">Generic HTTP ONT</option>
                             </select>
                         </div>
                     </div>
 
-                    @if (_editingOnt.Provider == "netopt-custom")
+                    @if (SfpAttachableOntProviders.Contains(_editingOnt.Provider))
                     {
                         <div class="form-row">
                             <div class="form-group" style="flex: 2;">
@@ -1859,7 +2076,7 @@
                                     }
                                 </select>
                                 <small class="form-help">
-                                    Attached ONTs are polled with the gateway SFP cycle and their PON stats merge into
+                                    Attached ONTs are polled with the SFP collection cycle and their PON stats merge into
                                     the selected module's SFP Stats series; the polling interval below is ignored.
                                     Standalone ONTs show on ONT Stats instead.
                                 </small>
@@ -1885,7 +2102,7 @@
                     <div class="form-row">
                         <div class="form-group" style="flex: 1;">
                             <label class="form-label">Username</label>
-                            <input type="text" class="form-control" @bind="_editingOnt.Username" @bind:event="oninput" placeholder="admin" />
+                            <input type="text" class="form-control" @bind="_editingOnt.Username" @bind:event="oninput" placeholder="@(_editingOnt.Provider == "peter-pon" ? "root" : "admin")" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
                         </div>
                         <div class="form-group" style="flex: 1;">
                             <label class="form-label">Password</label>
@@ -1988,7 +2205,7 @@
             {
                 <div class="form-group">
                     <label class="checkbox-label">
-                        <input type="checkbox" @bind="_monitoringSettings.ShowStarlinkTab" @bind:after="SaveTabVisibilityAsync" />
+                        <input type="checkbox" data-autosave @bind="_monitoringSettings.ShowStarlinkTab" @bind:after="SaveTabVisibilityAsync" />
                         <span>Show the Starlink Stats tab in Monitoring</span>
                     </label>
                 </div>
@@ -2025,7 +2242,7 @@
                                         <span class="status-badge status-disconnected">Disabled</span>
                                     }
                                 </td>
-                                <td>@(terminal.LastPolled?.ToLocalTime().ToString("g") ?? "Never")</td>
+                                <td>@(terminal.LastPolled?.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DateTime, DisplayFormat.Culture) ?? "Never")</td>
                                 <td>
                                     <div class="btn-group-wrap">
                                         <button class="btn btn-secondary btn-sm" @onclick="() => EditStarlink(terminal)">Edit</button>
@@ -2049,7 +2266,18 @@
                                                 <span>@(terminal.Enabled ? "Disable" : "Enable")</span>
                                             }
                                         </button>
-                                        <button class="btn btn-danger btn-sm" @onclick="() => DeleteStarlink(terminal.Id)">Delete</button>
+                                        @if (_confirmDeleteKey == $"starlink:{terminal.Id}")
+                                        {
+                                            <span class="confirm-inline">
+                                                <span class="confirm-text">Delete?</span>
+                                                <button class="btn btn-danger btn-sm" @onclick="() => DeleteStarlink(terminal.Id)">Yes, delete</button>
+                                                <button class="btn btn-secondary btn-sm" @onclick="CancelConfirmDelete">Cancel</button>
+                                            </span>
+                                        }
+                                        else
+                                        {
+                                            <button class="btn btn-danger btn-sm" @onclick="@(() => ConfirmDelete($"starlink:{terminal.Id}"))">Delete</button>
+                                        }
                                     </div>
                                 </td>
                             </tr>
@@ -2143,6 +2371,74 @@
         </div>
     </div>
 
+    <!-- Live Traffic -->
+    <div class="card settings-tab-monitoring" id="live-traffic">
+        <div class="card-header">
+            <div class="card-header-left">
+                <h2 class="card-title">Live Traffic</h2>
+                <a href="/monitoring/live-traffic" class="settings-title-link" data-tooltip="Open Live Traffic">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"></path><path d="M10 14 21 3"></path><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path></svg>
+                </a>
+            </div>
+        </div>
+        <div class="card-body">
+            <p class="section-description">
+                Live Traffic shows every flow through the Gateway, with its app, protocol, and destination, and the DNS lookups behind them. The On-Site Agent on the Gateway sends that detail over its encrypted tunnel only while someone has Live Traffic open (and up to a minute after, so coming back is instant), and Network Optimizer keeps it in memory, never on disk. We've seen no appreciable CPU impact on the Gateway while it's open.
+            </p>
+
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" @bind="_liveTrafficEnabled" />
+                    <span>Enable Live Traffic flow and DNS capture</span>
+                </label>
+                <small class="form-help">Turned off, the Agent sends no flows or DNS lookups. The Live Traffic card in Live View still ranks clients by usage, which is stored per device with no app or protocol, and History still reads UniFi Network's own flow records.</small>
+            </div>
+
+            <div class="action-buttons">
+                <button class="btn btn-primary" @onclick="SaveLiveTrafficSettings" disabled="@_savingLiveTraffic">
+                    @if (_savingLiveTraffic)
+                    {
+                        <span class="spinner"></span>
+                        <span>Saving...</span>
+                    }
+                    else
+                    {
+                        <span>Save</span>
+                    }
+                </button>
+            </div>
+
+            @if (!string.IsNullOrEmpty(_liveTrafficMessage))
+            {
+                <div class="alert alert-@_liveTrafficMessageClass">@_liveTrafficMessage</div>
+            }
+        </div>
+    </div>
+
+    <!-- Live Traffic - Custom Apps -->
+    <div class="card settings-tab-monitoring" id="custom-apps">
+        <div class="card-header">
+            <div class="card-header-left">
+                <h2 class="card-title">Custom Apps</h2>
+                <a href="/monitoring/live-traffic" class="settings-title-link" data-tooltip="Open Live Traffic">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"></path><path d="M10 14 21 3"></path><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path></svg>
+                </a>
+            </div>
+        </div>
+        <div class="card-body">
+            <p class="section-description">
+                Name traffic that UniFi Network's DPI doesn't recognize, by protocol, port, and remote. Live Traffic shows these names everywhere it shows an app.
+            </p>
+            @* Mounted only on this tab: the list keeps its live counts current on a timer. *@
+            @if (_activeTab == "monitoring")
+            {
+                <SiteAdminOnly>
+                    <CustomAppsManager />
+                </SiteAdminOnly>
+            }
+        </div>
+    </div>
+
     <!-- AP Telemetry -->
     <ApTelemetryPanel Class="settings-tab-aptelemetry" Active="@(_activeTab == "aptelemetry")"
                       OnConfigureDeviceSsh="GoToDeviceSshSettingsAsync" />
@@ -2158,7 +2454,7 @@
             </div>
             @if (_multiSiteEnabled)
             {
-                <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                <ScopeBadge />
             }
         </div>
         <div class="card-body">
@@ -2168,38 +2464,45 @@
             <div class="form-row" style="display: flex; gap: 1.5rem; flex-wrap: wrap; margin-bottom: 1rem;">
                 <div class="form-group" style="margin-bottom: 0;">
                     <label class="form-label">Gateway</label>
-                    <input type="number" class="form-control" @bind="iperf3GatewayParallelStreams" @bind:event="oninput" min="1" max="16" style="width: 80px;" />
+                    <input type="number" class="form-control" @bind="iperf3GatewayParallelStreams" @bind:event="oninput" min="1" max="16" style="width: 80px;" disabled="@(!_canEditInstanceSettings)" />
                 </div>
                 <div class="form-group" style="margin-bottom: 0;">
                     <label class="form-label">UniFi Devices</label>
-                    <input type="number" class="form-control" @bind="iperf3UniFiParallelStreams" @bind:event="oninput" min="1" max="16" style="width: 80px;" />
+                    <input type="number" class="form-control" @bind="iperf3UniFiParallelStreams" @bind:event="oninput" min="1" max="16" style="width: 80px;" disabled="@(!_canEditInstanceSettings)" />
                 </div>
                 <div class="form-group" style="margin-bottom: 0;">
                     <label class="form-label">Other Devices</label>
-                    <input type="number" class="form-control" @bind="iperf3OtherParallelStreams" @bind:event="oninput" min="1" max="16" style="width: 80px;" />
+                    <input type="number" class="form-control" @bind="iperf3OtherParallelStreams" @bind:event="oninput" min="1" max="16" style="width: 80px;" disabled="@(!_canEditInstanceSettings)" />
                 </div>
             </div>
             <small class="form-help" style="display: block; margin-bottom: 1rem;">Number of parallel TCP streams (1-16). Higher values may achieve better throughput on high-bandwidth connections.</small>
 
             <div class="form-group">
                 <label class="form-label">Test Duration (seconds)</label>
-                <input type="number" class="form-control" @bind="iperf3Duration" @bind:event="oninput" min="3" max="60" style="width: 100px;" />
+                <input type="number" class="form-control" @bind="iperf3Duration" @bind:event="oninput" min="3" max="60" style="width: 100px;" disabled="@(!_canEditInstanceSettings)" />
                 <small class="form-help">Duration of each test direction (3-60 seconds)</small>
             </div>
 
-            <div class="action-buttons">
-                <button class="btn btn-success" @onclick="SaveIperf3Settings" disabled="@savingIperf3Settings">
-                    @if (savingIperf3Settings)
-                    {
-                        <span class="spinner"></span>
-                        <span>Saving...</span>
-                    }
-                    else
-                    {
-                        <span>Save Settings</span>
-                    }
-                </button>
-            </div>
+            @if (_canEditInstanceSettings)
+            {
+                <div class="action-buttons">
+                    <button class="btn btn-success" @onclick="SaveIperf3Settings" disabled="@savingIperf3Settings">
+                        @if (savingIperf3Settings)
+                        {
+                            <span class="spinner"></span>
+                            <span>Saving...</span>
+                        }
+                        else
+                        {
+                            <span>Save Settings</span>
+                        }
+                    </button>
+                </div>
+            }
+            else
+            {
+                <small class="form-help">These settings apply to every site. An Admin manages them.</small>
+            }
 
             @if (!string.IsNullOrEmpty(iperf3Message))
             {
@@ -2221,11 +2524,11 @@
             </div>
             @if (_multiSiteEnabled)
             {
-                <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                <ScopeBadge />
             }
         </div>
         <div class="card-body">
-            <p class="section-description">Configure external OpenSpeedTest servers for WAN speed testing. Deploy the speed test container to remote servers (e.g., VPS instances) and clients can test their internet speed through them. Results are reported back here automatically.</p>
+            <p class="section-description">Configure external OpenSpeedTest servers for WAN speed testing. Deploy the speed test container to remote servers (e.g., VPS instances) and clients can test their internet speed through them. Results are reported back here automatically. Install each server with its Deploy commands below.</p>
 
             @if (extServers.Count > 0)
             {
@@ -2240,25 +2543,28 @@
                                     <span class="status-badge status-active" style="font-size: 0.7rem;">Default</span>
                                 }
                             </div>
-                            <div style="color: var(--text-secondary); font-family: monospace; font-size: 0.8125rem; margin-top: 0.25rem;">@server.Url</div>
+                            <div style="color: var(--text-secondary); font-family: var(--font-mono); font-size: 0.8125rem; margin-top: 0.25rem;">@server.Url</div>
                         </div>
-                        <div style="display: flex; gap: 0.5rem; flex-shrink: 0;">
-                            @if (!server.IsDefault)
-                            {
-                                <button class="btn btn-secondary btn-sm" @onclick="() => SetDefaultExtServer(server.Id)">Set Default</button>
-                            }
-                            <button class="btn btn-secondary btn-sm" @onclick="() => StartEditExtServer(server)">Edit</button>
-                            <button class="btn btn-danger btn-sm" @onclick="() => DeleteExtServer(server.Id)" disabled="@(deletingExtServerId == server.Id)">
-                                @if (deletingExtServerId == server.Id)
+                        @if (_canEditInstanceSettings)
+                        {
+                            <div style="display: flex; gap: 0.5rem; flex-shrink: 0;">
+                                @if (!server.IsDefault)
                                 {
-                                    <span class="spinner spinner-sm"></span>
+                                    <button class="btn btn-secondary btn-sm" @onclick="() => SetDefaultExtServer(server.Id)">Set Default</button>
                                 }
-                                else
-                                {
-                                    <span>Delete</span>
-                                }
-                            </button>
-                        </div>
+                                <button class="btn btn-secondary btn-sm" @onclick="() => StartEditExtServer(server)">Edit</button>
+                                <button class="btn btn-danger btn-sm" @onclick="() => DeleteExtServer(server.Id)" disabled="@(deletingExtServerId == server.Id)">
+                                    @if (deletingExtServerId == server.Id)
+                                    {
+                                        <span class="spinner spinner-sm"></span>
+                                    }
+                                    else
+                                    {
+                                        <span>Delete</span>
+                                    }
+                                </button>
+                            </div>
+                        }
                     </div>
 
                     <div style="border-bottom: 1px solid var(--bg-tertiary);">
@@ -2270,9 +2576,9 @@
                         {
                             <div style="padding: 0 0 0.75rem;">
                                 <p style="color: var(--text-secondary); font-size: 0.8125rem; margin-bottom: 0.5rem;">Install on a new server:</p>
-                                <pre style="background: var(--bg-primary); padding: 0.75rem; border-radius: 6px; font-size: 0.8125rem; overflow-x: auto; white-space: pre-wrap; word-break: break-all;">curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/deploy-external-speedtest.sh | bash -s -- @GetOptimizerUrl() @(server.ServerId)@GetDeployPortParam(server)</pre>
+                                <pre style="background: var(--bg-primary); padding: 0.75rem; border-radius: var(--border-radius-lg); font-size: 0.8125rem; overflow-x: auto; white-space: pre-wrap; word-break: break-all;">curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/deploy-external-speedtest.sh | bash -s -- @GetOptimizerUrl() @(server.ServerId)@GetDeployPortParam(server)</pre>
                                 <p style="color: var(--text-secondary); font-size: 0.8125rem; margin-top: 0.75rem; margin-bottom: 0.5rem;">Update existing:</p>
-                                <pre style="background: var(--bg-primary); padding: 0.75rem; border-radius: 6px; font-size: 0.8125rem; overflow-x: auto;">curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/deploy-external-speedtest.sh | bash -s -- --update</pre>
+                                <pre style="background: var(--bg-primary); padding: 0.75rem; border-radius: var(--border-radius-lg); font-size: 0.8125rem; overflow-x: auto;">curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/deploy-external-speedtest.sh | bash -s -- --update</pre>
                             </div>
                         }
                     </div>
@@ -2287,7 +2593,7 @@
 
             @if (showExtServerForm)
             {
-                <div style="margin-top: 1rem; padding: 1rem; background: var(--bg-primary); border-radius: 6px;">
+                <div style="margin-top: 1rem; padding: 1rem; background: var(--bg-primary); border-radius: var(--border-radius-lg);">
                     <h4 style="color: var(--text-primary); margin-bottom: 1rem;">@(editingExtServerId.HasValue ? "Edit" : "Add") Server</h4>
 
                     @if (extServerFormScheme != "https")
@@ -2306,7 +2612,7 @@
                     {
                         <div class="form-group">
                             <label class="form-label">Server ID</label>
-                            <input type="text" class="form-control" value="@ExternalSpeedTestServer.GenerateServerId(extServerFormName)" readonly style="color: var(--text-secondary); font-family: monospace; font-size: 0.8125rem;" />
+                            <input type="text" class="form-control" value="@ExternalSpeedTestServer.GenerateServerId(extServerFormName)" readonly style="color: var(--text-secondary); font-family: var(--font-mono); font-size: 0.8125rem;" />
                             <small class="form-help">Auto-generated identifier used to link speed test results to this server</small>
                         </div>
                     }
@@ -2333,7 +2639,7 @@
                     {
                         <div class="form-group">
                             <label class="form-label">Speed Test URL (preview)</label>
-                            <input type="text" class="form-control" value="@ComputeExtServerFormUrl()" readonly style="color: var(--text-secondary); font-family: monospace; font-size: 0.8125rem;" />
+                            <input type="text" class="form-control" value="@ComputeExtServerFormUrl()" readonly style="color: var(--text-secondary); font-family: var(--font-mono); font-size: 0.8125rem;" />
                         </div>
                     }
 
@@ -2353,11 +2659,15 @@
                     </div>
                 </div>
             }
-            else
+            else if (_canEditInstanceSettings)
             {
                 <div style="margin-top: 1rem;">
                     <button class="btn btn-primary" @onclick="StartAddExtServer">+ Add Server</button>
                 </div>
+            }
+            else
+            {
+                <small class="form-help" style="display: block; margin-top: 1rem;">These servers are shared by every site. An Admin manages them.</small>
             }
 
             @if (!string.IsNullOrEmpty(extServerMessage))
@@ -2386,18 +2696,19 @@
     </AdminOnly>
 
     <!-- 10. Application Settings -->
+    <AdminOnly>
     <div class="card settings-tab-application" id="application-settings">
         <div class="card-header">
             <h2 class="card-title">Application Settings</h2>
             @if (_multiSiteEnabled)
             {
-                <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                <ScopeBadge />
             }
         </div>
         <div class="card-body">
             <div class="form-group">
                 <label class="checkbox-label">
-                    <input type="checkbox" @bind="receivePrereleaseUpdates" @bind:after="SavePrereleaseSetting" />
+                    <input type="checkbox" data-autosave @bind="receivePrereleaseUpdates" @bind:after="SavePrereleaseSetting" />
                     Receive pre-release update notifications
                 </label>
                 <p class="form-help">
@@ -2407,6 +2718,7 @@
             </div>
         </div>
     </div>
+    </AdminOnly>
     }
 
     <!-- 11. Security Audit -->
@@ -2485,6 +2797,26 @@
             </div>
 
             <div class="form-group" style="margin-top: 1.5rem;">
+                <label class="form-label">PDF: Top Threat Sources rows</label>
+                <input type="number" class="form-control" @bind="pdfTopSourcesRows" @bind:event="oninput" min="1" max="@NetworkOptimizer.Reports.ThreatSummaryData.MaxRows" style="width: 120px;" />
+                <small class="form-help">Rows in the Top Threat Sources table of the downloaded PDF. Default: @NetworkOptimizer.Reports.ThreatSummaryData.DefaultTopSourcesRows.</small>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">PDF: rows per filter category</label>
+                <input type="number" class="form-control" @bind="pdfCategoryRows" @bind:event="oninput" min="1" max="@NetworkOptimizer.Reports.ThreatSummaryData.MaxRows" style="width: 120px;" />
+                <small class="form-help">Rows in each filter category table of the downloaded PDF. Default: @NetworkOptimizer.Reports.ThreatSummaryData.DefaultCategoryRows.</small>
+            </div>
+
+            <div class="form-group" style="margin-top: 1.5rem;">
+                <label class="checkbox-label">
+                    <input type="checkbox" @bind="allowGuestPublicDns" />
+                    <span>Allow Guest / Hotspot Public DNS</span>
+                </label>
+                <small class="form-help">Leaves Guest and Hotspot networks out of DNS leak checks (port 53, DNAT, DoT, DoQ, DoH) and out of Fix it for me. Off by default: guest networks get the same DNS control as every other network.</small>
+            </div>
+
+            <div class="form-group" style="margin-top: 1.5rem;">
                 <label class="form-label">DNAT DNS Coverage: Excluded VLANs (optional)</label>
                 <input type="text" class="form-control" @bind="dnatExcludedVlans" @bind:event="oninput" placeholder="e.g., 100, 200" style="width: 240px;" />
                 <small class="form-help">Comma-separated VLAN IDs to exclude from DNAT DNS coverage checks. Use this for networks that intentionally bypass DNS redirection (e.g., management VLANs).</small>
@@ -2540,7 +2872,7 @@
             <div class="card-header-badges">
                 @if (_multiSiteEnabled && SiteContext.IsDefault)
                 {
-                    <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                    <ScopeBadge />
                 }
                 @if (alertChannels?.Count > 0)
                 {
@@ -2620,7 +2952,7 @@
 
             @if (showChannelForm)
             {
-                <div style="margin-top: 1rem; padding: 1rem; background: var(--bg-primary); border-radius: 6px;">
+                <div style="margin-top: 1rem; padding: 1rem; background: var(--bg-primary); border-radius: var(--border-radius-lg);">
                     <h4 style="color: var(--text-primary); margin-bottom: 1rem;">@(editingChannelId.HasValue ? "Edit" : "Add") Channel</h4>
 
                     <div class="form-group">
@@ -2812,7 +3144,7 @@
                             </div>
                         }
                         <div class="form-group">
-                            <label class="form-label">Time (@_serverTzAbbrev)</label>
+                            <label class="form-label">Time (@_displayTzAbbrev)</label>
                             <input type="time" class="form-control" @bind="channelDigestTime" />
                         </div>
                     }
@@ -2864,7 +3196,7 @@
             </div>
             @if (_multiSiteEnabled && SiteContext.IsDefault)
             {
-                <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                <ScopeBadge />
             }
         </div>
         <div class="card-body">
@@ -2890,7 +3222,7 @@
             {
             <div class="form-group">
                 <label class="form-label">Background Collection Interval</label>
-                <select class="form-control" @bind="threatPollInterval">
+                <select class="form-control" @bind="threatPollInterval" disabled="@(!_canEditInstanceSettings)">
                     <option value="1">Every minute</option>
                     <option value="5">Every 5 minutes</option>
                     <option value="10">Every 10 minutes</option>
@@ -2902,13 +3234,17 @@
 
             <div class="form-group">
                 <label class="form-label">Data Retention</label>
-                <select class="form-control" @bind="threatRetentionDays">
+                <select class="form-control" @bind="threatRetentionDays" disabled="@(!_canEditInstanceSettings)">
                     <option value="30">30 days</option>
                     <option value="60">60 days</option>
                     <option value="90">90 days</option>
                     <option value="180">180 days</option>
                     <option value="365">1 year</option>
                 </select>
+                @if (!_canEditInstanceSettings)
+                {
+                    <small class="form-help">The collection interval and retention apply to every site. An Admin manages them.</small>
+                }
             </div>
             }
 
@@ -2941,12 +3277,18 @@
     @if (SiteContext.IsDefault)
     {
     <!-- MaxMind GeoIP Configuration -->
+    <AdminOnly>
     <div class="card settings-tab-security" id="maxmind">
         <div class="card-header">
-            <h2 class="card-title">MaxMind GeoIP</h2>
+            <div class="card-header-left">
+                <h2 class="card-title">MaxMind GeoIP</h2>
+                <a href="/threats?tab=geographic" class="settings-title-link" data-tooltip="Open Threat Intelligence - Geographic">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"></path><path d="M10 14 21 3"></path><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path></svg>
+                </a>
+            </div>
             @if (_multiSiteEnabled)
             {
-                <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                <ScopeBadge />
             }
         </div>
         <div class="card-body">
@@ -2954,7 +3296,7 @@
                 MaxMind GeoLite2 databases add country, city, and ASN data to threat sources for geographic analysis. With credentials saved, the databases auto-download and refresh monthly.
             </p>
 
-            <div class="info-row" style="margin-bottom: 1rem; padding: 0.75rem; background: var(--bg-primary); border-radius: 6px;">
+            <div class="info-row" style="margin-bottom: 1rem; padding: 0.75rem; background: var(--bg-primary); border-radius: var(--border-radius-lg);">
                 <span class="info-label">GeoLite2 Database:</span>
                 <span class="info-value" style="color: var(--text-secondary);">@threatGeoStatus</span>
             </div>
@@ -3011,12 +3353,12 @@
             }
         </div>
     </div>
+    </AdminOnly>
     }
 
-    @* CrowdSec CTI is global (instance-wide) and lives with the rest of the global
-       threat settings on the main site only; a secondary site's Threat Intelligence
-       card points there instead of rendering the shared settings. *@
-    @if (SiteContext.IsDefault)
+    @* Where the CTI key is edited comes from ICtiSettingsAdmin: the main site here, since the key is
+       instance-wide; a multi-tenant host shows it on each tenant's sites. *@
+    @if (_ctiCardShown)
     {
     <!-- CrowdSec CTI Configuration -->
     <div class="card settings-tab-security" id="crowdsec">
@@ -3025,7 +3367,7 @@
             <div class="card-header-badges">
                 @if (_multiSiteEnabled)
                 {
-                    <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                    <ScopeBadge />
                 }
                 @if (crowdsecEnabled)
                 {
@@ -3063,7 +3405,7 @@
                     <small class="form-help">Your plan's daily lookup limit (free tier: 30)</small>
                 </div>
 
-                <div class="info-row" style="margin-top: 1rem; padding: 0.75rem; background: var(--bg-primary); border-radius: 6px;">
+                <div class="info-row" style="margin-top: 1rem; padding: 0.75rem; background: var(--bg-primary); border-radius: var(--border-radius-lg);">
                     <span class="info-label">Usage Today:</span>
                     <span class="info-value" style="color: var(--text-secondary);">@crowdsecUsageDisplay</span>
                 </div>
@@ -3107,6 +3449,14 @@
     </div>
     }
 
+    <WafConnectionCard ShowPageLink="true" />
+
+    <AutomaticBlockingCard />
+
+    <WanFloodSettingsCard />
+
+    <TrustedSourcesCard />
+
     @if (SiteContext.IsDefault)
     {
     <!-- 12. UI / Display Settings -->
@@ -3117,13 +3467,13 @@
             <h2 class="card-title">UI / Display Settings</h2>
             @if (_multiSiteEnabled)
             {
-                <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                <ScopeBadge />
             }
         </div>
         <div class="card-body">
             <div class="form-group">
                 <label class="checkbox-label">
-                    <input type="checkbox" checked="@_kioskMode" @onchange="OnKioskModeChanged" />
+                    <input type="checkbox" data-autosave checked="@_kioskMode" @onchange="OnKioskModeChanged" />
                     <span>Kiosk mode</span>
                 </label>
                 <small class="form-help">Collapses the side menu into the hamburger button at any window size, giving the content full width - handy for presenting graphs on a mini display. This preference is saved per device (this browser only).</small>
@@ -3132,13 +3482,14 @@
     </div>
 
     <!-- 13. Map / Satellite -->
+    <AdminOnly>
     <div class="card settings-tab-application" id="map">
         <div class="card-header">
             <h2 class="card-title">Satellite Imagery</h2>
             <div class="card-header-badges">
                 @if (_multiSiteEnabled)
                 {
-                    <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                    <ScopeBadge />
                 }
                 <span class="status-badge status-@(!string.IsNullOrEmpty(_mapboxToken) ? "connected" : "info")">
                     @(!string.IsNullOrEmpty(_mapboxToken) ? "Mapbox (commercial)" : "Esri (non-commercial)")
@@ -3189,6 +3540,7 @@
             }
         </div>
     </div>
+    </AdminOnly>
 
     @* Export bundles EVERY site's database, console credentials, SSH keys and the data-protection
        keys - which sign the auth cookie. ManageSettings admits a Site Admin, so the card needs its
@@ -3200,7 +3552,7 @@
             <h2 class="card-title">Data Management</h2>
             @if (_multiSiteEnabled)
             {
-                <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                <ScopeBadge />
             }
         </div>
         <div class="card-body">
@@ -3259,7 +3611,7 @@
                                     <span class="text-muted">Export type:</span>
                                     <span>@(importPreview.ExportType == "Full" ? "Full backup" : "Settings only")</span>
                                     <span class="text-muted">Export date:</span>
-                                    <span>@importPreview.ExportDate.ToLocalTime().ToString("MMM d, yyyy h:mm tt")</span>
+                                    <span>@importPreview.ExportDate.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DateTime, DisplayFormat.Culture)</span>
                                     <span class="text-muted">App version:</span>
                                     <span>@importPreview.AppVersion</span>
                                     @if (importPreview.TableCounts.Count > 0)
@@ -3425,11 +3777,12 @@
                 settings.
             </p>
 
-            @if (!_multiSiteEnabled)
+            @* Not before the flag is read: the field starts false, so an enabled instance would offer the switch. *@
+            @if (_multiSiteLoaded && !_multiSiteEnabled)
             {
                 <p class="section-description">
-                    Multi-WAN monitoring needs this on as well: the agent that probes a second WAN
-                    enrolls through here, including on the main site.
+                    Multi-WAN monitoring needs this on as well: its agent enrolls here, including on
+                    the main site.
                 </p>
                 <AdminOnly>
                     <div class="form-group">
@@ -3446,25 +3799,33 @@
                 <div class="alert alert-info multi-wan-hint">
                     <div class="multi-wan-hint-body">
                     <span class="banner-icon banner-icon-info">i</span>
-                    @* Two leads, one card. Without multi-site there is no Configuration to open and
-                       no agent to enroll, so naming those steps first would send someone looking for
-                       controls that are not on the page yet. *@
+                    @* Three leads, one card. Without multi-site there is no Configuration to open, and
+                       a site whose gateway agent is enrolled needs only the vantage step. One gateway
+                       agent covers every WAN, so the copy never implies one agent per WAN. *@
                     <p>
-                        This site has more than one WAN, but only the primary is being monitored.
-                        @if (_multiSiteEnabled)
+                        This site has more than one WAN, but only the primary is monitored.
+                        @if (!_multiSiteEnabled)
                         {
                             <text>
-                                To monitor another, open @HintSitePhrase <strong>Configuration</strong>
-                                below, use <strong>Add Agent</strong> to enroll an agent for it,
-                                then give that WAN a vantage on <strong>Monitoring - Network Performance</strong>.
+                                One agent on the UniFi gateway covers them all: turn on
+                                <strong>Enable multi-site management</strong> above to add it.
+                            </text>
+                        }
+                        else if (_hintSiteHasGatewayAgent)
+                        {
+                            <text>
+                                Your gateway agent already reaches every WAN: give each additional WAN a
+                                vantage on <a href="/monitoring?tab=performance&contexts=1"><strong>Monitoring - Network Performance</strong></a>.
                             </text>
                         }
                         else
                         {
                             <text>
-                                Start by turning on <strong>Enable multi-site management</strong> above:
-                                the agent that probes another WAN enrolls through it, including on this
-                                site. The steps for adding one appear here once it is on.
+                                One agent on the UniFi gateway covers them all: add it with
+                                <strong>Add Agent</strong> in @HintSitePhrase
+                                <a href="@($"/settings?tab=multisite&configure={SiteContext.Slug}")" @onclick="OpenHintSiteConfigurationAsync" @onclick:preventDefault="true"><strong>Configuration</strong></a>
+                                below, then give each additional WAN a vantage on
+                                <a href="/monitoring?tab=performance&contexts=1"><strong>Monitoring - Network Performance</strong></a>.
                             </text>
                         }
                     </p>
@@ -3475,6 +3836,8 @@
 
             @if (_multiSiteEnabled)
             {
+                <AllSitesBlockingAction SiteSlugs="@_sites.Where(s => s.Enabled).Select(s => s.Slug).ToList()" />
+
                 <div class="form-group">
                     <label class="form-label">Sites</label>
                     <div class="table-responsive">
@@ -3524,7 +3887,7 @@
                                             }
                                         </td>
                                         <td><code>@site.Slug</code></td>
-                                        <td class="hide-mobile">@(site.IsDefault ? "" : site.CreatedAt.ToLocalTime().ToString("MMM d, yyyy"))</td>
+                                        <td class="hide-mobile">@(site.IsDefault ? "" : site.CreatedAt.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.Date, DisplayFormat.Culture))</td>
                                         <td>
                                             @if (site.IsDefault)
                                             {
@@ -3605,7 +3968,10 @@
                                                             {
                                                                 <div class="site-agent-row">
                                                                     <span class="status-dot @(agent.Enabled && TunnelRegistry.IsAgentLive(agent) ? "online" : "offline")"></span>
-                                                                    <span>@agent.Name</span>
+                                                                    <InlineEditField Tooltip="Rename agent" Placeholder="Agent name" SiteSlug="@site.Slug"
+                                                                                     Load="() => Task.FromResult(agent.Name)" Save="name => RenameAgentAsync(site, agent, name)">
+                                                                        <span>@agent.Name</span>
+                                                                    </InlineEditField>
                                                                     @* A gateway agent names itself by its detected interface, which on a gateway is the WAN
                                                                        address - so where it lives is said in words rather than shown as an address. *@
                                                                     @if (AgentOnGateway(agent.Id))
@@ -3633,10 +3999,25 @@
                                                                         else if (TunnelRegistry.IsAgentLive(agent))
                                                                         {
                                                                             <text>Online@(TunnelRegistry.IsConnected(agent.Id) ? " (tunnel)" : "")@(agent.LastVersion != null ? $" - v{NetworkOptimizer.Core.Helpers.VersionUtilities.TrimLeadingV(NetworkOptimizer.Core.Helpers.VersionUtilities.StripBuildMetadata(agent.LastVersion))}" : "")</text>
+                                                                            @if (TunnelRegistry.IsUnstable(agent.Id))
+                                                                            {
+                                                                                <a class="status-warning" href="@AgentTunnelRegistry.ReverseProxyHelpUrl" target="_blank" rel="noopener"
+                                                                                   data-tooltip="@($"{TunnelRegistry.DescribeUnstable(agent.Id)} Click for the Reverse proxy section of the agent README.")">Reconnecting often</a>
+                                                                            }
                                                                             @if (AgentVersionOutdated(agent))
                                                                             {
-                                                                                <span class="status-warning" data-tooltip="A newer agent release (v@(NetworkOptimizer.Core.Helpers.VersionUtilities.CoreVersion(AppVersionInfo.LatestAgentVersion))) is available. Update agents whenever a release calls for it.">
+                                                                                <span class="status-warning" data-tooltip="A newer agent release (v@(AppVersionInfo.AgentVersionForDisplay(AppVersionInfo.LatestAgentVersion))) is available. Update agents whenever a release calls for it.">
                                                                                     Agent needs update
+                                                                                </span>
+                                                                                <button class="btn btn-sm btn-secondary"
+                                                                                        @onclick="() => ToggleUpgradeCommand(agent.Id)">
+                                                                                    @(_upgradeCommandAgentId == agent.Id ? "Hide" : "Upgrade")
+                                                                                </button>
+                                                                            }
+                                                                            else if (AgentUpdateAvailable(agent))
+                                                                            {
+                                                                                <span class="text-muted" data-tooltip="Agent v@(AppVersionInfo.AgentVersionForDisplay(AppVersionInfo.LatestAgentVersion)) is available. Updating is optional unless you want what it adds.">
+                                                                                    Update available
                                                                                 </span>
                                                                                 <button class="btn btn-sm btn-secondary"
                                                                                         @onclick="() => ToggleUpgradeCommand(agent.Id)">
@@ -3646,7 +4027,7 @@
                                                                         }
                                                                         else
                                                                         {
-                                                                            <text>Last seen @agent.LastSeenAt?.ToLocalTime().ToString("MMM d, h:mm tt")</text>
+                                                                            <text>Last seen @agent.LastSeenAt?.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DayTime, DisplayFormat.Culture)</text>
                                                                         }
                                                                     </span>
                                                                     <button type="button" class="btn btn-secondary btn-sm" @onclick="() => ToggleAgentEnabled(site, agent)">
@@ -3656,6 +4037,10 @@
                                                                         Remove
                                                                     </button>
                                                                 </div>
+                                                                @if (_agentRenameErrors.TryGetValue(agent.Id, out var renameError))
+                                                                {
+                                                                    <div class="form-error">@renameError</div>
+                                                                }
                                                                 @if (_upgradeCommandAgentId == agent.Id)
                                                                 {
                                                                     <div class="agent-upgrade-cmd">
@@ -3670,7 +4055,7 @@
                                                                             <p class="form-help">Bare metal (systemd) - enrollment is preserved, only the binaries update:</p>
                                                                             <CopyableCommand Text="@NativeUpgradeCommand()" Tooltip="Copy the upgrade command" />
                                                                             <p class="form-help">Docker agents instead:</p>
-                                                                            <CopyableCommand Text="cd /opt/network-optimizer-agent &amp;&amp; docker compose pull &amp;&amp; docker compose up -d"
+                                                                            <CopyableCommand Text="@DockerUpgradeCommand()"
                                                                                              Tooltip="Copy the Docker upgrade command" />
                                                                             <p class="form-help">Proxmox LXC agents - run on the host, with the container's ID:</p>
                                                                             <CopyableCommand Text="@ProxmoxUpgradeCommand()"
@@ -3719,8 +4104,8 @@
                                                             <label class="checkbox-toggle">
                                                                 <input type="checkbox" @bind="_newAgentLanSpeedTest" />
                                                                 <span><strong>LAN speed test server</strong>
-                                                                    <span class="tooltip-icon tooltip-icon-sm" data-tooltip="Hosts an OpenSpeedTest page and an iperf3 server at the site for the site's own clients" @onclick:stopPropagation="true" @onclick:preventDefault="true">?</span>
-                                                                    - lets the site's clients run speed tests against the agent.</span>
+                                                                    <span class="tooltip-icon tooltip-icon-sm" data-tooltip="Hosts an OpenSpeedTest page and an iperf3 server at the site for the site's own clients. On a gateway, a running test loads its CPU and caps results: up to 10 Gbps on the EFG and UDM-Beast, 2.5-5 Gbps on the UXG/UCG-Fiber class with IPS on, 1-2.5 Gbps on the UDR7 and other IPQ5332 gateways." @onclick:stopPropagation="true" @onclick:preventDefault="true">?</span>
+                                                                    - lets the site's clients run speed tests against the agent. A separate box at the site is the recommended host; a high-end gateway (EFG, UDM-Beast, UXG/UCG-Fiber class) can host it too.</span>
                                                             </label>
                                                             <AgentInstallInstructions Token="@_newAgentToken" AgentId="@_newAgentId" TokenChanged="@(t => _newAgentToken = t)" LanSpeedTest="@_newAgentLanSpeedTest" SiteSlug="@site.Slug" />
                                                         }
@@ -3762,7 +4147,19 @@
                                                                     a minute.
                                                                 </label>
                                                             }
+                                                            <AdminOnly>
+                                                                <label class="checkbox-toggle">
+                                                                    <input type="checkbox" checked="@site.HasNoConsole"
+                                                                           @onchange="e => ToggleHasNoConsole((bool)e.Value!)" />
+                                                                    No UniFi Console at this site - this install only hosts your other sites.
+                                                                    Leaves it out of Site Health and console checks.
+                                                                </label>
+                                                            </AdminOnly>
                                                         </div>
+
+                                                        <AuthorizeView Policy="@Policies.SiteAdmin" Resource="@site.Slug" Context="blockingAdmin">
+                                                            <SiteBlockingSection SiteSlug="@site.Slug" />
+                                                        </AuthorizeView>
                                                     }
                                                     else
                                                     {
@@ -3811,6 +4208,10 @@
                                                             </div>
                                                         </div>
 
+                                                        <AuthorizeView Policy="@Policies.SiteAdmin" Resource="@site.Slug" Context="blockingAdmin">
+                                                            <SiteBlockingSection SiteSlug="@site.Slug" />
+                                                        </AuthorizeView>
+
                                                         @* A site's lifecycle is instance work, not site work: removing one destroys its
                                                            database and agent enrollments and hands a licence slot back, and disabling one
                                                            hides it from the switcher - which would strand the very Site Admin who did it,
@@ -3856,6 +4257,13 @@
                     </div>
                 </div>
 
+                @if (!string.IsNullOrEmpty(_multiSiteMessage))
+                {
+                    <div class="alert alert-@_multiSiteMessageClass">@_multiSiteMessage</div>
+                }
+
+                <TrustedSourcesMatrix Sites="@_sites.Where(s => s.Enabled).ToList()" />
+
                 @* The wizard shows its own first step (Add a site) only to an Admin; a Site Admin
                    reaches the later steps through Set up agent on their own row. Switching site
                    management off is instance-level and stays Admin-only below. *@
@@ -3879,11 +4287,6 @@
                     </div>
                 </details>
                 </AdminOnly>
-            }
-
-            @if (!string.IsNullOrEmpty(_multiSiteMessage))
-            {
-                <div class="alert alert-@_multiSiteMessageClass">@_multiSiteMessage</div>
             }
         </div>
     </div>
@@ -3948,12 +4351,15 @@
         ["gateway-ssh"] = "connection",
         ["device-ssh"] = "connection",
         ["ssh-key"] = "connection",
+        ["tailscale"] = "connection",
         ["monitoring"] = "monitoring",
         ["sqm-monitor"] = "monitoring",
         ["cellular-modem"] = "monitoring",
         ["cable-modem"] = "monitoring",
         ["ont-monitoring"] = "monitoring",
         ["starlink"] = "monitoring",
+        ["live-traffic"] = "monitoring",
+        ["custom-apps"] = "monitoring",
         ["ap-telemetry"] = "aptelemetry",
         ["speed-test-settings"] = "speedtests",
         ["external-speedtest-settings"] = "speedtests",
@@ -3962,6 +4368,13 @@
         ["threat-intelligence"] = "security",
         ["maxmind"] = "security",
         ["crowdsec"] = "security",
+        ["waf"] = "security",
+        ["automatic-blocking"] = "security",
+        ["blocking-exceptions"] = "security",
+        ["wan-flood-protection"] = "security",
+        ["trusted-sources"] = "security",
+        ["trusted-sources-matrix"] = "multisite",
+        ["time-zone"] = "application",
         ["admin-password"] = "application",
         ["licensing"] = "application",
         ["application-settings"] = "application",
@@ -3971,6 +4384,7 @@
         ["data-management"] = "application",
         ["identity-users"] = "identity",
         ["identity-access"] = "identity",
+        ["identity-roles"] = "identity",
         ["identity-sign-in"] = "identity",
         ["multi-site"] = "multisite",
         ["site-agent-setup"] = "multisite",
@@ -4047,7 +4461,11 @@
             if (await db.WanContexts.AnyAsync(c => c.AgentId != null)) return;
 
             _showMultiWanHint = await UiHints.ShouldShowAsync(UiHintKeys.MultiWanVantageSetup);
-            if (_showMultiWanHint) StateHasChanged();
+            if (_showMultiWanHint)
+            {
+                await UpdateHintGatewayAgentAsync();
+                StateHasChanged();
+            }
         }
         catch (Exception ex)
         {
@@ -4056,6 +4474,31 @@
             // with one WAN advice about its second.
             Logger.LogDebug(ex, "Could not decide the multi-WAN vantage hint; leaving it hidden");
         }
+    }
+
+    /// <summary>
+    /// Whether the current site already has an agent on its UniFi gateway, which reaches every WAN,
+    /// so the multi-WAN card skips the Add Agent step. Refreshed with the agent poll, so an agent
+    /// installed while the page is open changes the advice.
+    /// </summary>
+    private bool _hintSiteHasGatewayAgent;
+
+    private async Task UpdateHintGatewayAgentAsync()
+    {
+        if (!_showMultiWanHint || !_multiSiteEnabled) return;
+        if (_sites.FirstOrDefault(s => s.Slug == SiteContext.Slug) is not { } site) return;
+        await LoadAgentsOnGatewayAsync(site);
+        _hintSiteHasGatewayAgent = SiteHasGatewayAgent(site.Id);
+    }
+
+    /// <summary>The card's Configuration link: opens the current site's panel in place.</summary>
+    private async Task OpenHintSiteConfigurationAsync()
+    {
+        if (_sites.FirstOrDefault(s => s.Slug == SiteContext.Slug) is not { } site) return;
+        if (_expandedSiteId != site.Id) await ToggleAgents(site.Id);
+        await Task.Delay(300);
+        await JS.InvokeVoidAsync("noHighlightTarget", $"site-config-{site.Id}", "center",
+            "0 0 var(--border-radius-lg) var(--border-radius-lg)");
     }
 
     private async Task DismissMultiWanHintAsync()
@@ -4083,8 +4526,9 @@
 
     protected override void OnParametersSet()
     {
-        // Handle query param changes when already on this page (Blazor reuses the component)
-        if (TabParam != _lastTabParam && _lastTabParam != null)
+        // Handle query param changes when already on this page (Blazor reuses the component). A page
+        // opened from a #card link has no tab param, so a later ?tab= link must still switch from null.
+        if (TabParam != _lastTabParam)
         {
             var newTab = ResolveTab(TabParam);
             if (newTab != _activeTab)
@@ -4096,7 +4540,16 @@
             }
         }
         _lastTabParam = TabParam;
+
+        // A new ?configure= link (the agent banner, clicked again from another tab) opens its row again.
+        if (ConfigureSiteParam != _lastConfigureSiteParam)
+        {
+            _configureSiteHandled = false;
+            _lastConfigureSiteParam = ConfigureSiteParam;
+        }
     }
+
+    private string? _lastConfigureSiteParam;
 
     private async Task HandleFragmentNavigationAsync()
     {
@@ -4161,6 +4614,18 @@
             return;
         }
 
+        // Lives on another page (the account Security page): go there and ring it once it renders.
+        if (!hit.Entry.Route.StartsWith("/settings", StringComparison.OrdinalIgnoreCase))
+        {
+            NavigationManager.NavigateTo(hit.Entry.Route);
+            if (!string.IsNullOrEmpty(hit.Entry.Anchor))
+            {
+                await Task.Delay(300);
+                await JS.InvokeVoidAsync("noHighlightTarget", hit.Entry.Anchor);
+            }
+            return;
+        }
+
         var tab = ResolveTab(hit.Entry.Key);
 
         // A route carrying more than its tab carries the part a tab switch cannot reproduce: the
@@ -4193,6 +4658,27 @@
         await ScrollToAndHighlightAsync("device-ssh");
     }
 
+    // One heading, the opt-in under it, and the key details only once the modem uses it. Shared by the
+    // MikroTik and GL-iNet/Quectel forms so the two cannot drift.
+    private RenderFragment ModemManagedKeyField => @<text>
+        <div class="form-group">
+            <label class="form-label">Managed SSH Key</label>
+            <label class="checkbox-label">
+                <input type="checkbox" @bind="editingModem.UseManagedSshKey" />
+                <span>Use for this modem</span>
+            </label>
+            @if (editingModem.UseManagedSshKey)
+            {
+                @* With no key yet the row below offers to set one up; the password is not optional until then. *@
+                @if (_sshKey is not null)
+                {
+                    <small class="form-help">Install its public key on the modem first. With this on, the password is optional.</small>
+                }
+                <SshKeyRow Key="_sshKey" OnManage="ShowSshKeyPanel" ShowLabel="false" />
+            }
+        </div>
+    </text>;
+
     /// <summary>Takes the reader to the SSH Key panel from a key row elsewhere on this page.</summary>
     private async Task ShowSshKeyPanel()
     {
@@ -4212,6 +4698,7 @@
     </button>;
 
     private bool _multiSiteEnabled = false;
+    private bool _multiSiteLoaded;
     private List<Site> _sites = new();
     private string _multiSiteMessage = "";
     private string _multiSiteMessageClass = "";
@@ -4219,6 +4706,7 @@
     private async Task LoadMultiSiteSettings()
     {
         _multiSiteEnabled = await SiteManagement.IsMultiSiteEnabledAsync();
+        _multiSiteLoaded = true;
         if (_multiSiteEnabled)
         {
             _sites = await SiteManagement.GetSitesAsync();
@@ -4237,12 +4725,16 @@
                     await InvokeAsync(async () =>
                     {
                         await LoadAgentsAsync();
+                        await UpdateHintGatewayAgentAsync();
                         if (_expandedSiteId is int openId && _sites.FirstOrDefault(s => s.Id == openId) is { } openSite)
                         {
                             await LoadAgentsOnGatewayAsync(openSite);
                             await LoadSpeedTestHostAsync(openSite);
                             _collectorAgentIds[openSite.Slug] = await ProbeSink.GetCollectorAgentIdAsync(openSite.Slug);
                         }
+                        // An agent enrolling mid-setup adds rows above the wizard.
+                        if (_setupWizard?.InProgress == true)
+                            await JS.InvokeVoidAsync("noHoldScroll", SiteSetupWizard.ElementId);
                         StateHasChanged();
                     });
                 }
@@ -4275,8 +4767,28 @@
         }
     }
 
+    // Floating Save and unsaved-changes prompts for every card (wwwroot/js/settings-section-save.js).
+    private IJSObjectReference? _sectionSave;
+    private ElementReference _settingsContainer;
+
+    private async Task ConfirmLeaveAsync(LocationChangingContext context)
+    {
+        if (_sectionSave == null) return;
+        try
+        {
+            if (!await _sectionSave.InvokeAsync<bool>("confirmLeave", context.TargetLocation))
+                context.PreventNavigation();
+        }
+        catch (Exception ex) when (ex is JSDisconnectedException or JSException or TaskCanceledException)
+        {
+            // Fails open: a prompt that cannot run never keeps anyone on the page.
+        }
+    }
+
     public void Dispose()
     {
+        if (_sectionSave != null)
+            _ = _sectionSave.InvokeVoidAsync("unmount").AsTask().ContinueWith(_ => _sectionSave.DisposeAsync().AsTask());
         DisposeTimers(_clientSpeedTestTargetDebounce);
         DisposeTimers(_clientSpeedTestTargetSavedTimers);
         SiteChangeNotifier.SitesChanged -= OnSiteRegistryChanged;
@@ -4328,6 +4840,21 @@
         StateHasChanged();
     }
 
+    private async Task ToggleHasNoConsole(bool value)
+    {
+        try
+        {
+            await SiteManagement.SetDefaultSiteHasNoConsoleAsync(value);
+        }
+        catch (Exception ex)
+        {
+            _multiSiteMessage = ex.Message;
+            _multiSiteMessageClass = "danger";
+            return;
+        }
+        await RefreshSites();
+    }
+
     private async Task ToggleSiteEnabled(Site site)
     {
         // Disabling pauses a live site, so it confirms; re-enabling is harmless.
@@ -4351,7 +4878,7 @@
     private async Task RemoveSite(Site site)
     {
         if (!await JS.InvokeAsync<bool>("confirm",
-                $"Remove site \"{site.Name}\" permanently? This deletes the site, its database (monitoring history, speed test results, settings), and its agent enrollments. Its InfluxDB buckets are not removed - delete those in InfluxDB if you no longer want them."))
+                $"Remove site \"{site.Name}\" permanently? This deletes the site, its database (monitoring history, speed test results, settings), its agent enrollments, its floor plan images, its report PDFs, and its InfluxDB buckets. Buckets with a custom name are kept."))
             return;
         if (!await JS.InvokeAsync<bool>("confirm",
                 $"Last check: \"{site.Name}\" and all of its data will be gone for good. This cannot be undone. Remove it?"))
@@ -4372,7 +4899,7 @@
         // it may be sitting on the agent step for the very site just deleted.
         _setupWizard?.Reset();
         _multiSiteMessage = $"Site \"{site.Name}\" was removed.";
-        _multiSiteMessageClass = "success";
+        _multiSiteMessageClass = "info";
         await RefreshSites();
     }
 
@@ -4721,12 +5248,14 @@
         timers.Clear();
     }
 
-    // An online agent reporting an older version than the manually-tracked
-    // latest agent release gets an "Update agent" callout. Tracked manually
-    // (AppVersionInfo.LatestAgentVersion) rather than compared to the server
-    // build: server releases without agent changes leave agents intentionally
-    // lagging, and that must not nag.
+    // An online agent older than the required release gets the "Agent needs update" warning; one
+    // only older than the latest release is offered the upgrade quietly. Both tracked manually in
+    // AppVersionInfo rather than compared to the server build: server releases without agent
+    // changes leave agents intentionally lagging, and that must not nag.
     private static bool AgentVersionOutdated(SiteAgent agent) =>
+        NetworkOptimizer.Core.Helpers.VersionUtilities.IsOlderThan(agent.LastVersion, AppVersionInfo.RequiredAgentVersion);
+
+    private static bool AgentUpdateAvailable(SiteAgent agent) =>
         NetworkOptimizer.Core.Helpers.VersionUtilities.IsOlderThan(agent.LastVersion, AppVersionInfo.LatestAgentVersion);
 
     // Which agent row is showing its upgrade one-liner. The install script
@@ -4743,7 +5272,10 @@
 
     private string NativeUpgradeCommand() =>
         "curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/agent/install-native.sh"
-        + $" | sudo bash -s -- --server \"{AgentServerBase()}\"";
+        + $" | sudo bash -s -- --server \"{AgentServerBase()}\""
+        + GatewayAgentCommands.ReleaseArgument(AppVersionInfo.AgentReleaseTag);
+
+    private static string DockerUpgradeCommand() => GatewayAgentCommands.DockerUpgrade(AppVersionInfo.AgentReleaseTag);
 
     // An agent in an LXC is the bare-metal agent with a container around it, so it
     // upgrades with the same script - run from the host, since that is where the
@@ -4780,7 +5312,7 @@
         if (!_speedTestHosts.TryGetValue(site.Id, out var selection) || selection.Host == null)
         {
             return selection is { AnyOnGateway: true }
-                ? "none - the agent runs on the UniFi gateway; enter a separate box hosting the speed test"
+                ? "none - the gateway agent isn't hosting the speed test; re-run it with --lan-speed-test or enter a separate box"
                 : "e.g. 192.168.1.50 or https://speed.example.com";
         }
         return $"auto: https://{selection.Host.LanIp}:{selection.Host.Port} (agent's detected LAN IP)";
@@ -4883,6 +5415,47 @@
         }
     }
 
+    // Agent id -> why its last rename did not save; shown under that agent's row.
+    private readonly Dictionary<int, string> _agentRenameErrors = new();
+
+    // Shows the new name at once and saves behind it; a failed save puts the old name back.
+    private Task<string?> RenameAgentAsync(Site site, SiteAgent agent, string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return Task.FromResult<string?>("Enter a name.");
+        _agentRenameErrors.Remove(agent.Id);
+        if (name == agent.Name)
+            return Task.FromResult<string?>(null);
+
+        var previous = agent.Name;
+        agent.Name = name;
+        _ = SaveAgentNameAsync(site, agent, previous, name);
+        return Task.FromResult<string?>(null);
+    }
+
+    private async Task SaveAgentNameAsync(Site site, SiteAgent agent, string previous, string name)
+    {
+        string? error;
+        try
+        {
+            error = await AgentEnrollment.RenameAgentAsync(site.Slug, agent.Id, name)
+                ? null : "This agent is no longer on this site.";
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+        }
+        if (error == null)
+            return;
+        await InvokeAsync(() =>
+        {
+            if (agent.Name == name)
+                agent.Name = previous;
+            _agentRenameErrors[agent.Id] = $"Rename not saved: {error}";
+            StateHasChanged();
+        });
+    }
+
     private async Task ToggleAgentEnabled(Site site, SiteAgent agent)
     {
         await AgentEnrollment.SetEnabledAsync(site.Slug, agent.Id, !agent.Enabled);
@@ -4909,7 +5482,6 @@
     private string controllerApiKey = "";
     private bool useApiKeyAuth = false;
     private string controllerSite = "default";
-    private bool rememberCredentials = true;
     private bool ignoreControllerSSLErrors = true;
     private string controllerStatus = "Disconnected";
     private bool _currentSiteConsoleViaAgent;
@@ -4945,11 +5517,12 @@
     private string? _modemTestedProvider;
     private List<DiscoveredModem> discoveredModems = new();
     private bool loadingDiscoveredModems = false;
+    private string modemScanResult = "";
     private bool modemFormExpanded = false;
 
     // Cable Modem Monitoring
     private List<CmConfiguration> _cmConfigs = new();
-    private CmConfiguration _editingCm = new() { Provider = "netgear", Port = 80, Username = "admin", PollingIntervalSeconds = 300, Enabled = true };
+    private CmConfiguration _editingCm = new() { Provider = "", Port = 80, Username = "admin", PollingIntervalSeconds = 300, Enabled = true };
     private bool _cmFormVisible;
     private bool _savingCm;
     private string? _cmTestResult;
@@ -4992,9 +5565,7 @@
     /// interface funnel has nothing to offer and only adds a wrong turn. Empty counts as UniFi:
     /// it is the default provider for rows that predate the column.
     /// </summary>
-    private static bool IsUniFiSshModem(string? provider) =>
-        string.IsNullOrWhiteSpace(provider)
-        || provider.Equals("qmicli", StringComparison.OrdinalIgnoreCase);
+    private static bool IsUniFiSshModem(string? provider) => ModemProviderKeys.UsesSharedSsh(provider);
 
     private static bool LooksUnreachable(string? message)
     {
@@ -5092,6 +5663,9 @@
     private int iperf3OtherParallelStreams = 10;
     private int iperf3Duration = 10;
     private bool savingIperf3Settings = false;
+    // Instance-wide settings (iperf3 defaults, external servers, threat retention, MaxMind, Mapbox,
+    // prerelease updates) are changed only by a global Admin.
+    private bool _canEditInstanceSettings;
     private string iperf3Message = "";
     private string iperf3MessageClass = "";
 
@@ -5113,7 +5687,6 @@
     private AdminPasswordSource adminPasswordSource = AdminPasswordSource.None;
     private string _passwordPolicy => NetworkOptimizer.Web.Services.Identity.PasswordPolicyText.Describe(IdentityOptions.Value.Password);
     private string adminNewPassword = "";
-    private string adminConfirmPassword = "";
     private bool savingAdminPassword = false;
     private string adminPasswordMessage = "";
     private string adminPasswordMessageClass = "";
@@ -5131,8 +5704,11 @@
     private string dnatExcludedVlans = "";
     private string? piholeManagementEndpoint;
     private string trustedDnsRedirectTargets = "";
+    private bool allowGuestPublicDns = false;
     private int unusedPortInactivityDays = 15;
     private int namedPortInactivityDays = 45;
+    private int pdfTopSourcesRows = NetworkOptimizer.Reports.ThreatSummaryData.DefaultTopSourcesRows;
+    private int pdfCategoryRows = NetworkOptimizer.Reports.ThreatSummaryData.DefaultCategoryRows;
     private bool savingAuditSettings = false;
     private string auditSettingsMessage = "";
     private string auditSettingsMessageClass = "";
@@ -5173,7 +5749,7 @@
     private string channelDigestFrequency = "daily";
     private string channelDigestDay = "monday";
     private TimeOnly channelDigestTime = new(8, 0);
-    private readonly string _serverTzAbbrev = GetServerTimezoneAbbrev();
+    private string _displayTzAbbrev => DisplayTime.Abbreviation(DateTime.UtcNow);
     private bool savingAlertChannel = false;
     private bool testingAlertChannel = false;
     private int testingAlertChannelId = 0;
@@ -5225,6 +5801,7 @@
     private string _siteInfluxLongtermBucket = string.Empty;
 
     // CrowdSec Settings
+    private bool _ctiCardShown;
     private bool crowdsecEnabled = false;
     private string crowdsecApiKey = "";
     private bool hasCrowdsecApiKey = false;
@@ -5250,6 +5827,16 @@
         {
             _kioskMode = await JS.InvokeAsync<bool>("getKioskMode");
             StateHasChanged();
+            try
+            {
+                _sectionSave = await JS.InvokeAsync<IJSObjectReference>("import",
+                    FileVersionProvider.AddFileVersionToPath("", "/js/settings-section-save.js"));
+                await _sectionSave.InvokeVoidAsync("mount", _settingsContainer);
+            }
+            catch (JSException ex)
+            {
+                Logger.LogWarning(ex, "Settings floating Save did not load");
+            }
             await HandleFragmentNavigationAsync();
 
             // Connection is the default tab, so arriving here never goes through SetActiveTab and
@@ -5315,6 +5902,14 @@
             _lastTabParam = _activeTab;
         }
 
+        // First, before any await below yields a render, so an Admin never sees the fields disabled.
+        var authState = AuthState is null ? null : await AuthState;
+        _canEditInstanceSettings = authState is not null
+            && (await Authz.AuthorizeAsync(authState.User, Policies.RequireAdmin)).Succeeded;
+
+        // Before the loads below: one of them calls the console live, and multi-site is a database read.
+        await LoadMultiSiteSettings();
+
         // Pre-release update notifications default ON (global/instance-wide); only an explicit "false" opts out.
         var prereleaseSetting = await SystemSettings.GetGlobalAsync("updates.include_prereleases");
         receivePrereleaseUpdates = prereleaseSetting is null || (bool.TryParse(prereleaseSetting, out var prPre) && prPre);
@@ -5326,7 +5921,6 @@
             controllerUsername = ConnectionService.CurrentConfig.Username;
             // Don't load password/API key - keep them empty for security
             controllerSite = ConnectionService.CurrentConfig.Site;
-            rememberCredentials = ConnectionService.CurrentConfig.RememberCredentials;
             ignoreControllerSSLErrors = ConnectionService.CurrentConfig.IgnoreControllerSSLErrors;
             useApiKeyAuth = ConnectionService.CurrentConfig.UseApiKey;
         }
@@ -5356,9 +5950,9 @@
         await LoadAuditSettings();
         await LoadAlertChannels();
         await LoadThreatSettings();
+        await LoadLiveTrafficSettings();
         await LoadMonitoringSettings();
         await LoadMapboxToken();
-        await LoadMultiSiteSettings();
         SiteChangeNotifier.SitesChanged += OnSiteRegistryChanged;
 
         if (_multiSiteEnabled)
@@ -5400,7 +5994,7 @@
             iperf3OtherParallelStreams = Math.Clamp(iperf3OtherParallelStreams, 1, 16);
             iperf3Duration = Math.Clamp(iperf3Duration, 3, 60);
 
-            await SystemSettings.SaveIperf3SettingsAsync(new Iperf3Settings
+            await SettingsAdmin.SaveIperf3SettingsAsync(new Iperf3Settings
             {
                 GatewayParallelStreams = iperf3GatewayParallelStreams,
                 UniFiParallelStreams = iperf3UniFiParallelStreams,
@@ -5490,12 +6084,12 @@
             if (editingExtServerId.HasValue)
             {
                 server.Id = editingExtServerId.Value;
-                await SystemSettings.UpdateExternalSpeedTestServerAsync(server);
+                await SettingsAdmin.UpdateExternalSpeedTestServerAsync(server);
                 extServerMessage = "Server updated";
             }
             else
             {
-                await SystemSettings.AddExternalSpeedTestServerAsync(server);
+                await SettingsAdmin.AddExternalSpeedTestServerAsync(server);
                 extServerMessage = "Server added";
             }
             extServerMessageClass = "success";
@@ -5525,7 +6119,7 @@
 
         try
         {
-            await SystemSettings.DeleteExternalSpeedTestServerAsync(id);
+            await SettingsAdmin.DeleteExternalSpeedTestServerAsync(id);
             await LoadExtServers();
             SystemSettings.UpdateCachedExternalOrigins(extServers);
             if (extServerExpandedId == id) extServerExpandedId = 0;
@@ -5548,7 +6142,7 @@
     {
         try
         {
-            await SystemSettings.SetDefaultExternalSpeedTestServerAsync(id);
+            await SettingsAdmin.SetDefaultExternalSpeedTestServerAsync(id);
             await LoadExtServers();
         }
         catch (Exception ex)
@@ -5624,6 +6218,12 @@
         !string.IsNullOrWhiteSpace(gatewayPrivateKeyPath) || gatewayKeyFileConfigured;
 
     /// <summary>
+    /// Whether the saved Gateway SSH settings can sign in. Counts a key file below global Admin too,
+    /// where the loaded settings carry the path redacted and so read as having no credential.
+    /// </summary>
+    private bool GatewayHasCredentials => gatewaySettings?.HasCredentials == true || gatewayKeyFileConfigured;
+
+    /// <summary>
     /// Reads the same way as the gateway, deliberately, even though there is nothing to confirm it
     /// against: keys reach switches and APs through UniFi Network's Device SSH Settings, which we do
     /// not read. A stored key therefore means "a key is meant to be doing this", not "a key is proven
@@ -5637,6 +6237,9 @@
 
     private bool DeviceKeyPathSet =>
         !string.IsNullOrWhiteSpace(sshPrivateKeyPath) || deviceKeyFileConfigured;
+
+    /// <summary>The device-SSH twin of <see cref="GatewayHasCredentials"/>.</summary>
+    private bool DeviceHasCredentials => sshSettings?.HasCredentials == true || deviceKeyFileConfigured;
 
     /// <summary>Dims the header of an option that is not configured.</summary>
     private static string UnusedLabel(bool inUse) => inUse ? "" : "form-label-unused";
@@ -5754,7 +6357,7 @@
         try
         {
             var devices = await ConnectionService.GetDiscoveredDevicesAsync();
-            var gateway = devices.FirstOrDefault(d => d.HardwareType == NetworkOptimizer.Core.Enums.DeviceType.Gateway);
+            var gateway = UniFiDiscovery.SiteGateway(devices);
             var model = gateway?.Shortname ?? gateway?.Model ?? "";
 
             // A UXG is adopted like any other device, so UniFi Network's Device SSH Settings reaches
@@ -5932,6 +6535,26 @@
         return success;
     }
 
+    /// <summary>
+    /// Names of this site's modems that authenticate with the stored key alone, read fresh so a modem
+    /// saved in another tab counts. Wording only: any failure returns none, so it can never block the removal.
+    /// </summary>
+    private async Task<List<string>> KeyOnlyModemNamesAsync()
+    {
+        try
+        {
+            return (await ModemService.GetModemsAsync())
+                .Where(m => CellularModemService.OffersStoredKey(m)
+                            && string.IsNullOrEmpty(m.Password) && string.IsNullOrEmpty(m.PrivateKeyPath))
+                .Select(m => m.Name)
+                .ToList();
+        }
+        catch (Exception)
+        {
+            return new List<string>();
+        }
+    }
+
     private async Task RemoveSshKey()
     {
         var installed = _keyDeployStatus?.KeyInstalled == true || _keyDeployStatus?.ScriptInstalled == true;
@@ -5939,6 +6562,11 @@
             ? "Remove the stored SSH key and take it off the gateway? Connections will fall back to the "
               + "password or key file configured for each."
             : "Remove the stored SSH key? Connections will fall back to the password or key file configured for each.";
+
+        // A modem set to use the key with no password or key file has nothing to fall back to.
+        var keyOnlyModems = await KeyOnlyModemNamesAsync();
+        if (keyOnlyModems.Count > 0)
+            prompt += $" These modems use only this key and will stop connecting until each has a password: {string.Join(", ", keyOnlyModems)}.";
 
         if (!await JS.InvokeAsync<bool>("confirm", prompt))
         {
@@ -6049,10 +6677,23 @@
             }
 
             gatewaySettings = await SshSettingsAdmin.SaveGatewayAsync(settings);
+            var typedPassword = gatewayPassword;
             gatewayPassword = ""; // Clear password field
             hasGatewayPassword = !string.IsNullOrEmpty(gatewaySettings.Password);
             gatewayMessage = "Gateway settings saved successfully";
             gatewayMessageClass = "success";
+
+            // Only a CloudKey answer is reported here; any other test failure is left to Test Connection.
+            if (gatewayEnabled)
+            {
+                var check = await GatewaySshService.TestConnectionAsync(
+                    gatewayHost, gatewayPort, gatewayUsername, typedPassword, gatewayPrivateKeyPath);
+                if (!check.success && check.message == NetworkOptimizer.Web.Services.Ssh.GatewaySshService.CloudKeyMessage)
+                {
+                    gatewayMessage = $"Gateway settings saved. {check.message}";
+                    gatewayMessageClass = "danger";
+                }
+            }
         }
         catch (Exception ex)
         {
@@ -6456,7 +7097,9 @@
         }
     }
 
-    private async Task LoadDiscoveredModems()
+    private Task ScanForModems() => LoadDiscoveredModems(manual: true);
+
+    private async Task LoadDiscoveredModems(bool manual = false)
     {
         if (!ConnectionService.IsConnected)
         {
@@ -6464,11 +7107,24 @@
         }
 
         loadingDiscoveredModems = true;
+        modemScanResult = "";
         StateHasChanged();
 
         try
         {
-            discoveredModems = await ModemService.DiscoverModemsAsync();
+            // A manual scan holds the spinner briefly: discovery reads cached devices and returns too fast to see.
+            var discovery = ModemService.DiscoverModemsAsync();
+            if (manual)
+            {
+                await Task.WhenAll(discovery, Task.Delay(600));
+            }
+            discoveredModems = await discovery;
+            if (manual)
+            {
+                modemScanResult = discoveredModems.Count > 0
+                    ? $"Scan complete: found {TimeFormatHelper.Pluralize(discoveredModems.Count, "modem")}"
+                    : "Scan complete: no modems found";
+            }
         }
         catch (Exception ex)
         {
@@ -6482,10 +7138,38 @@
         }
     }
 
+    /// <summary>
+    /// A gateway's built-in modem always polls the Gateway SSH host, so one gateway row covers it
+    /// whatever host the row was saved with.
+    /// </summary>
+    private bool IsDiscoveredModemConfigured(DiscoveredModem discovered) => discovered.IsGateway
+        ? modemConfigs.Any(m => ModemProviderKeys.UsesGatewaySsh(m.Provider))
+        : modemConfigs.Any(m => m.Host == discovered.Host);
+
+    /// <summary>Choosing the gateway provider points the form at the Gateway SSH host.</summary>
+    private void OnModemProviderChanged()
+    {
+        if (!ModemProviderKeys.UsesGatewaySsh(editingModem.Provider))
+            return;
+
+        editingModem.Host = gatewaySettings?.Host ?? "";
+        editingModem.QmiDevice = "";
+        if (string.IsNullOrEmpty(editingModem.ModemType) || editingModem.ModemType == "U5G-Max")
+            editingModem.ModemType = "UDR-5G-Max";
+    }
+
     private async Task AddDiscoveredModem(DiscoveredModem discovered)
     {
         // Check if SSH credentials are configured
-        if (sshSettings?.HasCredentials != true)
+        if (discovered.IsGateway && !GatewayHasCredentials)
+        {
+            modemMessage = "Gateway SSH credentials must be configured before adding a UDR-5G-Max. Please configure them in the Gateway SSH section above.";
+            modemMessageClass = "warning";
+            StateHasChanged();
+            return;
+        }
+
+        if (!discovered.IsGateway && !DeviceHasCredentials)
         {
             modemMessage = "SSH credentials must be configured before adding modems. Please configure them in the Device SSH section above.";
             modemMessageClass = "warning";
@@ -6494,7 +7178,7 @@
         }
 
         // Check if already configured
-        if (modemConfigs.Any(m => m.Host == discovered.Host))
+        if (IsDiscoveredModemConfigured(discovered))
         {
             modemMessage = $"{discovered.Name} is already configured";
             modemMessageClass = "warning";
@@ -6510,10 +7194,11 @@
         {
             var config = new ModemConfiguration
             {
+                Provider = discovered.Provider,
                 Name = discovered.Name,
-                Host = discovered.Host,
+                Host = discovered.IsGateway && !string.IsNullOrEmpty(gatewaySettings?.Host) ? gatewaySettings.Host : discovered.Host,
                 Port = 22,
-                Username = "root",
+                Username = discovered.IsGateway ? "" : "root",
                 ModemType = discovered.Model,
                 QmiDevice = UniFiProductDatabase.GetDefaultQmiDevicePath(discovered.Model),
                 PollingIntervalSeconds = 300,
@@ -6601,7 +7286,6 @@
             Password = password,
             ApiKey = apiKey,
             Site = string.IsNullOrWhiteSpace(controllerSite) ? "default" : controllerSite,
-            RememberCredentials = rememberCredentials,
             IgnoreControllerSSLErrors = ignoreControllerSSLErrors
         };
     }
@@ -6826,6 +7510,7 @@
             Username = modem.Username,
             Password = modem.Password,
             PrivateKeyPath = modem.PrivateKeyPath,
+            UseManagedSshKey = modem.UseManagedSshKey,
             ModemType = modem.ModemType,
             QmiDevice = modem.QmiDevice,
             Enabled = modem.Enabled,
@@ -6863,6 +7548,10 @@
             return;
         }
 
+        // A new row still carries the SSH default port; tunnel routing needs the real one.
+        if (editingModem.Provider is "inseego-fx" or "zyxel-cpe")
+            editingModem.Port = 443;
+
         probingModem = true;
         probeResult = "";
         StateHasChanged();
@@ -6887,17 +7576,42 @@
 
     private async Task SaveModem()
     {
-        var isUniFiProvider = string.IsNullOrWhiteSpace(editingModem.Provider) ||
-                              editingModem.Provider == "qmicli";
-        var isQuectelProvider = editingModem.Provider == "quectel-at";
-        var isHttpProvider = !isUniFiProvider && !isQuectelProvider;
+        var isUniFiProvider = ModemProviderKeys.UsesSharedSsh(editingModem.Provider);
+        var isGatewayProvider = ModemProviderKeys.UsesGatewaySsh(editingModem.Provider);
+        var isPerModemSshProvider = ModemProviderKeys.UsesPerModemSsh(editingModem.Provider);
+        var isGlInetProvider = editingModem.Provider == ModemProviderKeys.QuectelAt;
+        var isInseegoProvider = editingModem.Provider == "inseego-fx";
+        var isZyxelProvider = editingModem.Provider == "zyxel-cpe";
+        var isMikroTikProvider = editingModem.Provider == ModemProviderKeys.MikroTikRouterOs;
+        var isHttpProvider = !ModemProviderKeys.IsSsh(editingModem.Provider);
+        var sshModemKind = isGlInetProvider ? "GL-iNet" : isMikroTikProvider ? "MikroTik" : "Quectel";
 
         // UniFi modems use shared SSH credentials; require them to be configured
-        if (editingModem.Id == 0 && isUniFiProvider && sshSettings?.HasCredentials != true)
+        if (editingModem.Id == 0 && isUniFiProvider && !DeviceHasCredentials)
         {
             modemMessage = "SSH credentials must be configured before adding Ubiquiti modems. Please configure them in the Device SSH section above.";
             modemMessageClass = "warning";
             return;
+        }
+
+        // The gateway's built-in modem polls the Gateway SSH host and credentials, not the row's.
+        if (isGatewayProvider)
+        {
+            if (editingModem.Id == 0 && !GatewayHasCredentials)
+            {
+                modemMessage = "Gateway SSH credentials must be configured before adding a UDR-5G-Max. Please configure them in the Gateway SSH section above.";
+                modemMessageClass = "warning";
+                return;
+            }
+
+            editingModem.Host = gatewaySettings?.Host ?? editingModem.Host;
+            editingModem.Port = gatewaySettings?.Port ?? 22;
+            editingModem.Username = "";
+            editingModem.Password = null;
+            editingModem.PrivateKeyPath = "";
+            editingModem.UseManagedSshKey = false;
+            if (string.IsNullOrEmpty(editingModem.ModemType) || editingModem.ModemType == "U5G-Max")
+                editingModem.ModemType = "UDR-5G-Max";
         }
 
         // People paste the modem's management page URL here - strip it down to the host.
@@ -6910,43 +7624,69 @@
             return;
         }
 
-        // GL-iNet/Quectel modems need per-modem SSH credentials
-        if (isQuectelProvider && string.IsNullOrWhiteSpace(editingModem.Username))
+        // GL-iNet and Quectel modems need per-modem SSH credentials
+        if (isPerModemSshProvider && string.IsNullOrWhiteSpace(editingModem.Username))
         {
-            modemMessage = "SSH username is required for GL-iNet modems";
+            modemMessage = $"SSH username is required for {sshModemKind} modems";
             modemMessageClass = "danger";
             return;
         }
 
-        if (isQuectelProvider && string.IsNullOrWhiteSpace(editingModem.Password) && string.IsNullOrWhiteSpace(editingModem.PrivateKeyPath))
+        // A modem set to use the site's SSH key needs no password.
+        if (isPerModemSshProvider && string.IsNullOrWhiteSpace(editingModem.Password)
+            && string.IsNullOrWhiteSpace(editingModem.PrivateKeyPath) && !(editingModem.UseManagedSshKey && _sshKey is not null))
         {
-            modemMessage = "SSH password or private key path is required for GL-iNet modems";
+            modemMessage = $"An SSH password, or an SSH key for this site, is required for {sshModemKind} modems";
             modemMessageClass = "danger";
             return;
         }
 
-        // HTTP-based providers don't use SSH/QMI fields
+        if (isInseegoProvider && string.IsNullOrWhiteSpace(editingModem.Password))
+        {
+            modemMessage = "The admin password is required for Inseego gateways";
+            modemMessageClass = "danger";
+            return;
+        }
+
+        if (isZyxelProvider && string.IsNullOrWhiteSpace(editingModem.Password))
+        {
+            modemMessage = "The password is required for Zyxel routers";
+            modemMessageClass = "danger";
+            return;
+        }
+
+        // HTTP-based providers don't use SSH/QMI fields; only Zyxel signs in with a username
         if (isHttpProvider)
         {
-            editingModem.Port = 80;
-            editingModem.Username = "";
+            editingModem.Port = isInseegoProvider || isZyxelProvider ? 443 : 80;
+            editingModem.Username = isZyxelProvider ? editingModem.Username.Trim() : "";
             editingModem.PrivateKeyPath = "";
             editingModem.QmiDevice = "";
             if (string.IsNullOrEmpty(editingModem.ModemType) ||
-                editingModem.ModemType == "U5G-Max")
+                editingModem.ModemType is "U5G-Max" or "Netgear Nighthawk Hotspot" or "Inseego FX" or "Zyxel CPE")
             {
-                editingModem.ModemType = "Netgear Nighthawk Hotspot";
+                editingModem.ModemType = isZyxelProvider ? "Zyxel CPE"
+                    : isInseegoProvider ? "Inseego FX"
+                    : "Netgear Nighthawk Hotspot";
             }
         }
 
         // GL-iNet modems use the TransportPath for the gl_modem bus, not a QMI device
-        if (isQuectelProvider)
+        if (isGlInetProvider)
         {
             if (string.IsNullOrEmpty(editingModem.ModemType) ||
                 editingModem.ModemType == "U5G-Max")
             {
                 editingModem.ModemType = "GL-iNet";
             }
+        }
+
+        // The LTE interface name rides in QmiDevice; the first poll replaces the placeholder model.
+        if (isMikroTikProvider)
+        {
+            editingModem.QmiDevice = editingModem.QmiDevice?.Trim() ?? "";
+            if (string.IsNullOrEmpty(editingModem.ModemType) || editingModem.ModemType == "U5G-Max")
+                editingModem.ModemType = MikroTikRouterOsProvider.ModemTypePlaceholder;
         }
 
         savingModem = true;
@@ -6975,13 +7715,22 @@
         }
     }
 
+    // Settings - Monitoring row awaiting delete confirmation, as "<card>:<id>". One at a time across the cards.
+    private string? _confirmDeleteKey;
+
+    private void ConfirmDelete(string key) => _confirmDeleteKey = key;
+
+    private void CancelConfirmDelete() => _confirmDeleteKey = null;
+
     private async Task DeleteModem(ModemConfiguration modem)
     {
+        _confirmDeleteKey = null;
         try
         {
             await ModemService.DeleteModemAsync(modem.Id);
+            if (editingModem.Id == modem.Id) CancelEditModem();
             modemMessage = $"Deleted modem: {modem.Name}";
-            modemMessageClass = "success";
+            modemMessageClass = "info";
             await LoadModemConfigs();
         }
         catch (Exception ex)
@@ -7072,12 +7821,40 @@
 
     private async Task SaveCm()
     {
-        // People paste the modem's management page URL here - strip it down to the host.
-        _editingCm.Host = NetworkUtilities.ExtractHostFromUrl(_editingCm.Host);
+        if (string.IsNullOrEmpty(_editingCm.Provider))
+        {
+            _cmTestResult = CmSelectProviderMessage;
+            _cmTestResultClass = "danger";
+            return;
+        }
+
+        var isUci = IsCmUciProvider(_editingCm.Provider);
+        if (isUci)
+        {
+            // A UCI is identified by its MAC and reads no address or credentials.
+            _editingCm.Host = NetworkOptimizer.Web.Services.CableModemProviders.Uci.UciInformService.NormalizeMac(_editingCm.Host) ?? "";
+            _editingCm.Port = 0;
+            _editingCm.Username = "";
+            _editingCm.Password = null;
+            _editingCm.StatusPagePath = null;
+        }
+        else
+        {
+            // People paste the modem's management page URL here - strip it down to the host.
+            _editingCm.Host = NetworkUtilities.ExtractHostFromUrl(_editingCm.Host);
+        }
 
         if (string.IsNullOrWhiteSpace(_editingCm.Name) || string.IsNullOrWhiteSpace(_editingCm.Host))
         {
-            _cmTestResult = "Name and Host are required.";
+            _cmTestResult = isUci ? "Name and a UCI are required." : "Name and Host are required.";
+            _cmTestResultClass = "danger";
+            return;
+        }
+
+        if (isUci && _cmConfigs.Any(c => c.Id != _editingCm.Id && IsCmUciProvider(c.Provider)
+                && NetworkOptimizer.Web.Services.CableModemProviders.Uci.UciInformService.NormalizeMac(c.Host) == _editingCm.Host))
+        {
+            _cmTestResult = "This UCI is already monitored.";
             _cmTestResultClass = "danger";
             return;
         }
@@ -7085,6 +7862,22 @@
         _savingCm = true;
         _cmTestResult = null;
         StateHasChanged();
+
+        // A provider that needs a password saves without one only if the modem really answers
+        // without it: a stored password counts, and so does a test that succeeds.
+        if (CmCredentialsFor(_editingCm.Provider) == NetworkOptimizer.Monitoring.Providers.CmCredentialRequirement.Required
+            && string.IsNullOrEmpty(_editingCm.Password))
+        {
+            var (probeOk, probeMessage) = await CmMonitorService.ProbeAsync(_editingCm);
+            if (!probeOk)
+            {
+                _cmTestResult = $"This modem needs a password. {probeMessage}";
+                _cmTestResultClass = "danger";
+                _savingCm = false;
+                StateHasChanged();
+                return;
+            }
+        }
 
         try
         {
@@ -7114,11 +7907,13 @@
 
     private async Task DeleteCm(int id)
     {
+        _confirmDeleteKey = null;
         try
         {
             await CmMonitorService.DeleteCmAsync(id);
+            if (_editingCm.Id == id) CancelEditCm();
             _cmTestResult = "Cable modem deleted.";
-            _cmTestResultClass = "success";
+            _cmTestResultClass = "info";
             await LoadCmSettings();
         }
         catch (Exception ex)
@@ -7181,7 +7976,7 @@
         }
     }
 
-    private void EditCm(CmConfiguration config)
+    private async Task EditCm(CmConfiguration config)
     {
         _editingCm = new CmConfiguration
         {
@@ -7200,11 +7995,62 @@
             CreatedAt = config.CreatedAt,
         };
         _cmFormVisible = true;
+        if (IsCmUciProvider(config.Provider))
+            await LoadCmUciDevicesAsync();
+    }
+
+    private List<(string Mac, string Name)> _cmUciDevices = new();
+    private bool _cmUciAgentReady;
+
+    private NetworkOptimizer.Monitoring.Providers.ICableModemProvider? CmProviderFor(string provider) =>
+        CmProviders.FirstOrDefault(p => string.Equals(p.ProviderKey, provider, StringComparison.OrdinalIgnoreCase));
+
+    // An unknown provider key shows the fields unrequired rather than hiding them.
+    private NetworkOptimizer.Monitoring.Providers.CmCredentialRequirement CmCredentialsFor(string provider) =>
+        CmProviderFor(provider)?.Credentials ?? NetworkOptimizer.Monitoring.Providers.CmCredentialRequirement.Optional;
+
+    private static bool IsCmUciProvider(string provider) =>
+        provider == NetworkOptimizer.Web.Services.CableModemProviders.Uci.UciInformService.ProviderKey;
+
+    private const string CmSelectProviderMessage = "Select a provider.";
+
+    private async Task OnCmProviderChanged()
+    {
+        // Picking a provider answers the save's "Select a provider." error, so it goes.
+        if (_cmTestResult == CmSelectProviderMessage) _cmTestResult = null;
+        if (!IsCmUciProvider(_editingCm.Provider)) return;
+        if (_editingCm.Id == 0)
+        {
+            _editingCm.Host = "";
+            _editingCm.PollingIntervalSeconds = 60;
+        }
+        await LoadCmUciDevicesAsync();
+    }
+
+    /// <summary>The site's adopted UCIs for the picker, plus the one being edited if it is no longer adopted.</summary>
+    private async Task LoadCmUciDevicesAsync()
+    {
+        var found = new List<(string Mac, string Name)>();
+        try
+        {
+            var choices = await CmMonitorService.GetUciChoicesAsync();
+            _cmUciAgentReady = choices.AgentReady;
+            found.AddRange(choices.Devices);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Could not list UniFi Cable Internet devices for the cable modem form");
+        }
+
+        var current = NetworkOptimizer.Web.Services.CableModemProviders.Uci.UciInformService.NormalizeMac(_editingCm.Host);
+        if (current != null && found.All(d => d.Mac != current))
+            found.Add((current, string.IsNullOrWhiteSpace(_editingCm.Name) ? "UniFi Cable Internet" : _editingCm.Name));
+        _cmUciDevices = found;
     }
 
     private void CancelEditCm()
     {
-        _editingCm = new CmConfiguration { Provider = "netgear", Port = 80, Username = "admin", PollingIntervalSeconds = 300, Enabled = true };
+        _editingCm = new CmConfiguration { Provider = "", Port = 80, Username = "admin", PollingIntervalSeconds = 300, Enabled = true };
         _cmFormVisible = false;
     }
 
@@ -7214,20 +8060,27 @@
         "arris-surfboard" => "ARRIS Surfboard (HTTP)",
         "arris-surfboard-hnap" => "ARRIS Surfboard S33/S34 (HNAP)",
         "motorola-hnap" => "Motorola (HNAP)",
-        "xfinity-gateway" => "Xfinity XB8/XB10, Comcast Business CGA4332, Cox CGM4981 (HTTP)",
+        "xfinity-gateway" => "Xfinity XB7/XB8/XB10, Comcast Business CGA4332, Cox CGM4981 (HTTP)",
         "technicolor-cga" => "Technicolor CGA Series (HTTP)",
         "vodafone-station" => "Vodafone Station (ARRIS TG3442DE)",
+        "sagemcom-f3896lg" => "Sagemcom F3896LG: Virgin Media Hub 5, Ziggo SmartWifi (HTTP)",
+        "fritzbox-cable" => "FRITZ!Box Cable (HTTP)",
+        "hitron-coda" => "Hitron CODA (HTTP)",
+        "unifi-uci" => "UniFi Cable Internet (UCI)",
         _ => provider,
     };
 
     private static string GetCmStatusPathPlaceholder(string provider) => provider switch
     {
-        "arris-surfboard" => "/cgi-bin/status",
+        "arris-surfboard" => "Detected automatically",
         "arris-surfboard-hnap" => "N/A (uses /HNAP1/)",
         "motorola-hnap" => "N/A (uses /HNAP1/)",
         "xfinity-gateway" => "Detected automatically",
         "technicolor-cga" => "/api/v1/sta_docsis_status",
         "vodafone-station" => "/php/status_docsis_data.php",
+        "sagemcom-f3896lg" => "/rest/v1/cablemodem",
+        "fritzbox-cable" => "/data.lua",
+        "hitron-coda" => "/1/Device/CM",
         _ => "/DocsisStatus.htm",
     };
 
@@ -7315,11 +8168,13 @@
 
     private async Task DeleteOnt(int id)
     {
+        _confirmDeleteKey = null;
         try
         {
             await OntMonitorService.DeleteOntAsync(id);
+            if (_editingOnt.Id == id) CancelEditOnt();
             _ontTestResult = "ONT deleted.";
-            _ontTestResultClass = "success";
+            _ontTestResultClass = "info";
             await LoadOntSettings();
         }
         catch (Exception ex)
@@ -7441,15 +8296,19 @@
 
         // SFP attachment is only meaningful for providers that support it; clear a
         // stale association so it can't linger invisibly after a provider switch.
-        if (provider != "netopt-custom")
+        if (!SfpAttachableOntProviders.Contains(provider))
             _editingOnt.AttachedSfpId = null;
     }
+
+    /// <summary>Providers implementing ISfpSupplementalOntProvider, which can merge into a monitored SFP module.</summary>
+    private static readonly HashSet<string> SfpAttachableOntProviders = new() { "netopt-custom", "realtek-ont", "peter-pon", "odi-oss" };
 
     private static int GetOntProviderDefaultPort(string provider) => provider switch
     {
         "8311" => 443,
         "quantum-q1000k" => 443,
         "netopt-custom" => 10012,
+        "odi-oss" => 9100,
         _ => 80,
     };
 
@@ -7463,9 +8322,12 @@
         "telekom-modem2" => "192.168.100.1",
         "nokia-xs010x-q" => "192.168.100.1",
         "zyxel-gpon-sfp" => "10.10.1.1",
+        "peter-pon" => "192.168.1.10",
+        "odi-oss" => "192.168.1.1",
         // realtek-ont, netopt-custom and generic-http-ont have no single sensible
         // default (vendor-dependent stick, gateway-served JSON, or generic), so nothing
-        // is prefilled and the generic example placeholder is shown.
+        // is prefilled and the generic example placeholder is shown. richerlink-ont's
+        // factory address is unconfirmed (the one trace is a single ISP-provisioned unit).
         _ => "",
     };
 
@@ -7485,10 +8347,21 @@
         "telekom-modem2" => "Telekom Glasfaser-Modem 2 (HTTP)",
         "nokia-xs010x-q" => "Nokia XS-010X-Q (HTTP)",
         "zyxel-gpon-sfp" => "Zyxel GPON-SFP PMG3000 (HTTP)",
+        "richerlink-ont" => "Richerlink RL821GWV-D (HTTP)",
+        "peter-pon" => "Peter-Pon GPON Firmware (HTTP)",
         "netopt-custom" => "Network Optimizer Custom (HTTP JSON)",
+        "odi-oss" => "odi-oss GPON Stick (Prometheus)",
         "generic-http-ont" => "Generic HTTP ONT",
         _ => provider,
     };
+
+    private string OntAttachmentTooltip(int sfpId)
+    {
+        var sfp = _attachableSfps.FirstOrDefault(s => s.Id == sfpId);
+        return sfp != null
+            ? $"Attached to {AttachableSfpLabel(sfp)}. Its PON stats show on that module's SFP Stats."
+            : "Attached to an SFP module that is no longer monitored.";
+    }
 
     private static string AttachableSfpLabel(MonitoredSfp sfp)
     {
@@ -7562,11 +8435,13 @@
 
     private async Task DeleteStarlink(int id)
     {
+        _confirmDeleteKey = null;
         try
         {
             await StarlinkMonitor.DeleteStarlinkAsync(id);
+            if (_editingStarlink.Id == id) CancelEditStarlink();
             _starlinkTestResult = "Starlink terminal deleted.";
-            _starlinkTestResultClass = "success";
+            _starlinkTestResultClass = "info";
             await LoadStarlinkSettings();
         }
         catch (Exception ex)
@@ -7659,7 +8534,7 @@
     private async Task SavePrereleaseSetting()
     {
         // Instance-wide: written to the main DB so it applies across all sites.
-        await SystemSettings.SetGlobalAsync("updates.include_prereleases", receivePrereleaseUpdates ? "true" : "false");
+        await SettingsAdmin.SetGlobalAsync("updates.include_prereleases", receivePrereleaseUpdates ? "true" : "false");
     }
 
     // Config export state
@@ -7688,11 +8563,13 @@
 
         try
         {
-            var bytes = await ConfigTransfer.ExportAsync(type);
+            // The browser fetches the archive from the export endpoint: it is built in that request, not
+            // on this circuit, and it can be larger than a JS interop call carries (one JSON string).
             var label = type == ExportType.Full ? "full" : "settings";
             var fileName = $"NetworkOptimizer-{label}-{DateTime.UtcNow:yyyyMMdd}.nopt";
-            var base64 = Convert.ToBase64String(bytes);
-            await JS.InvokeVoidAsync("downloadFile", fileName, "application/octet-stream", base64);
+            // A large install's export outlasts the one-minute default JS call timeout.
+            if (await JS.InvokeAsync<string?>("downloadUrl", TimeSpan.FromMinutes(30), $"api/config/backups?type={label}", fileName) is { } error)
+                exportError = $"Export failed: {error}";
         }
         catch (Exception ex)
         {
@@ -7849,7 +8726,7 @@
     private async Task SaveAdminPassword()
     {
         // Validate using service
-        var validation = AdminAuth.ValidateNewPassword(adminNewPassword, adminConfirmPassword);
+        var validation = AdminAuth.ValidateNewPassword(adminNewPassword);
         if (!validation.IsValid)
         {
             adminPasswordMessage = validation.ErrorMessage ?? "Invalid password";
@@ -7893,7 +8770,6 @@
             adminPasswordSource = await AdminAuth.GetPasswordSourceAsync();
 
             adminNewPassword = "";
-            adminConfirmPassword = "";
             if (identityError is null)
             {
                 adminPasswordMessage = "Admin password settings saved successfully";
@@ -7962,17 +8838,20 @@
     {
         try
         {
-            var appleStreaming = await SystemSettings.GetAsync("audit:allowAppleStreamingOnMainNetwork");
-            var allStreaming = await SystemSettings.GetAsync("audit:allowAllStreamingOnMainNetwork");
-            var nameBrandTVs = await SystemSettings.GetAsync("audit:allowNameBrandTVsOnMainNetwork");
-            var allTVs = await SystemSettings.GetAsync("audit:allowAllTVsOnMainNetwork");
-            var mediaPlayers = await SystemSettings.GetAsync("audit:allowMediaPlayersOnMainNetwork");
-            var printers = await SystemSettings.GetAsync("audit:allowPrintersOnMainNetwork");
-            var excludedVlans = await SystemSettings.GetAsync("audit:dnatExcludedVlans");
-            var piholePort = await SystemSettings.GetAsync("audit:piholeManagementPort");
-            var trustedTargets = await SystemSettings.GetAsync("audit:trustedDnsRedirectTargets");
-            var unusedPortDays = await SystemSettings.GetAsync("audit:unusedPortInactivityDays");
-            var namedPortDays = await SystemSettings.GetAsync("audit:namedPortInactivityDays");
+            var appleStreaming = await SystemSettings.GetAsync(SiteContext.Slug, "audit:allowAppleStreamingOnMainNetwork");
+            var allStreaming = await SystemSettings.GetAsync(SiteContext.Slug, "audit:allowAllStreamingOnMainNetwork");
+            var nameBrandTVs = await SystemSettings.GetAsync(SiteContext.Slug, "audit:allowNameBrandTVsOnMainNetwork");
+            var allTVs = await SystemSettings.GetAsync(SiteContext.Slug, "audit:allowAllTVsOnMainNetwork");
+            var mediaPlayers = await SystemSettings.GetAsync(SiteContext.Slug, "audit:allowMediaPlayersOnMainNetwork");
+            var printers = await SystemSettings.GetAsync(SiteContext.Slug, "audit:allowPrintersOnMainNetwork");
+            var excludedVlans = await SystemSettings.GetAsync(SiteContext.Slug, "audit:dnatExcludedVlans");
+            var piholePort = await SystemSettings.GetAsync(SiteContext.Slug, "audit:piholeManagementPort");
+            var trustedTargets = await SystemSettings.GetAsync(SiteContext.Slug, "audit:trustedDnsRedirectTargets");
+            var guestPublicDns = await SystemSettings.GetAsync(SiteContext.Slug, AuditOptions.AllowGuestPublicDnsKey);
+            var unusedPortDays = await SystemSettings.GetAsync(SiteContext.Slug, "audit:unusedPortInactivityDays");
+            var namedPortDays = await SystemSettings.GetAsync(SiteContext.Slug, "audit:namedPortInactivityDays");
+            var topSourcesRows = await SystemSettings.GetAsync(SiteContext.Slug, ThreatReportRows.TopSourcesSettingKey);
+            var categoryRows = await SystemSettings.GetAsync(SiteContext.Slug, ThreatReportRows.CategoryRowsSettingKey);
 
             allowAppleStreamingOnMainNetwork = appleStreaming?.ToLower() == "true";
             allowAllStreamingOnMainNetwork = allStreaming?.ToLower() == "true";
@@ -7987,9 +8866,15 @@
             piholeManagementEndpoint = string.IsNullOrWhiteSpace(piholePort) ? null : piholePort;
             // Trusted DNS redirect targets (VIPs, anycast)
             trustedDnsRedirectTargets = trustedTargets ?? "";
+            // Guest and Hotspot networks are checked for DNS control unless allowed public DNS
+            allowGuestPublicDns = guestPublicDns?.ToLower() == "true";
             // Unused port thresholds (defaults: 15 days unnamed, 45 days named)
             unusedPortInactivityDays = int.TryParse(unusedPortDays, out var unusedDays) && unusedDays > 0 ? unusedDays : 15;
             namedPortInactivityDays = int.TryParse(namedPortDays, out var namedDays) && namedDays > 0 ? namedDays : 45;
+            pdfTopSourcesRows = int.TryParse(topSourcesRows, out var topRows) && topRows > 0
+                ? topRows : NetworkOptimizer.Reports.ThreatSummaryData.DefaultTopSourcesRows;
+            pdfCategoryRows = int.TryParse(categoryRows, out var catRows) && catRows > 0
+                ? catRows : NetworkOptimizer.Reports.ThreatSummaryData.DefaultCategoryRows;
         }
         catch (Exception ex)
         {
@@ -8006,13 +8891,6 @@
 
         try
         {
-            await SystemSettings.SetAsync("audit:allowAppleStreamingOnMainNetwork", allowAppleStreamingOnMainNetwork.ToString().ToLower());
-            await SystemSettings.SetAsync("audit:allowAllStreamingOnMainNetwork", allowAllStreamingOnMainNetwork.ToString().ToLower());
-            await SystemSettings.SetAsync("audit:allowNameBrandTVsOnMainNetwork", allowNameBrandTVsOnMainNetwork.ToString().ToLower());
-            await SystemSettings.SetAsync("audit:allowAllTVsOnMainNetwork", allowAllTVsOnMainNetwork.ToString().ToLower());
-            await SystemSettings.SetAsync("audit:allowMediaPlayersOnMainNetwork", allowMediaPlayersOnMainNetwork.ToString().ToLower());
-            await SystemSettings.SetAsync("audit:allowPrintersOnMainNetwork", allowPrintersOnMainNetwork.ToString().ToLower());
-            await SystemSettings.SetAsync("audit:dnatExcludedVlans", dnatExcludedVlans ?? "");
             // Validate DNS endpoint: must be empty, a port number, or a valid absolute URL
             var endpoint = piholeManagementEndpoint?.Trim();
             if (!string.IsNullOrEmpty(endpoint) &&
@@ -8024,10 +8902,26 @@
                 savingAuditSettings = false;
                 return;
             }
-            await SystemSettings.SetAsync("audit:piholeManagementPort", endpoint ?? "");
-            await SystemSettings.SetAsync("audit:trustedDnsRedirectTargets", trustedDnsRedirectTargets ?? "");
-            await SystemSettings.SetAsync("audit:unusedPortInactivityDays", unusedPortInactivityDays.ToString());
-            await SystemSettings.SetAsync("audit:namedPortInactivityDays", namedPortInactivityDays.ToString());
+            pdfTopSourcesRows = Math.Clamp(pdfTopSourcesRows, 1, NetworkOptimizer.Reports.ThreatSummaryData.MaxRows);
+            pdfCategoryRows = Math.Clamp(pdfCategoryRows, 1, NetworkOptimizer.Reports.ThreatSummaryData.MaxRows);
+
+            await SiteSettingsAdmin.SaveAuditOptionsAsync(new Dictionary<string, string?>
+            {
+                ["audit:allowAppleStreamingOnMainNetwork"] = allowAppleStreamingOnMainNetwork.ToString().ToLower(),
+                ["audit:allowAllStreamingOnMainNetwork"] = allowAllStreamingOnMainNetwork.ToString().ToLower(),
+                ["audit:allowNameBrandTVsOnMainNetwork"] = allowNameBrandTVsOnMainNetwork.ToString().ToLower(),
+                ["audit:allowAllTVsOnMainNetwork"] = allowAllTVsOnMainNetwork.ToString().ToLower(),
+                ["audit:allowMediaPlayersOnMainNetwork"] = allowMediaPlayersOnMainNetwork.ToString().ToLower(),
+                ["audit:allowPrintersOnMainNetwork"] = allowPrintersOnMainNetwork.ToString().ToLower(),
+                ["audit:dnatExcludedVlans"] = dnatExcludedVlans ?? "",
+                ["audit:piholeManagementPort"] = endpoint ?? "",
+                ["audit:trustedDnsRedirectTargets"] = trustedDnsRedirectTargets ?? "",
+                [AuditOptions.AllowGuestPublicDnsKey] = allowGuestPublicDns.ToString().ToLower(),
+                ["audit:unusedPortInactivityDays"] = unusedPortInactivityDays.ToString(),
+                ["audit:namedPortInactivityDays"] = namedPortInactivityDays.ToString(),
+                [ThreatReportRows.TopSourcesSettingKey] = pdfTopSourcesRows.ToString(),
+                [ThreatReportRows.CategoryRowsSettingKey] = pdfCategoryRows.ToString(),
+            });
 
             auditSettingsMessage = "Audit settings saved successfully";
             auditSettingsMessageClass = "success";
@@ -8224,14 +9118,14 @@
             channelDigestFrequency = "weekly";
             channelDigestDay = parts[1].ToLowerInvariant();
             var utcDt = DateTime.UtcNow.Date.AddHours(wh).AddMinutes(wm);
-            var localDt = utcDt.ToLocalTime();
+            var localDt = utcDt.ToLocalTime(DisplayTime);
             channelDigestTime = new TimeOnly(localDt.Hour, localDt.Minute);
         }
         else if (parts.Length >= 3 && int.TryParse(parts[1], out var dh) && int.TryParse(parts[2], out var dm))
         {
             channelDigestFrequency = "daily";
             var utcDt = DateTime.UtcNow.Date.AddHours(dh).AddMinutes(dm);
-            var localDt = utcDt.ToLocalTime();
+            var localDt = utcDt.ToLocalTime(DisplayTime);
             channelDigestTime = new TimeOnly(localDt.Hour, localDt.Minute);
         }
         else
@@ -8246,23 +9140,14 @@
     /// </summary>
     private string BuildDigestScheduleUtc()
     {
-        var localDt = DateTime.Today.Add(channelDigestTime.ToTimeSpan());
-        var utcDt = localDt.ToUniversalTime();
+        var localDt = DisplayTime.Now.Date.Add(channelDigestTime.ToTimeSpan());
+        var utcDt = DisplayTime.ToUtc(localDt);
         var hh = utcDt.Hour.ToString("D2");
         var mm = utcDt.Minute.ToString("D2");
 
         return channelDigestFrequency == "weekly"
             ? $"weekly:{channelDigestDay}:{hh}:{mm}"
             : $"daily:{hh}:{mm}";
-    }
-
-    private static string GetServerTimezoneAbbrev()
-    {
-        var tz = TimeZoneInfo.Local;
-        var now = DateTime.Now;
-        var name = tz.IsDaylightSavingTime(now) ? tz.DaylightName : tz.StandardName;
-        var words = name.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        return words.Length > 1 ? string.Concat(words.Select(w => w[0])) : name;
     }
 
     private async Task SaveAlertChannel()
@@ -8407,7 +9292,7 @@
         {
             // When editing and password field is left blank, preserve the existing encrypted password
             var password = !string.IsNullOrEmpty(channelSmtpPass)
-                ? SecretDecryptor.Encrypt(channelSmtpPass)
+                ? SecretDecryptor.EncryptForSite(channelSmtpPass, SiteContext.Slug)
                 : GetExistingSecret<NetworkOptimizer.Alerts.Delivery.EmailChannelConfig>(existingConfigJson, c => c.Password);
 
             var cfg = new NetworkOptimizer.Alerts.Delivery.EmailChannelConfig
@@ -8429,7 +9314,7 @@
             string? secret = clearWebhookSecret
                 ? null
                 : !string.IsNullOrEmpty(channelWebhookSecret)
-                    ? SecretDecryptor.Encrypt(channelWebhookSecret)
+                    ? SecretDecryptor.EncryptForSite(channelWebhookSecret, SiteContext.Slug)
                     : GetExistingSecret<NetworkOptimizer.Alerts.Delivery.WebhookChannelConfig>(existingConfigJson, c => c.Secret);
 
             // Normalize empty string to null for webhook secrets (optional field)
@@ -8448,14 +9333,14 @@
             string? token = clearNtfyToken
                 ? null
                 : !string.IsNullOrEmpty(channelNtfyAccessToken)
-                    ? SecretDecryptor.Encrypt(channelNtfyAccessToken)
+                    ? SecretDecryptor.EncryptForSite(channelNtfyAccessToken, SiteContext.Slug)
                     : GetExistingSecret<NetworkOptimizer.Alerts.Delivery.NtfyChannelConfig>(existingConfigJson, c => c.AccessToken);
             if (string.IsNullOrEmpty(token)) token = null;
 
             string? password = clearNtfyPassword
                 ? null
                 : !string.IsNullOrEmpty(channelNtfyPassword)
-                    ? SecretDecryptor.Encrypt(channelNtfyPassword)
+                    ? SecretDecryptor.EncryptForSite(channelNtfyPassword, SiteContext.Slug)
                     : GetExistingSecret<NetworkOptimizer.Alerts.Delivery.NtfyChannelConfig>(existingConfigJson, c => c.Password);
             if (string.IsNullOrEmpty(password)) password = null;
 
@@ -8553,9 +9438,47 @@
     // The enable flag is PER SITE, namespaced the same way the collector's SiteScopedKey
     // does: the bare key for the default site (single-site unchanged), "threats.enabled:<slug>"
     // for secondary sites. Interval/retention/MaxMind/CrowdSec are one global value.
-    private string ThreatsEnabledKey => SiteContext.IsDefault
-        ? "threats.enabled"
-        : $"threats.enabled:{SiteContext.Slug}";
+    private string ThreatsEnabledKey => NetworkOptimizer.Web.Services.SiteSettingsAdmin.ThreatCollectionKey(SiteContext);
+
+    private bool _liveTrafficEnabled = true;
+    private bool _savingLiveTraffic;
+    private string _liveTrafficMessage = "";
+    private string _liveTrafficMessageClass = "";
+
+    private async Task LoadLiveTrafficSettings()
+    {
+        try
+        {
+            _liveTrafficEnabled = await LiveTrafficSettings.IsEnabledAsync();
+        }
+        catch (Exception ex)
+        {
+            _liveTrafficMessage = $"Error loading Live Traffic settings: {ex.Message}";
+            _liveTrafficMessageClass = "danger";
+        }
+    }
+
+    private async Task SaveLiveTrafficSettings()
+    {
+        _savingLiveTraffic = true;
+        _liveTrafficMessage = "";
+        StateHasChanged();
+        try
+        {
+            await LiveTrafficSettings.SetEnabledAsync(_liveTrafficEnabled);
+            _liveTrafficMessage = "Live Traffic settings saved.";
+            _liveTrafficMessageClass = "success";
+        }
+        catch (Exception ex)
+        {
+            _liveTrafficMessage = $"Error saving settings: {ex.Message}";
+            _liveTrafficMessageClass = "danger";
+        }
+        finally
+        {
+            _savingLiveTraffic = false;
+        }
+    }
 
     private async Task LoadThreatSettings()
     {
@@ -8587,17 +9510,15 @@
             var mmKey = await SystemSettings.GetGlobalAsync("maxmind.license_key");
             hasMaxmindLicenseKey = !string.IsNullOrEmpty(mmKey);
 
-            var csEnabled = await SystemSettings.GetGlobalAsync("crowdsec.enabled");
-            crowdsecEnabled = csEnabled == "true";
-            var csKey = await SystemSettings.GetGlobalAsync("crowdsec.api_key");
-            hasCrowdsecApiKey = !string.IsNullOrEmpty(csKey);
-
-            var csQuota = await SystemSettings.GetGlobalAsync("crowdsec.daily_quota");
-            if (!string.IsNullOrEmpty(csQuota) && int.TryParse(csQuota, out var quota) && quota >= 1)
-                crowdsecDailyQuota = quota;
-
-            var rateLimitState = CrowdSecClient.GetRateLimitState();
-            crowdsecUsageDisplay = $"{rateLimitState.RequestsToday}/{rateLimitState.DailyLimit}";
+            _ctiCardShown = await CtiSettings.CanEditAsync();
+            if (_ctiCardShown)
+            {
+                var cti = await CtiSettings.GetAsync();
+                crowdsecEnabled = cti.Enabled;
+                hasCrowdsecApiKey = cti.HasKey;
+                crowdsecDailyQuota = cti.DailyQuota;
+                crowdsecUsageDisplay = $"{cti.RequestsToday}/{cti.DailyQuota}";
+            }
         }
         catch (Exception ex)
         {
@@ -8614,14 +9535,14 @@
 
         try
         {
-            await SystemSettings.SetGlobalAsync(ThreatsEnabledKey, threatCollectionEnabled ? "true" : "false");
+            await SiteSettingsAdmin.SetThreatCollectionEnabledAsync(threatCollectionEnabled);
 
-            // Global settings render (and save) only on the main site; a secondary
-            // site's card carries just its own enable toggle.
-            if (SiteContext.IsDefault)
+            // Global settings render (and save) only on the main site, and only for a global
+            // Admin; a secondary site's card carries just its own enable toggle.
+            if (SiteContext.IsDefault && _canEditInstanceSettings)
             {
-                await SystemSettings.SetGlobalAsync("threats.poll_interval_minutes", threatPollInterval.ToString());
-                await SystemSettings.SetGlobalAsync("threats.retention_days", threatRetentionDays.ToString());
+                await SettingsAdmin.SetGlobalAsync("threats.poll_interval_minutes", threatPollInterval.ToString());
+                await SettingsAdmin.SetGlobalAsync("threats.retention_days", threatRetentionDays.ToString());
             }
 
             threatSettingsMessage = "Threat intelligence settings saved.";
@@ -8649,7 +9570,7 @@
             if (!string.IsNullOrEmpty(maxmindAccountId))
             {
                 var encAcct = CredentialService.Encrypt(maxmindAccountId);
-                await SystemSettings.SetGlobalAsync("maxmind.account_id", encAcct);
+                await SettingsAdmin.SetGlobalAsync("maxmind.account_id", encAcct);
                 hasMaxmindAccountId = true;
                 maxmindAccountId = "";
             }
@@ -8657,7 +9578,7 @@
             if (!string.IsNullOrEmpty(maxmindLicenseKey))
             {
                 var encrypted = CredentialService.Encrypt(maxmindLicenseKey);
-                await SystemSettings.SetGlobalAsync("maxmind.license_key", encrypted);
+                await SettingsAdmin.SetGlobalAsync("maxmind.license_key", encrypted);
                 hasMaxmindLicenseKey = true;
                 maxmindLicenseKey = "";
             }
@@ -8712,7 +9633,7 @@
             if (!string.IsNullOrEmpty(maxmindAccountId))
             {
                 var encAcct = CredentialService.Encrypt(maxmindAccountId);
-                await SystemSettings.SetGlobalAsync("maxmind.account_id", encAcct);
+                await SettingsAdmin.SetGlobalAsync("maxmind.account_id", encAcct);
                 hasMaxmindAccountId = true;
                 maxmindAccountId = "";
             }
@@ -8720,7 +9641,7 @@
             if (!string.IsNullOrEmpty(maxmindLicenseKey))
             {
                 var encKey = CredentialService.Encrypt(maxmindLicenseKey);
-                await SystemSettings.SetGlobalAsync("maxmind.license_key", encKey);
+                await SettingsAdmin.SetGlobalAsync("maxmind.license_key", encKey);
                 hasMaxmindLicenseKey = true;
                 maxmindLicenseKey = "";
             }
@@ -8729,13 +9650,13 @@
             using var httpClient = HttpClientFactory.CreateClient();
             httpClient.Timeout = TimeSpan.FromMinutes(5);
 
-            var (success, message) = await GeoService.DownloadDatabasesAsync(accountId, licenseKey, dataPath, httpClient);
+            var (success, partial, message) = await GeoService.DownloadDatabasesAsync(accountId, licenseKey, dataPath, httpClient);
             maxmindMessage = message;
-            maxmindMessageClass = success ? "success" : "danger";
+            maxmindMessageClass = !success ? "danger" : partial ? "warning" : "success";
 
             if (success)
             {
-                await SystemSettings.SetGlobalAsync("maxmind.last_download", DateTime.UtcNow.ToString("O"));
+                await SettingsAdmin.SetGlobalAsync("maxmind.last_download", DateTime.UtcNow.ToString("O"));
                 await LoadThreatSettings(); // Refresh geo status display
             }
         }
@@ -8767,24 +9688,14 @@
 
         try
         {
-            await SystemSettings.SetGlobalAsync("crowdsec.enabled", crowdsecEnabled ? "true" : "false");
+            await CtiSettings.SaveAsync(crowdsecEnabled, crowdsecApiKey, crowdsecDailyQuota);
+            crowdsecApiKey = "";
 
-            var newKeyProvided = !string.IsNullOrEmpty(crowdsecApiKey);
-            if (newKeyProvided)
-            {
-                var encrypted = CredentialService.Encrypt(crowdsecApiKey);
-                await SystemSettings.SetGlobalAsync("crowdsec.api_key", encrypted);
-                hasCrowdsecApiKey = true;
-                crowdsecApiKey = "";
-            }
-
-            await SystemSettings.SetGlobalAsync("crowdsec.daily_quota", crowdsecDailyQuota.ToString());
-
-            // Update the rate limiter. Reset counter when a new API key is saved
-            // since the new key has its own fresh quota on CrowdSec's side.
-            var requestsToday = newKeyProvided ? 0 : CrowdSecClient.GetRateLimitState().RequestsToday;
-            CrowdSecClient.LoadRateLimitState(requestsToday, DateOnly.FromDateTime(DateTime.UtcNow), crowdsecDailyQuota);
-            crowdsecUsageDisplay = $"{requestsToday}/{crowdsecDailyQuota}";
+            // The usage count is per key, so a new key starts at zero.
+            var cti = await CtiSettings.GetAsync();
+            hasCrowdsecApiKey = cti.HasKey;
+            crowdsecDailyQuota = cti.DailyQuota;
+            crowdsecUsageDisplay = $"{cti.RequestsToday}/{cti.DailyQuota}";
 
             crowdsecMessage = "CrowdSec settings saved.";
             crowdsecMessageClass = "success";
@@ -8808,16 +9719,13 @@
 
         try
         {
-            var stored = await SystemSettings.GetGlobalAsync("crowdsec.api_key");
-            if (string.IsNullOrEmpty(stored))
+            if (await CtiSettings.TestAsync() is not { } result)
             {
                 crowdsecMessage = "No CTI API key configured.";
                 crowdsecMessageClass = "warning";
                 return;
             }
 
-            var apiKey = CredentialService.IsEncrypted(stored) ? CredentialService.Decrypt(stored) : stored;
-            var result = await CrowdSecClient.TestApiKeyAsync(apiKey);
             if (result.Success)
             {
                 crowdsecMessage = result.Message;
@@ -8852,7 +9760,7 @@
         StateHasChanged();
         try
         {
-            await SystemSettings.SetGlobalAsync(SystemSettingKeys.MapboxApiKey, string.IsNullOrWhiteSpace(_mapboxToken) ? null : _mapboxToken.Trim());
+            await SettingsAdmin.SetGlobalAsync(SystemSettingKeys.MapboxApiKey, string.IsNullOrWhiteSpace(_mapboxToken) ? null : _mapboxToken.Trim());
             _mapboxTokenMessage = "Mapbox token saved. Reload any open maps to apply.";
             _mapboxTokenMessageClass = "success";
         }
@@ -8875,7 +9783,7 @@
         StateHasChanged();
         try
         {
-            await SystemSettings.SetGlobalAsync(SystemSettingKeys.MapboxApiKey, null);
+            await SettingsAdmin.SetGlobalAsync(SystemSettingKeys.MapboxApiKey, null);
             _mapboxToken = "";
             _mapboxTokenMessage = "Mapbox token cleared.";
             _mapboxTokenMessageClass = "success";
@@ -8940,6 +9848,22 @@
         {
             // Best-effort persistence; the toggle keeps its in-memory state either way.
         }
+    }
+
+    private async Task SetOntErrorWindowAsync(bool enabled)
+    {
+        if (_monitoringSettings == null) return;
+        _monitoringSettings.OntErrorCountersLast24h = enabled;
+        try { await MonitoringSettingsAdmin.SetOntErrorCountersLast24hAsync(enabled); }
+        catch (Exception ex) { Logger.LogWarning(ex, "Failed to save the ONT error counter window"); }
+    }
+
+    private async Task SetCmErrorWindowAsync(bool enabled)
+    {
+        if (_monitoringSettings == null) return;
+        _monitoringSettings.CmErrorCountersLast24h = enabled;
+        try { await MonitoringSettingsAdmin.SetCmErrorCountersLast24hAsync(enabled); }
+        catch (Exception ex) { Logger.LogWarning(ex, "Failed to save the cable modem error counter window"); }
     }
 
     /// <summary>
@@ -9079,46 +10003,19 @@
     /// </summary>
     private async Task<HashSet<string>> GatherBucketsOwnedByOtherSitesAsync()
     {
-        var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Every site, read unfiltered: _sites holds only the sites this caller can see.
+        await using var mainDb = SiteDb.CreateForSite(SiteManagementService.DefaultSiteSlug, isDefault: true);
+        var main = await mainDb.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync();
+        var allSlugs = await mainDb.Sites.AsNoTracking().Select(s => s.Slug).ToListAsync();
 
-        var mainPrimaryBase = "network_monitoring";
-        var mainLongtermBase = "network_monitoring_longterm";
-
-        await using (var mainDb = SiteDb.CreateForSite(SiteManagementService.DefaultSiteSlug, isDefault: true))
-        {
-            var main = await mainDb.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync();
-            if (!string.IsNullOrWhiteSpace(main?.InfluxDbBucket))
+        return await InfluxBucketOwnership.GatherTakenAsync(
+            main?.InfluxDbBucket, main?.InfluxDbLongtermBucket, allSlugs, SiteContext.Slug,
+            async slug =>
             {
-                mainPrimaryBase = main!.InfluxDbBucket!.Trim();
-                taken.Add(mainPrimaryBase);
-            }
-            if (!string.IsNullOrWhiteSpace(main?.InfluxDbLongtermBucket))
-            {
-                mainLongtermBase = main!.InfluxDbLongtermBucket!.Trim();
-                taken.Add(mainLongtermBase);
-            }
-        }
-
-        foreach (var site in _sites)
-        {
-            if (site.Slug == SiteContext.Slug) continue;                       // this site
-            if (site.Slug == SiteManagementService.DefaultSiteSlug) continue;  // main handled above
-
-            string? customPrimary = null, customLongterm = null;
-            try
-            {
-                await using var sdb = SiteDb.CreateForSite(site.Slug, isDefault: false);
+                await using var sdb = SiteDb.CreateForSite(slug, isDefault: false);
                 var s = await sdb.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync();
-                customPrimary = s?.InfluxDbBucket?.Trim();
-                customLongterm = s?.InfluxDbLongtermBucket?.Trim();
-            }
-            catch { /* an unprovisioned site DB contributes only its derived names */ }
-
-            taken.Add(!string.IsNullOrWhiteSpace(customPrimary) ? customPrimary! : $"{site.Slug}-{mainPrimaryBase}");
-            taken.Add(!string.IsNullOrWhiteSpace(customLongterm) ? customLongterm! : $"{site.Slug}-{mainLongtermBase}");
-        }
-
-        return taken;
+                return (s?.InfluxDbBucket, s?.InfluxDbLongtermBucket);
+            });
     }
 
     private async Task SaveInfluxSettings()
@@ -9193,14 +10090,18 @@
             {
                 await SnmpDetection.SaveDetectionResultAsync(result);
                 await LoadMonitoringSettings();
+                var v3PasswordMissing = _monitoringSettings?.SnmpV3PasswordMissing == true;
+                var communityMissing = _monitoringSettings?.SnmpCommunityMissing == true;
                 _monitoringMessage = _monitoringSettings?.SnmpDetectionState switch
                 {
+                    SnmpDetectionState.EnabledV2c when communityMissing => "SNMP v2c detected, but the UniFi Console didn't return its Community String. See Monitoring - Setup.",
                     SnmpDetectionState.EnabledV2c => "SNMP v2c detected and saved.",
+                    SnmpDetectionState.EnabledV3Only when v3PasswordMissing => "SNMPv3 detected, but the UniFi Console didn't return its password. See Monitoring - Setup.",
                     SnmpDetectionState.EnabledV3Only => "SNMPv3 detected and saved.",
                     SnmpDetectionState.Disabled => "SNMP is not enabled on your UniFi Console.",
                     _ => "SNMP detection complete."
                 };
-                _monitoringMessageClass = "success";
+                _monitoringMessageClass = v3PasswordMissing || communityMissing ? "warning" : "success";
             }
             else
             {

@@ -1,12 +1,12 @@
-﻿using Microsoft.AspNetCore.Authentication.Cookies;
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Components.Authorization;
-using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using NetworkOptimizer.Storage.Models.Identity;
 using NetworkOptimizer.Web.Services.Auditing;
 using NetworkOptimizer.Web.Services.Gates;
-using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace NetworkOptimizer.Web.Services.Identity;
 
@@ -115,6 +115,8 @@ public static class IdentityRegistration
         services.AddSingleton<SamlRequestStore>();
         // Ambient caller context (user vs system) for authorization + audit attribution.
         services.AddScoped<ICallerContext, CallerContext>();
+        services.AddScoped<IUserDismissals, UserDismissals>();
+        services.AddScoped<IUserPreferences, UserPreferences>();
         // Hands enrollment recovery codes from the endpoint to the page across the redirect.
         services.AddSingleton<MfaEnrollmentCodes>();
         services.AddScoped<Microsoft.AspNetCore.Components.Server.Circuits.CircuitHandler, CallerContextCircuitHandler>();
@@ -163,7 +165,7 @@ public static class IdentityRegistration
             // Secure only over HTTPS - LAN installs on plain http://host:8042 must still work.
             options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
             options.SlidingExpiration = true;
-            options.ExpireTimeSpan = TimeSpan.FromDays(14);
+            options.ExpireTimeSpan = IdleTimeout;
             options.LoginPath = "/login";
             options.LogoutPath = "/api/auth/logout";
             // NOT the login page: a policy refusing an authenticated user is not a failure to
@@ -207,6 +209,39 @@ public static class IdentityRegistration
                     : $"{options.AccessDeniedPath}?{SiteContextService.SiteQueryParam}={Uri.EscapeDataString(site)}");
                 return Task.CompletedTask;
             };
+
+            // Every sign-in, refreshes included: a login keeps the id it was given at sign-in (a
+            // refresh carries the cookie's properties over), and a new login gets a new one.
+            options.Events.OnSigningIn = context =>
+            {
+                StampLogin(context.Properties, context.Principal);
+                return Task.CompletedTask;
+            };
+
+            // Identity's own handler (the security stamp check) is already in place; it still runs, after
+            // the per-login checks it cannot make.
+            var stampCheck = options.Events.OnValidatePrincipal;
+            options.Events.OnValidatePrincipal = async context =>
+            {
+                var store = context.HttpContext.RequestServices.GetRequiredService<EndedSessionStore>();
+                var loginId = context.Principal?.FindFirst(NetOptClaims.LoginId)?.Value;
+                if (await store.IsEndedAsync(loginId, context.HttpContext.RequestAborted))
+                {
+                    context.RejectPrincipal();
+                    await context.HttpContext.SignOutAsync(IdentityConstants.ApplicationScheme);
+                    return;
+                }
+
+                // A cookie issued before logins had ids gets one on its next request, so signing out
+                // can end it too. Only the copy that asks first gets this id; any other copy gets its own.
+                if (loginId is null && context.Principal != null)
+                {
+                    StampLogin(context.Properties, context.Principal);
+                    context.ShouldRenew = true;
+                }
+
+                await stampCheck(context);
+            };
         });
 
         // Rotate/revoke sessions within ~5 min of a stamp change (role/password/MFA/disable).
@@ -218,6 +253,43 @@ public static class IdentityRegistration
         // Blazor Server circuit revalidation (security stamp + IsEnabled + membership version).
         services.AddScoped<AuthenticationStateProvider, RevalidatingIdentityAuthenticationStateProvider>();
 
+        services.AddSingleton<EndedSessionStore>();
+
         return services;
     }
+
+    /// <summary>
+    /// How long a login lasts unused. The cookie slides, so any use renews it; there is
+    /// deliberately no cap on a login's total age, which would sign out people who are using it.
+    /// </summary>
+    public static readonly TimeSpan IdleTimeout = TimeSpan.FromDays(30);
+
+    /// <summary>
+    /// How long an ended login is remembered. With no age cap, a copied cookie used at least every
+    /// <see cref="IdleTimeout"/> never expires on its own, so its record has to outlive it.
+    /// </summary>
+    public static readonly TimeSpan EndedLoginRetention = TimeSpan.FromDays(365);
+
+    private const string LoginIdItem = "netopt.login";
+
+    /// <summary>
+    /// Gives a login its id if it has none, and puts the id on the principal so a Blazor circuit,
+    /// which sees only the principal, can be checked against it too.
+    /// </summary>
+    private static void StampLogin(AuthenticationProperties properties, ClaimsPrincipal? principal)
+    {
+        if (!properties.Items.TryGetValue(LoginIdItem, out var loginId) || string.IsNullOrEmpty(loginId))
+            properties.Items[LoginIdItem] = loginId = Guid.NewGuid().ToString("N");
+
+        if (principal?.Identity is not ClaimsIdentity identity) return;
+        foreach (var stale in identity.FindAll(NetOptClaims.LoginId).ToList())
+            identity.RemoveClaim(stale);
+        identity.AddClaim(new Claim(NetOptClaims.LoginId, loginId!));
+    }
+
+    /// <summary>The login a request's cookie belongs to, for ending it at sign-out.</summary>
+    public static string? LoginIdOf(ClaimsPrincipal principal) => principal.FindFirst(NetOptClaims.LoginId)?.Value;
+
+    /// <summary>How long an ending login is kept on record: see <see cref="EndedLoginRetention"/>.</summary>
+    public static DateTime LoginExpiry() => DateTime.UtcNow + EndedLoginRetention;
 }

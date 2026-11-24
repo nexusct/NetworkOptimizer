@@ -17,15 +17,20 @@
 #   --lan-speed-test Host the LAN speed test page (port 24443) and iperf3 (5201)
 #   --speed-test-port N  Serve the LAN speed test page on N instead of 24443. The agent tells the
 #                    server which port it uses, so in-app links follow automatically.
+#   --speed-test-http-port N  Plain HTTP listener the HTTPS page hands the test to after taking
+#                    the GPS fix (default 24080; 0 keeps the whole test on HTTPS). Kept on re-runs.
 #   --insecure       Accept a self-signed cert on the server's reverse proxy
 #   --release TAG    Install this release (e.g. v2.9.1-preview1) instead of the latest stable one
 #   --force-native   Skip the UniFi gateway refusal (this installer targets a
 #                    separate box; on a UniFi OS gateway use install-agent-gateway.sh)
-#   --dir PATH       Install directory (default: /opt/netopt-agent)
+#   --dir PATH       Install directory (default: the existing install's, else /opt/netopt-agent)
 #   --uninstall      Stop and remove the agent, its services, install dir, and any
 #                    AppArmor override this installer added, then exit
 #   --configure-apparmor  With --lan-speed-test: add a persistent AppArmor exception
 #                    if the host's nginx profile blocks the speed test (off by default)
+#
+# Exit status 3: a first install stopped because this host does not trust the server's
+# certificate while the tunnel works with it unchecked (re-run with --insecure if it is yours).
 
 set -euo pipefail
 
@@ -34,11 +39,13 @@ TOKEN=""
 LAN_SPEED_TEST=false
 SPEED_TEST_PORT=24443
 PORT_REQUESTED=false
+HTTP_PORT=""
 INSECURE=false
 UNINSTALL=false
 FORCE_NATIVE=false
 CONFIGURE_APPARMOR=false
 INSTALL_DIR="/opt/netopt-agent"
+DIR_REQUESTED=false
 SERVICE_NAME="netopt-agent"
 SPEEDTEST_SERVICE="netopt-speedtest-nginx"
 RELEASE_BASE="https://github.com/Ozark-Connect/NetworkOptimizer/releases/latest/download"
@@ -50,11 +57,12 @@ while [ $# -gt 0 ]; do
         --token) TOKEN="$2"; shift 2 ;;
         --lan-speed-test) LAN_SPEED_TEST=true; shift ;;
         --speed-test-port) SPEED_TEST_PORT="$2"; PORT_REQUESTED=true; shift 2 ;;
+        --speed-test-http-port) HTTP_PORT="$2"; shift 2 ;;
         --insecure) INSECURE=true; shift ;;
         --uninstall) UNINSTALL=true; shift ;;
         --force-native) FORCE_NATIVE=true; shift ;;
         --configure-apparmor) CONFIGURE_APPARMOR=true; shift ;;
-        --dir) INSTALL_DIR="$2"; shift 2 ;;
+        --dir) INSTALL_DIR="$2"; DIR_REQUESTED=true; shift 2 ;;
         --release) RELEASE_TAG="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
@@ -73,6 +81,17 @@ if [ -n "$RELEASE_TAG" ]; then
     RELEASE_BASE="https://github.com/Ozark-Connect/NetworkOptimizer/releases/download/${RELEASE_TAG}"
 fi
 
+# An existing install stays where it is. The server's upgrade command passes no --dir, so without
+# this an install in a custom directory got a second copy in the default one (or failed where that
+# is read-only) while the running agent stayed on the old binary.
+if [ "$DIR_REQUESTED" != true ] && [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
+    EXISTING_DIR=$(sed -n 's#^ExecStart=\(/.*\)/NetworkOptimizer\.Agent[[:space:]]*$#\1#p' "/etc/systemd/system/${SERVICE_NAME}.service" | head -1)
+    if [ -n "$EXISTING_DIR" ] && [ "$EXISTING_DIR" != "$INSTALL_DIR" ] && [ -d "$EXISTING_DIR" ]; then
+        INSTALL_DIR="$EXISTING_DIR"
+        echo "Using the existing install directory ${INSTALL_DIR} (pass --dir to override)."
+    fi
+fi
+
 # An install that already serves the LAN speed test keeps serving it, whether or not the flag was
 # repeated on this run. Without this, re-running to update the binary quietly stopped refreshing the
 # nginx config while agent.json (deliberately preserved) kept the speed test switched on - so the two
@@ -89,6 +108,28 @@ if [ "$SPEED_TEST_PORT" = "24443" ] && [ -f "${INSTALL_DIR}/agent.json" ]; then
     EXISTING_PORT=$(sed -n 's/.*"lanSpeedTestPort"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${INSTALL_DIR}/agent.json" | head -1)
     [ -n "$EXISTING_PORT" ] && SPEED_TEST_PORT="$EXISTING_PORT"
 fi
+case "$SPEED_TEST_PORT" in
+    ''|*[!0-9]*) echo "Invalid --speed-test-port: $SPEED_TEST_PORT" >&2; exit 1 ;;
+esac
+
+# The plain HTTP handoff port lives only in the served config.js, so a re-run reads it back there.
+# An automatic off (port was taken) carries a trailing comment and is not read back: rechecked.
+HTTP_PORT_NOTE=""
+# Guarded by -f: under pipefail a sed on a missing file would fail the assignment and exit.
+if [ -z "$HTTP_PORT" ] && [ -f "${INSTALL_DIR}/speedtest-web/assets/js/config.js" ]; then
+    HTTP_PORT=$(sed -n 's/^var plainHttpPort = \([0-9][0-9]*\);$/\1/p' "${INSTALL_DIR}/speedtest-web/assets/js/config.js" | head -1)
+fi
+[ -n "$HTTP_PORT" ] || HTTP_PORT=24080
+case "$HTTP_PORT" in
+    *[!0-9]*|'') echo "Invalid --speed-test-http-port: $HTTP_PORT" >&2; exit 1 ;;
+esac
+
+# Git ref the speed test page and nginx config are fetched from. Testing a branch's installer
+# against its own assets: AGENT_ASSETS_REF=<branch or commit>. Default main.
+ASSETS_REF="${AGENT_ASSETS_REF:-main}"
+case "$ASSETS_REF" in
+    *[!A-Za-z0-9._/-]*|'') echo "Invalid AGENT_ASSETS_REF: $ASSETS_REF" >&2; exit 1 ;;
+esac
 
 # --- Output helpers -----------------------------------------------------------
 # Colorized, structured output; colors collapse to empty when stdout isn't a
@@ -104,6 +145,107 @@ ok()   { printf '  %s\xe2\x9c\x93%s %s\n' "$_grn" "$_rst" "$*"; }
 note() { printf '  %s%s%s\n' "$_dim" "$*" "$_rst"; }
 warn() { printf '  %s\xe2\x9a\xa0%s  %s\n' "$_ylw" "$_rst" "$*"; }
 err()  { printf '%sError:%s %s\n' "${_red}${_b}" "$_rst" "$*" >&2; exit 1; }
+
+# --- Server pre-flight --------------------------------------------------------
+# Probes the tunnel route the agent uses (the agent README's "Verify the connection" call). It stops
+# an install in one case only: the certificate is untrusted while -k reaches a working tunnel, so the
+# agent could never connect. Anything else warns or skips, so a curl that cannot run the probe never
+# blocks an install. Each curl runs on the left of && / ||, where set -e does not apply.
+PREFLIGHT_DOC="https://github.com/Ozark-Connect/NetworkOptimizer/blob/main/src/NetworkOptimizer.Agent/README.md#verify-the-connection"
+# The stop's exit status. Run It for Me and the Proxmox installer read it to offer --insecure.
+PREFLIGHT_UNTRUSTED_EXIT=3
+# $1: the base URL. The rest are extra curl arguments.
+tunnel_probe() {
+    local base="$1"; shift
+    curl "$@" -sS -D - -o /dev/null --http2 --max-time 10 -X POST -H 'content-type: application/grpc' \
+        "${base%/}/networkoptimizer.agent.v1.AgentTunnel/Connect" 2>&1
+}
+tunnel_verdict() {
+    # Here-strings, not pipes: under pipefail an early-exiting grep -q can fail the pipe on a match.
+    # No -i: GNU grep 3.0 aborts on -iF. HTTP/2 headers are lowercase, HTTP/1.1 ones capitalized.
+    if grep -qE '[Gg]rpc-[Mm]essage: First message must be a hello' <<<"$1"; then echo hello
+    elif grep -qE '[Gg]rpc-[Mm]essage: Service is unimplemented' <<<"$1"; then echo unimplemented
+    # The app's own answer when a proxy forwards the tunnel path to it over HTTP/1.1.
+    elif grep -qE "Request protocol 'HTTP/1\.1' is not supported" <<<"$1"; then echo unimplemented
+    elif grep -qE '^HTTP/[0-9.]+ 404' <<<"$1" && ! grep -qE '^[Gg]rpc-[Mm]essage:' <<<"$1"; then echo notfound
+    else echo other
+    fi
+}
+# What a failed probe says about the route, or nothing when it says nothing. $1 output, $2 curl exit, $3 base URL.
+route_problem() {
+    local code
+    case "$2" in
+        6|7|28) echo "Could not reach ${3%/} (curl exit $2). The install continues and the agent keeps retrying."; return 0 ;;
+        35) echo "The TLS handshake with ${3%/} failed (curl exit 35). Check that the URL points at the proxy's HTTPS port."; return 0 ;;
+        52|56) echo "The connection to ${3%/} closed without an answer (curl exit $2)."; return 0 ;;
+        60|51) return 0 ;;
+    esac
+    case "$(tunnel_verdict "$1")" in
+        unimplemented) echo "The proxy sends the tunnel path to the app, not the tunnel port: add the gRPC route." ;;
+        notfound) echo "The proxy has no route for the tunnel path at ${3%/} (HTTP 404)." ;;
+        *)
+            code=$(sed -n 's#^HTTP/[0-9.]* \([0-9][0-9]*\).*#\1#p' <<<"$1") || code=""
+            code=${code##*$'\n'}
+            if [ -n "$code" ]; then echo "The tunnel route did not answer at ${3%/} (HTTP ${code})."; fi
+            ;;
+    esac
+    return 0
+}
+# $1: the agent.json path. $2: "stop" when this installer may stop on an untrusted certificate.
+preflight_server() {
+    local config="$1" may_stop="$2" enrolled=false tls="" base="$SERVER" out rc verdict version saved msg
+    step "Checking the server"
+    version=$(curl --version 2>/dev/null) || version=""
+    if ! grep -q 'HTTP2' <<<"$version"; then
+        note "Skipped: this host's curl has no HTTP/2 support, so it cannot test the tunnel route."
+        return 0
+    fi
+    if ${SUDO:-} grep -q '"agentKey"' "$config" 2>/dev/null; then
+        enrolled=true
+        # An enrolled agent keeps its agent.json, so probe the URL it actually dials.
+        saved=$(${SUDO:-} sed -n 's/^[[:space:]]*"tunnelUrl":[[:space:]]*"\([^"]*\)".*/\1/p' "$config" 2>/dev/null) || saved=""
+        saved=${saved%%$'\n'*}
+        case "$saved" in https://*) base="$saved" ;; esac
+    fi
+    if [ "$INSECURE" = true ] || ${SUDO:-} grep -q '"ignoreSslErrors":[[:space:]]*true' "$config" 2>/dev/null; then
+        tls="-k"
+    fi
+    out=$(tunnel_probe "$base" $tls) && rc=0 || rc=$?
+    verdict=$(tunnel_verdict "$out")
+    if [ "$verdict" = hello ]; then
+        ok "The tunnel route answers at ${base%/}"
+        return 0
+    fi
+    case "$rc" in
+        60|51)
+            if [ -z "$tls" ]; then
+                out=$(tunnel_probe "$base" -k) && rc=0 || rc=$?
+                if [ "$(tunnel_verdict "$out")" = hello ]; then
+                    if [ "$enrolled" = true ]; then
+                        warn "This host does not trust the server's certificate. If you issued it yourself, set \"ignoreSslErrors\": true in ${config} and restart the agent. Otherwise fix the certificate on the reverse proxy."
+                        return 0
+                    fi
+                    # The stop needs this host's trust store to work, or a broken store would read as a bad certificate.
+                    if [ "$may_stop" = stop ] && curl -sS -o /dev/null --max-time 10 https://github.com >/dev/null 2>&1; then
+                        printf '%sError:%s %s\n' "${_red}${_b}" "$_rst" "This host does not trust the server's certificate, so the agent cannot connect to ${base%/}. If you issued the certificate yourself, re-run this command with --insecure. Otherwise fix the certificate on the reverse proxy. See ${PREFLIGHT_DOC}" >&2
+                        exit "$PREFLIGHT_UNTRUSTED_EXIT"
+                    fi
+                    warn "This host does not trust the server's certificate. If you issued it yourself, re-run this command with --insecure. Otherwise fix the certificate on the reverse proxy."
+                    return 0
+                fi
+            fi
+            # The route problem behind the certificate one, from the -k probe when it ran.
+            warn "This host does not trust the server's certificate."
+            ;;
+    esac
+    msg=$(route_problem "$out" "$rc" "$base")
+    if [ -n "$msg" ]; then
+        warn "$msg See ${PREFLIGHT_DOC}"
+    else
+        note "Inconclusive (curl exit ${rc}); continuing."
+    fi
+    return 0
+}
 
 # --- LAN speed test nginx: AppArmor remediation -------------------------------
 # Some distros ship an ENFORCING AppArmor profile on the nginx binary that only
@@ -256,6 +398,12 @@ remove_apparmor_override() {
     return 0
 }
 
+# True if something listens on TCP port $1, IPv4 or IPv6. Reads /proc, so no ss or netstat needed.
+port_listening() {
+    awk -v h=":$(printf '%04X' "$1")" '$4 == "0A" && toupper($2) ~ (h "$") { f = 1 } END { exit !f }' \
+        /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
 # nginx workers drop privileges after start, so an install dir whose ancestors are
 # not world-traversable (e.g. under /root, mode 700) makes them 403 - they can't
 # reach the webroot. True in that case, so the wrapper should run workers as root.
@@ -320,6 +468,78 @@ stop_and_reap_agent() {
     fi
 }
 
+# Automatic Blocking's rules from an agent on a gateway: its chain, the jumps to it, and its sets.
+# They outlive the agent otherwise; nothing else uses these names.
+remove_gateway_blocklist() {
+    local t c s
+    for t in iptables ip6tables; do
+        command -v "$t" >/dev/null 2>&1 || continue
+        for c in FORWARD INPUT; do
+            while "$t" -D "$c" -j NETOPT_BLOCK 2>/dev/null; do :; done
+        done
+        # Skip a chain that is absent (any non-gateway host): some iptables builds print the
+        # "cannot find chain" error on stdout, which 2>/dev/null does not catch.
+        "$t" -w -S NETOPT_BLOCK >/dev/null 2>&1 || continue
+        "$t" -F NETOPT_BLOCK >/dev/null 2>&1 || true
+        "$t" -X NETOPT_BLOCK >/dev/null 2>&1 || true
+    done
+    # Its dead-man timer would otherwise stay armed for up to an hour on a host already cleaned up.
+    systemctl stop netopt-blocklist-cleanup.timer netopt-blocklist-cleanup.service 2>/dev/null || true
+    command -v ipset >/dev/null 2>&1 || return 0
+    for s in netopt_block_v4 netopt_block_v6 netopt_guard_v4 netopt_guard_v6 netopt_out_v4 netopt_out_v6; do
+        ipset destroy "${s}_tmp" 2>/dev/null || true
+        ipset destroy "$s" 2>/dev/null || true
+    done
+}
+
+# WAN Flood Protection's rules from an agent on a gateway: the mangle chains and their jumps, the guard
+# sets, our tc filters (priorities 100-163 and 200-263), and an ingress qdisc the agent added and left
+# empty. UniFi's own filters and qdiscs are never touched. Reads wan-flood.json, so run before the dir goes.
+remove_wan_flood() {
+    local t c ch s d p o owned
+    for t in iptables ip6tables; do
+        command -v "$t" >/dev/null 2>&1 || continue
+        for c in PREROUTING FORWARD; do
+            # || true: with no flood rules grep exits 1, and under pipefail set -e would end the uninstall.
+            "$t" -w -t mangle -S "$c" 2>/dev/null | grep -E -e '-j NETOPT_FLOOD(_FWD)?$' | sed 's/^-A/-D/' \
+                | while read -r r; do "$t" -w -t mangle $r 2>/dev/null; done || true
+        done
+        for ch in NETOPT_FLOOD NETOPT_FLOOD_FWD NETOPT_PROBE; do
+            "$t" -w -t mangle -S "$ch" >/dev/null 2>&1 || continue
+            "$t" -w -t mangle -F "$ch" >/dev/null 2>&1 || true
+            "$t" -w -t mangle -X "$ch" >/dev/null 2>&1 || true
+        done
+    done
+    if command -v ipset >/dev/null 2>&1; then
+        for s in netopt_flood_guard_v4 netopt_flood_guard_v6 netopt_probe; do
+            ipset destroy "${s}_tmp" 2>/dev/null || true
+            ipset destroy "$s" 2>/dev/null || true
+        done
+    fi
+    if command -v tc >/dev/null 2>&1; then
+        # Guarded by -f: under pipefail a sed on a missing file would fail the assignment and exit.
+        owned=""
+        if [ -f "${INSTALL_DIR}/wan-flood.json" ]; then
+            owned=$(sed -n 's/.*"ownedQdiscs":\[\([^]]*\)\].*/\1/p' "${INSTALL_DIR}/wan-flood.json" | tr -d '"' | tr ',' ' ')
+        fi
+        for d in $(ls /sys/class/net 2>/dev/null); do
+            tc qdisc show dev "$d" ingress 2>/dev/null | grep -q 'ingress ffff:' || continue
+            for p in $(tc filter show dev "$d" parent ffff: 2>/dev/null | grep -o 'pref [0-9]*' | awk '{print $2}' | sort -u); do
+                if { [ "$p" -ge 100 ] && [ "$p" -le 163 ]; } || { [ "$p" -ge 200 ] && [ "$p" -le 263 ]; }; then
+                    tc filter del dev "$d" parent ffff: pref "$p" 2>/dev/null || true
+                fi
+            done
+            for o in $owned; do
+                if [ "$o" = "$d" ] && [ -z "$(tc filter show dev "$d" parent ffff: 2>/dev/null)" ]; then
+                    tc qdisc del dev "$d" ingress 2>/dev/null || true
+                fi
+            done
+        done
+    fi
+    ip link del netopt_probe 2>/dev/null || true
+    systemctl stop netopt-flood-cleanup.timer netopt-flood-cleanup.service 2>/dev/null || true
+}
+
 uninstall_agent() {
     step "Removing the Network Optimizer agent"
     note "${SERVICE_NAME} + ${INSTALL_DIR}"
@@ -328,6 +548,8 @@ uninstall_agent() {
     local had_speedtest=0
     [ -f "/etc/systemd/system/${SPEEDTEST_SERVICE}.service" ] && had_speedtest=1
     stop_and_reap_agent
+    remove_gateway_blocklist
+    remove_wan_flood
     rm -f "/etc/systemd/system/${SERVICE_NAME}.service" \
           "/etc/systemd/system/${SPEEDTEST_SERVICE}.service" \
           "/etc/systemd/system/multi-user.target.wants/${SERVICE_NAME}.service"
@@ -369,7 +591,7 @@ fi
 if [ "$FORCE_NATIVE" != true ] && command -v ubnt-device-info >/dev/null 2>&1; then
     err "This host is a UniFi OS gateway ($(ubnt-device-info model 2>/dev/null || echo model unknown)) - use the on-gateway installer instead:
   curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/agent/install-agent-gateway.sh | bash -s -- --server ... --token ...
-Re-run with --force-native to override (not recommended: no memory fence, and the LAN speed test does not belong on the router)."
+Re-run with --force-native to override (not recommended: the gateway installer adds the memory fence and gateway-safe speed test setup)."
 fi
 
 [ -n "$SERVER" ] || err "--server is required (the central server's HTTPS address)"
@@ -388,6 +610,7 @@ esac
 
 printf '\n%sNetwork Optimizer on-site agent%s\n' "$_b" "$_rst"
 note "Installing to ${INSTALL_DIR}  (${RID})"
+preflight_server "${INSTALL_DIR}/agent.json" stop
 mkdir -p "$INSTALL_DIR"
 
 # Binaries are downloaded to a temp name and renamed into place: writing over a
@@ -401,12 +624,58 @@ chmod +x "${INSTALL_DIR}/NetworkOptimizer.Agent.new"
 mv -f "${INSTALL_DIR}/NetworkOptimizer.Agent.new" "${INSTALL_DIR}/NetworkOptimizer.Agent"
 ok "agent (${RID})"
 
+# On a 64K-page kernel (some arm64 servers, EFG and UDM-Beast class gateways) .NET's default regions GC
+# refuses large allocations with memory free; the segments GC (libclrgc.so) does not. A module from another
+# runtime than the binary's stops the agent from starting, and "latest" can move between the two
+# downloads, so both runtime stamps must match. Any miss keeps the default GC.
+GC_ENV=""
+if [ "$RID" = "linux-arm64" ] && [ "$(getconf PAGESIZE 2>/dev/null)" = "65536" ]; then
+    GC_NEW="${INSTALL_DIR}/libclrgc.so.new"
+    if curl -fsL "${RELEASE_BASE}/libclrgc-${RID}.so" -o "$GC_NEW" 2>/dev/null; then
+        BIN_RT=$(grep -ao '@(#)Version [0-9.]*' "${INSTALL_DIR}/NetworkOptimizer.Agent" 2>/dev/null | head -n1 || true)
+        GC_RT=$(grep -ao '@(#)Version [0-9.]*' "$GC_NEW" 2>/dev/null | head -n1 || true)
+        if [ -n "$BIN_RT" ] && [ "$BIN_RT" = "$GC_RT" ]; then
+            mv -f "$GC_NEW" "${INSTALL_DIR}/libclrgc.so"
+            GC_ENV="Environment=DOTNET_GCName=libclrgc.so"
+            ok "segments GC (this host uses 64K memory pages)"
+        else
+            rm -f "$GC_NEW"
+            warn "this host uses 64K memory pages, but the GC module does not match this agent build: keeping the default GC"
+        fi
+    else
+        rm -f "$GC_NEW"
+        warn "this host uses 64K memory pages, but this release has no GC module for them: keeping the default GC"
+    fi
+fi
+
 # uwnspeedtest binary for site-local WAN speed tests; the agent resolves it next
 # to itself (AppContext.BaseDirectory/uwnspeedtest).
 curl -fsSL "${RELEASE_BASE}/uwnspeedtest-${RID}" -o "${INSTALL_DIR}/uwnspeedtest.new"
 chmod +x "${INSTALL_DIR}/uwnspeedtest.new"
 mv -f "${INSTALL_DIR}/uwnspeedtest.new" "${INSTALL_DIR}/uwnspeedtest"
 ok "WAN speed test helper"
+
+# iperf3 runs the client leg of LAN speed tests the server starts, on every agent, and the
+# iperf3 server with --lan-speed-test. Best effort: without it the agent still installs, and
+# those tests fail with a message that names the missing binary.
+install_iperf3() {
+    command -v iperf3 >/dev/null 2>&1 && return 0
+    # stdin is closed for the package manager: under `curl | bash` it is this script.
+    if command -v apt-get >/dev/null 2>&1; then
+        # Debian's package can run its own iperf3 daemon, which would hold port 5201.
+        echo "iperf3 iperf3/start_daemon boolean false" | debconf-set-selections >/dev/null 2>&1 || true
+        { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3; } </dev/null >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then dnf install -y -q iperf3 </dev/null >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then yum install -y -q iperf3 </dev/null >/dev/null 2>&1 || true
+    elif command -v apk >/dev/null 2>&1; then apk add --no-cache iperf3 </dev/null >/dev/null 2>&1 || true
+    fi
+    command -v iperf3 >/dev/null 2>&1
+}
+if install_iperf3; then
+    ok "iperf3"
+else
+    warn "could not install iperf3 automatically - install it to run LAN speed tests from this agent."
+fi
 
 CONFIG="${INSTALL_DIR}/agent.json"
 
@@ -432,7 +701,7 @@ if grep -q '"agentKey"' "$CONFIG" 2>/dev/null; then
         if [ "$INSECURE" = true ] || grep -q '"ignoreSslErrors":[[:space:]]*true' "$CONFIG"; then CURL_TLS="-k"; fi
         KEY_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 $CURL_TLS \
             -H 'Content-Type: application/json' -d "{\"agentKey\":\"${CURRENT_KEY}\"}" \
-            "${SERVER_URL%/}/api/public/agents/heartbeats" 2>/dev/null)
+            "${SERVER_URL%/}/api/public/agents/heartbeats" 2>/dev/null || true)   # unreachable: 000, not a set -e exit
         case "$KEY_STATUS" in
             204)
                 note "Existing enrollment is still valid - keeping the agent key (the token is not needed)"
@@ -517,13 +786,31 @@ if [ "$LAN_SPEED_TEST" = true ]; then
     if [ -x "$NGINX_BIN" ]; then
         # Webroot lives beside the deployables, not in /usr/share/nginx/html (which
         # may belong to the system nginx or sit on a read-only root on appliances).
+        # A port something else holds would stop nginx from starting at all. A taken page port skips
+        # the speed test (its start is the last step, after the agent is up); a taken handoff port
+        # turns the handoff off. A port our current config already listens on is ours: no check.
+        SPEEDTEST_OK=true
+        if ! grep -qE "^[[:space:]]*listen[[:space:]]+(\[::\]:)?${SPEED_TEST_PORT}[[:space:];]" "${INSTALL_DIR}/nginx-speedtest-server.conf" 2>/dev/null \
+            && port_listening "$SPEED_TEST_PORT"; then
+            SPEEDTEST_OK=false
+            warn "port ${SPEED_TEST_PORT} is in use on this host - skipping the LAN speed test (pick another with --speed-test-port)."
+        fi
+        if [ "$HTTP_PORT" != "0" ] \
+            && ! grep -qE "^[[:space:]]*listen[[:space:]]+(\[::\]:)?${HTTP_PORT}[[:space:];]" "${INSTALL_DIR}/nginx-speedtest-server.conf" 2>/dev/null; then
+            if port_listening "$HTTP_PORT"; then
+                warn "port ${HTTP_PORT} is in use on this host - plain HTTP handoff off, the test stays on HTTPS (pick another with --speed-test-http-port)."
+                HTTP_PORT=0
+                HTTP_PORT_NOTE=" // off: port in use, rechecked on the next install run"
+            fi
+        fi
         WEBROOT="${INSTALL_DIR}/speedtest-web"
-        RAW="https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main"
+        RAW="https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/${ASSETS_REF}"
         mkdir -p "$WEBROOT/assets/js"
         note "Fetching the OpenSpeedTest page"
         TARBALL="$(mktemp)"; TMPX="$(mktemp -d)"
-        curl -fsSL "https://github.com/Ozark-Connect/NetworkOptimizer/archive/refs/heads/main.tar.gz" -o "$TARBALL"
-        tar -xzf "$TARBALL" -C "$TMPX" --strip-components=3 "NetworkOptimizer-main/src/OpenSpeedTest"
+        curl -fsSL "https://github.com/Ozark-Connect/NetworkOptimizer/archive/${ASSETS_REF}.tar.gz" -o "$TARBALL"
+        # GitHub names the archive's top dir after the ref, with / turned into -.
+        tar -xzf "$TARBALL" -C "$TMPX" --strip-components=3 "NetworkOptimizer-$(echo "$ASSETS_REF" | tr '/' '-')/src/OpenSpeedTest"
         cp -r "$TMPX/." "$WEBROOT/"
         rm -rf "$TARBALL" "$TMPX"
 
@@ -536,6 +823,7 @@ var externalServerId = "";
 var clientResultsUrl = window.location.protocol + "//" + window.location.host + "/client-speedtest";
 var OpenSpeedTestdb = "";
 CFGJS
+        echo "var plainHttpPort = ${HTTP_PORT};${HTTP_PORT_NOTE}" >> "$WEBROOT/assets/js/config.js"
         # World-readable so nginx's unprivileged workers can serve it wherever the
         # install dir lives (e.g. under /root on some appliances).
         chmod -R a+rX "$WEBROOT"
@@ -553,6 +841,14 @@ CFGJS
         if [ "$SPEED_TEST_PORT" != "24443" ]; then
             sed -i "/listen/ s/24443/${SPEED_TEST_PORT}/" "${INSTALL_DIR}/nginx-speedtest-server.conf"
             note "LAN speed test page on port ${SPEED_TEST_PORT}"
+        fi
+        # The plain HTTP twin listener the HTTPS page hands the test to (0 removes it).
+        if [ "$HTTP_PORT" = "0" ]; then
+            sed -i '/listen.*24080/d' "${INSTALL_DIR}/nginx-speedtest-server.conf"
+            note "Plain HTTP handoff off - the whole test runs on HTTPS"
+        elif [ "$HTTP_PORT" != "24080" ]; then
+            sed -i "/listen/ s/24080/${HTTP_PORT}/" "${INSTALL_DIR}/nginx-speedtest-server.conf"
+            note "Plain HTTP handoff on port ${HTTP_PORT}"
         fi
 
         if [ "${AGENT_SPEEDTEST_TLS:-1}" = "0" ]; then
@@ -598,6 +894,27 @@ CFGJS
             -e "s#__SERVERCONF__#${INSTALL_DIR}/nginx-speedtest-server.conf#" \
             "${INSTALL_DIR}/nginx-speedtest.conf"
 
+        # Temp paths under the install dir, set before any `nginx -t` below: the borrowed
+        # binary's compiled-in ones belong to the host's own nginx (/var/lib/nginx/* on
+        # Debian), and a master (even `nginx -t`) re-owns them to its worker user, locking the
+        # host nginx's workers out of buffering uploads and proxied responses.
+        TEMPDIR="${INSTALL_DIR}/nginx-temp"
+        mkdir -p "$TEMPDIR"
+        sed -i "s#^http {#http {\n    client_body_temp_path ${TEMPDIR}/client_body;\n    proxy_temp_path ${TEMPDIR}/proxy;\n    fastcgi_temp_path ${TEMPDIR}/fastcgi;\n    uwsgi_temp_path ${TEMPDIR}/uwsgi;\n    scgi_temp_path ${TEMPDIR}/scgi;#" \
+            "${INSTALL_DIR}/nginx-speedtest.conf"
+        # Every compiled temp path, plus the five every build has, must now point at ours. A
+        # build with one we do not override skips the speed test rather than take it.
+        TEMP_DIRECTIVES="client_body_temp_path proxy_temp_path fastcgi_temp_path uwsgi_temp_path scgi_temp_path"
+        for opt in $("$NGINX_BIN" -V 2>&1 | tr ' ' '\n' | sed -n 's/^--http-\(.*\)-temp-path=.*/\1/p'); do
+            TEMP_DIRECTIVES="$TEMP_DIRECTIVES $(echo "$opt" | tr '-' '_')_temp_path"
+        done
+        for d in $(echo "$TEMP_DIRECTIVES" | tr ' ' '\n' | sort -u); do
+            if ! grep -qE "^[[:space:]]*${d}[[:space:]]+${TEMPDIR}/" "${INSTALL_DIR}/nginx-speedtest.conf"; then
+                SPEEDTEST_OK=false
+                warn "this host's nginx has a temp path (${d}) the speed test does not override, so starting it would take that directory from the host's own nginx. Skipping the LAN speed test."
+            fi
+        done
+
         # If the install dir isn't world-traversable (e.g. under /root, mode 700),
         # unprivileged nginx workers can't reach the webroot and every request 403s.
         # Run the workers as root in that case so the page serves wherever it lives;
@@ -642,11 +959,17 @@ UNIT
         # our install dir, add a local override and let the re-test below decide. This
         # is skipped entirely when the test already passes, so working hosts are
         # untouched.
-        if ! "$NGINX_BIN" -t -c "${INSTALL_DIR}/nginx-speedtest.conf" >/dev/null 2>&1; then
+        if [ "$SPEEDTEST_OK" != true ]; then
+            # Never even `nginx -t` it, and keep an earlier install's enabled unit from
+            # starting at the end of this run.
+            systemctl disable --now --quiet netopt-speedtest-nginx.service 2>/dev/null || true
+        elif ! "$NGINX_BIN" -t -c "${INSTALL_DIR}/nginx-speedtest.conf" >/dev/null 2>&1; then
             maybe_fix_apparmor_nginx
         fi
 
-        if "$NGINX_BIN" -t -c "${INSTALL_DIR}/nginx-speedtest.conf" >/dev/null 2>&1; then
+        if [ "$SPEEDTEST_OK" != true ]; then
+            :
+        elif "$NGINX_BIN" -t -c "${INSTALL_DIR}/nginx-speedtest.conf" >/dev/null 2>&1; then
             systemctl daemon-reload
             # Enable now, but START it below, after the agent unit is installed and
             # running - nginx BindsTo the agent, so starting it before the agent exists
@@ -677,12 +1000,16 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/NetworkOptimizer.Agent
+${GC_ENV}
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 UNIT
+# The manual 64K-page test drop-in (2026-11): the unit above now carries the setting, matched to this binary.
+rm -f "/etc/systemd/system/${SERVICE_NAME}.service.d/gc.conf"
+rmdir "/etc/systemd/system/${SERVICE_NAME}.service.d" 2>/dev/null || true
 
 systemctl daemon-reload
 systemctl enable --quiet "${SERVICE_NAME}.service"
@@ -702,7 +1029,10 @@ fi
 step "Done"
 ok "Agent installed and running"
 note "It enrolls, then holds a tunnel to ${SERVER%/} - watch it come Online in the web UI."
-note "Logs:   journalctl -u ${SERVICE_NAME} -f"
+# Run through sudo by a regular user, who needs sudo again to read the system journal.
+LOG_SUDO=""
+if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != root ]; then LOG_SUDO="sudo "; fi
+note "Logs:   ${LOG_SUDO}journalctl -u ${SERVICE_NAME} -f"
 DIR_ARG=""
 [ "$INSTALL_DIR" != "/opt/netopt-agent" ] && DIR_ARG=" --dir \"${INSTALL_DIR}\""
 note "Remove: curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/agent/install-native.sh | sudo bash -s -- --uninstall${DIR_ARG}"

@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using NetworkOptimizer.Alerts.Events;
 using NetworkOptimizer.Alerts.Models;
 using NetworkOptimizer.Core.Enums;
+using NetworkOptimizer.Core.Helpers;
 
 namespace NetworkOptimizer.Alerts.Delivery;
 
@@ -23,7 +24,7 @@ public class DiscordDeliveryChannel : IAlertDeliveryChannel
         _httpClient = httpClient;
     }
 
-    public async Task<bool> SendAsync(AlertEvent alertEvent, AlertHistoryEntry historyEntry, DeliveryChannel channel, CancellationToken cancellationToken = default)
+    public async Task<bool> SendAsync(AlertEvent alertEvent, AlertHistoryEntry historyEntry, DeliveryChannel channel, TimeZoneInfo timeZone, DisplayFormat format, CancellationToken cancellationToken = default)
     {
         var config = JsonSerializer.Deserialize<DiscordChannelConfig>(channel.ConfigJson);
         if (config == null || string.IsNullOrEmpty(config.WebhookUrl)) return false;
@@ -56,7 +57,7 @@ public class DiscordDeliveryChannel : IAlertDeliveryChannel
                     description = alertEvent.Message,
                     color = GetSeverityColorInt(alertEvent.Severity),
                     fields,
-                    timestamp = alertEvent.Timestamp.ToString("o"),
+                    timestamp = DateTimeUtilities.AsUtc(alertEvent.Timestamp).ToString("o"),
                     footer = new { text = "Network Optimizer" }
                 }
             }
@@ -65,7 +66,7 @@ public class DiscordDeliveryChannel : IAlertDeliveryChannel
         return await PostAsync(config.WebhookUrl, payload, cancellationToken);
     }
 
-    public async Task<bool> SendDigestAsync(IReadOnlyList<AlertHistoryEntry> alerts, DeliveryChannel channel, DigestSummary summary, CancellationToken cancellationToken = default)
+    public async Task<bool> SendDigestAsync(IReadOnlyList<AlertHistoryEntry> alerts, DeliveryChannel channel, DigestSummary summary, TimeZoneInfo timeZone, DisplayFormat format, CancellationToken cancellationToken = default)
     {
         var config = JsonSerializer.Deserialize<DiscordChannelConfig>(channel.ConfigJson);
         if (config == null || string.IsNullOrEmpty(config.WebhookUrl)) return false;
@@ -80,7 +81,7 @@ public class DiscordDeliveryChannel : IAlertDeliveryChannel
 
         foreach (var alert in alerts.OrderByDescending(a => a.Severity).Take(10))
         {
-            description.AppendLine($"- **{alert.Title}** ({alert.Source}) - {TimestampFormatter.FormatLocalShort(alert.TriggeredAt)}");
+            description.AppendLine($"- **{alert.Title}** ({alert.Source}) - {TimestampFormatter.FormatLocalShort(alert.TriggeredAt, timeZone, format)}");
         }
 
         if (alerts.Count > 10)

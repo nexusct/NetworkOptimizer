@@ -1,6 +1,7 @@
 using FluentAssertions;
 using Microsoft.EntityFrameworkCore;
 using NetworkOptimizer.Core.Enums;
+using NetworkOptimizer.Monitoring.Probes;
 using NetworkOptimizer.Storage.Models;
 using NetworkOptimizer.Web.Services.Monitoring;
 using Xunit;
@@ -123,8 +124,9 @@ public class UpstreamCommitTests : IDisposable
     }
 
     [Fact]
-    public async Task Disabled_access_hop_does_not_create_target()
+    public async Task Unchecked_new_access_hop_is_saved_paused()
     {
+        // Saved paused, as path-end hosts are, so the next run proposes it unchecked.
         var hops = new List<AccessHopCandidate>
         {
             MakeAccessHop("192.0.2.1", "TestISP bng", enabled: false)
@@ -133,7 +135,21 @@ public class UpstreamCommitTests : IDisposable
         await CommitAsync(hops, new List<TransitAsnCandidate>());
 
         var target = await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.Address == "192.0.2.1");
-        target.Should().BeNull();
+        target.Should().NotBeNull();
+        target!.Enabled.Should().BeFalse();
+        target.Name.Should().Be("TestISP bng");
+        target.TargetType.Should().Be(MonitoringTargetType.AccessIsp);
+    }
+
+    [Fact]
+    public async Task Unreachable_new_access_hop_does_not_create_target()
+    {
+        var hop = MakeAccessHop("192.0.2.2", "TestISP olt", enabled: false);
+        hop.Unreachable = true;
+
+        await CommitAsync(new List<AccessHopCandidate> { hop }, new List<TransitAsnCandidate>());
+
+        (await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.Address == "192.0.2.2")).Should().BeNull();
     }
 
     [Fact]
@@ -538,106 +554,26 @@ public class UpstreamCommitTests : IDisposable
 
     // ---- Helpers ----
 
+    // The real commit methods, in the order UpstreamTracerService's commit runs them, as an operator's commit.
     private async Task CommitAsync(List<AccessHopCandidate> hops, List<TransitAsnCandidate> transits)
     {
-        var wanInterface = "wan";
+        const string wan = "wan";
+        var ct = CancellationToken.None;
 
         foreach (var hop in hops.Where(h => h.Enabled))
-        {
-            var existing = await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.TargetId == hop.TargetId)
-                           ?? await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.Address == hop.Address);
-            if (existing == null)
-            {
-                _db.MonitoringTargets.Add(new MonitoringTarget
-                {
-                    TargetId = hop.TargetId,
-                    Name = hop.Label,
-                    Address = hop.Address,
-                    ProbeMode = hop.RespondedTo,
-                    TargetType = MonitoringTargetType.AccessIsp,
-                    AsnNumber = hop.AsnNumber,
-                    AsnName = UpstreamTracerService.CleanAsnName(hop.AsnName),
-                    VantagePoint = "server",
-                    PollIntervalSeconds = 10,
-                    PingCount = 5,
-                    Enabled = true,
-                    AutoDiscovered = true,
-                    DiscoveryMethod = hop.Method,
-                    WanInterface = wanInterface,
-                    CreatedAt = DateTime.UtcNow,
-                    LastVerified = DateTime.UtcNow
-                });
-            }
-            else
-            {
-                existing.Enabled = true;
-                existing.Name = hop.Label;
-                if (hop.AsnNumber.HasValue) existing.AsnNumber = hop.AsnNumber;
-                if (!string.IsNullOrEmpty(hop.AsnName)) existing.AsnName = UpstreamTracerService.CleanAsnName(hop.AsnName);
-                existing.LastVerified = DateTime.UtcNow;
-            }
-        }
+            await UpstreamTracerService.UpsertTargetAsync(_db, hop, wan, wanContextId: null, ct);
         foreach (var hop in hops.Where(h => !h.Enabled))
-        {
-            var existing = await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.Address == hop.Address);
-            if (existing != null)
-            {
-                existing.Enabled = false;
-                existing.Name = hop.Label;
-                if (!string.IsNullOrEmpty(hop.AsnName)) existing.AsnName = UpstreamTracerService.CleanAsnName(hop.AsnName);
-            }
-        }
+            await UpstreamTracerService.PauseUnselectedAccessHopAsync(_db, hop, wan, isUnboundRun: true, automatic: false, ct);
+        await UpstreamTracerService.PauseUnproposedAccessRowsAsync(_db, hops.Select(h => h.Address).ToList(),
+            _db.MonitoringTargets.Select(t => t.Address).ToList(), wan, isUnboundRun: true, automatic: false, ct);
         foreach (var transit in transits.Where(t => t.Enabled))
-        {
-            var targetType = transit.Method == DiscoveryMethod.PathProxy
-                ? MonitoringTargetType.InternetService
-                : MonitoringTargetType.Transit;
-            var address = transit.HopAddress ?? transit.PathProxyTarget;
-            var existing = await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.TargetId == transit.TargetId)
-                           ?? (address != null ? await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.Address == address) : null);
-            if (existing == null && !string.IsNullOrEmpty(address))
-            {
-                _db.MonitoringTargets.Add(new MonitoringTarget
-                {
-                    TargetId = transit.TargetId ?? $"transit-{Guid.NewGuid():N}",
-                    Name = transit.Label ?? transit.AsnName,
-                    Address = address,
-                    ProbeMode = transit.RespondedTo ?? ProbeMode.Icmp,
-                    TargetType = targetType,
-                    AsnNumber = transit.AsnNumber,
-                    AsnName = transit.AsnName,
-                    VantagePoint = "server",
-                    PollIntervalSeconds = 15,
-                    PingCount = 5,
-                    Enabled = true,
-                    AutoDiscovered = true,
-                    DiscoveryMethod = transit.Method,
-                    WanInterface = wanInterface,
-                    CreatedAt = DateTime.UtcNow,
-                    LastVerified = DateTime.UtcNow
-                });
-            }
-            else if (existing != null)
-            {
-                existing.Enabled = true;
-                existing.Name = transit.Label ?? transit.AsnName;
-                existing.Address = address ?? existing.Address;
-                if (transit.AsnNumber > 0) existing.AsnNumber = transit.AsnNumber;
-                if (!string.IsNullOrEmpty(transit.AsnName)) existing.AsnName = transit.AsnName;
-                existing.LastVerified = DateTime.UtcNow;
-            }
-        }
+            await UpstreamTracerService.UpsertTransitTargetAsync(_db, transit, wan, wanContextId: null, ct);
         foreach (var transit in transits.Where(t => !t.Enabled))
         {
-            var addr = transit.HopAddress ?? transit.PathProxyTarget;
-            if (string.IsNullOrEmpty(addr)) continue;
-            var existing = await _db.MonitoringTargets.FirstOrDefaultAsync(t => t.Address == addr);
-            if (existing != null)
-            {
-                existing.Enabled = false;
-                existing.Name = transit.Label ?? transit.AsnName;
-                if (!string.IsNullOrEmpty(transit.AsnName)) existing.AsnName = transit.AsnName;
-            }
+            if (transit.Method == DiscoveryMethod.PathProxy)
+                await UpstreamTracerService.UpsertTransitTargetAsync(_db, transit, wan, wanContextId: null, ct, enabled: false);
+            else
+                await UpstreamTracerService.PauseUnselectedTransitAsync(_db, transit, wan, isUnboundRun: true, automatic: false, ct);
         }
 
         await _db.SaveChangesAsync();
@@ -1388,6 +1324,128 @@ public class AccessIspFallbackTests
     {
         UpstreamTracerService.SelectLowestRtt(Array.Empty<UpstreamTracerService.AccessFallbackProbe>())
             .Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData(17.3, 27.5, true)]    // IX peering-LAN hop pinged through another carrier: +10 ms
+    [InlineData(17.3, 21.0, false)]   // +3.7 ms, under the 5 ms floor
+    [InlineData(2.5, 8.0, true)]      // metro hop, +5.5 ms clears the floor
+    [InlineData(2.5, 7.0, false)]     // +4.5 ms at metro RTT is still under the floor
+    [InlineData(80.0, 98.0, false)]   // long-haul: +18 ms is under 25%
+    [InlineData(80.0, 102.0, true)]   // long-haul: +22 ms clears 25%
+    [InlineData(17.3, 15.0, false)]   // a faster ping is never off path
+    public void IsOffPath_flags_ping_rtt_well_above_trace_rtt(double traceRtt, double pingRtt, bool expected)
+    {
+        UpstreamTracerService.IsOffPath(traceRtt, pingRtt).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(49.0, 16.0, 27.5, true)]    // slow time-exceeded reply; the later hop at 16 ms caps it
+    [InlineData(18.6, 16.0, 27.9, true)]    // own trace RTT already catches it
+    [InlineData(53.3, 20.0, 53.1, false)]   // own reply not slow vs its ping: no cap, genuine long-return hop
+    [InlineData(49.0, 25.0, 27.5, false)]   // slow reply, but the later hop does not undercut the ping enough
+    [InlineData(49.0, null, 27.5, false)]   // slow reply with no later responding hop
+    public void IsOffPath_caps_a_slow_trace_reply_with_the_later_hop_rtt(double traceRtt, double? laterRtt, double pingRtt, bool expected)
+    {
+        UpstreamTracerService.IsOffPath(traceRtt, laterRtt, pingRtt).Should().Be(expected);
+    }
+
+    // Access ISP 192.0.2.x (AS64500), the transit the trace takes (AS64501), another carrier (AS64502),
+    // and the exchange router being judged (AS64510).
+    private static readonly Dictionary<string, int> PathCheckAsns = new()
+    {
+        ["192.0.2.1"] = 64500, ["192.0.2.2"] = 64500,
+        ["198.51.100.1"] = 64501, ["198.51.100.2"] = 64501,
+        ["203.0.113.1"] = 64502, ["203.0.113.2"] = 64502,
+        ["203.0.113.200"] = 64510, ["203.0.113.201"] = 64510,
+    };
+
+    [Fact]
+    public void AsnsOffTheTrace_flags_a_direct_route_through_another_carrier()
+    {
+        var trace = new[] { (IReadOnlyList<string>)new[] { "192.0.2.1", "192.0.2.2", "198.51.100.1" } };
+        var direct = new[] { "192.0.2.1", "192.0.2.2", "100.64.0.1", "203.0.113.1", "203.0.113.2" };
+
+        UpstreamTracerService.AsnsOffTheTrace(direct, trace, PathCheckAsns, 64510)
+            .Should().Equal(64502);
+    }
+
+    [Fact]
+    public void AsnsOffTheTrace_keeps_a_route_that_follows_the_trace()
+    {
+        var trace = new[] { (IReadOnlyList<string>)new[] { "192.0.2.1", "192.0.2.2", "198.51.100.1" } };
+        // Another router of the same transit network (ECMP), and the router's own network ahead of it.
+        var direct = new[] { "192.0.2.1", "192.0.2.2", "198.51.100.2", "203.0.113.201" };
+
+        UpstreamTracerService.AsnsOffTheTrace(direct, trace, PathCheckAsns, 64510).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void AsnsOffTheTrace_takes_any_discovery_trace_that_reached_the_router()
+    {
+        var traces = new[]
+        {
+            (IReadOnlyList<string>)new[] { "192.0.2.1", "198.51.100.1" },
+            new[] { "192.0.2.1", "203.0.113.1" },
+        };
+        var direct = new[] { "192.0.2.1", "203.0.113.2" };
+
+        UpstreamTracerService.AsnsOffTheTrace(direct, traces, PathCheckAsns, 64510).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void AsnsOffTheTrace_ignores_hops_with_no_resolved_network()
+    {
+        var trace = new[] { (IReadOnlyList<string>)new[] { "192.0.2.1" } };
+        var direct = new[] { "192.0.2.1", "10.0.0.1", "100.64.0.9" };
+
+        UpstreamTracerService.AsnsOffTheTrace(direct, trace, PathCheckAsns, 64510).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void LaterHopRtts_takes_the_lowest_rtt_after_each_hop_and_skips_silent_hops()
+    {
+        var hops = new[]
+        {
+            new TraceHop { HopNumber = 1, Address = "192.0.2.1", RttMinMs = 0.3, Responses = 2 },
+            new TraceHop { HopNumber = 2, Address = "198.51.100.1", RttMinMs = 11.0, Responses = 2 },
+            new TraceHop { HopNumber = 3, Address = null, Responses = 0 },
+            new TraceHop { HopNumber = 4, Address = "203.0.113.224", RttMinMs = 49.0, Responses = 2 },
+            new TraceHop { HopNumber = 5, Address = "203.0.113.9", RttMinMs = 16.0, Responses = 2 },
+        };
+
+        var later = UpstreamTracerService.LaterHopRtts(hops).ToDictionary(x => x.Address, x => x.LaterRttMs);
+
+        later.Should().BeEquivalentTo(new Dictionary<string, double>
+        {
+            ["192.0.2.1"] = 11.0,
+            ["198.51.100.1"] = 16.0,
+            ["203.0.113.224"] = 16.0,
+        });
+    }
+
+    [Theory]
+    [InlineData(ProbeMode.Udp, ProbeMode.Icmp, true)]    // managed fallback: UDP asked, ICMP returned
+    [InlineData(ProbeMode.Udp, ProbeMode.Udp, false)]    // native traceroute honors UDP
+    [InlineData(ProbeMode.Icmp, ProbeMode.Icmp, false)]  // an ICMP request alone proves nothing
+    public void SweepUsedManagedTraceroute_detects_a_udp_request_answered_as_icmp(ProbeMode requested, ProbeMode used, bool expected)
+    {
+        var traces = new[]
+        {
+            Trace(ProbeMode.Icmp, ProbeMode.Icmp),
+            Trace(requested, used),
+        };
+
+        UpstreamTracerService.SweepUsedManagedTraceroute(traces).Should().Be(expected);
+
+        static TracerouteResult Trace(ProbeMode requested, ProbeMode used) => new()
+        {
+            Target = new ProbeTarget("192.0.2.1", requested),
+            Vantage = new ProbeVantage("server", VantageKind.Server),
+            ModeUsed = used,
+            Hops = Array.Empty<TraceHop>(),
+            Timestamp = DateTime.UtcNow,
+        };
     }
 }
 

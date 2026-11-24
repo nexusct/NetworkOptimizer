@@ -1,5 +1,6 @@
 using System.Text.Json;
 using NetworkOptimizer.Alerts.Events;
+using NetworkOptimizer.Alerts.Interfaces;
 using NetworkOptimizer.Core.Enums;
 using NetworkOptimizer.Storage.Models;
 
@@ -57,6 +58,8 @@ public class RolloutAutopilot : IRolloutAutopilot
     private readonly IAlertEventBus _eventBus;
     private readonly TimeProvider _time;
     private readonly ILogger<RolloutAutopilot> _logger;
+    private readonly Auditing.IAuditLogger? _audit;
+    private readonly INotificationTimeZoneResolver? _timeZones;
     private readonly NetworkOptimizer.Storage.Interfaces.ISharedFirmwareCatalogRepository _sharedCatalog;
     private readonly UbiquitiReleaseFeedClient _feed;
     private readonly string _siteSlug;
@@ -90,8 +93,12 @@ public class RolloutAutopilot : IRolloutAutopilot
         ILogger<RolloutAutopilot> logger,
         NetworkOptimizer.Storage.Interfaces.ISharedFirmwareCatalogRepository sharedCatalog,
         UbiquitiReleaseFeedClient feed,
-        string siteSlug = SiteManagementService.DefaultSiteSlug)
+        string siteSlug = SiteManagementService.DefaultSiteSlug,
+        Auditing.IAuditLogger? audit = null,
+        INotificationTimeZoneResolver? timeZones = null)
     {
+        _audit = audit;
+        _timeZones = timeZones;
         _repositories = repositories;
         _planning = planning;
         _commands = commands;
@@ -203,7 +210,7 @@ public class RolloutAutopilot : IRolloutAutopilot
 
         var timings = await _repositories.UseAsync((r, c) => r.GetModelTimingsAsync(c), cancellationToken);
         var inputs = await _planning.UseAsync(
-            (p, c) => RolloutPlanComposer.GatherAsync(p, timings, _commands, settings, _logger, _sharedCatalog, _feed, c), cancellationToken);
+            (p, c) => RolloutPlanComposer.GatherAsync(p, timings, _commands, settings, _logger, _sharedCatalog, _feed, cancellationToken: c), cancellationToken);
 
         // Don't burn the check interval when the site wasn't reachable: the catalog and
         // update availability are unknown, so "nothing to upgrade" is an absence of data, not
@@ -239,8 +246,9 @@ public class RolloutAutopilot : IRolloutAutopilot
         {
             _logger.LogDebug(
                 "Autopilot found nothing to upgrade on site {Site} right now", _siteSlug);
-            HoldReason = ripeness.Notes.Count > 0
-                ? string.Join(" ", ripeness.Notes) + " Autopilot checks again every hour."
+            var holdNotes = ripeness.Notes.Concat(inputs.StagingNotes ?? []).ToList();
+            HoldReason = holdNotes.Count > 0
+                ? string.Join(" ", holdNotes) + " Autopilot checks again every hour."
                 : "Everything is on the current firmware for its channel. Autopilot checks again every hour.";
             return null;
         }
@@ -291,6 +299,14 @@ public class RolloutAutopilot : IRolloutAutopilot
 
         await AnnounceAsync(result, window, startAtUtc, cancellationToken);
         HoldReason = null;
+        RolloutAudit.LogSystem(_audit, NetworkOptimizer.Storage.Models.Identity.AuditActions.FirmwareRolloutScheduled, _siteSlug, plan.Id, new
+        {
+            planId = plan.Id,
+            startAt = startAtUtc,
+            devices = RolloutPlanComposer.LiveStepCount(result),
+            waves = result.Document.Waves.Count,
+            autopilot = true,
+        });
 
         _logger.LogInformation(
             "Autopilot scheduled firmware rollout {Id} on site {Site} for {When} ({Devices} devices, {Waves} waves)",
@@ -303,6 +319,8 @@ public class RolloutAutopilot : IRolloutAutopilot
         RolloutPlanResult result, QuietWindowProposal window, DateTime startAtUtc, CancellationToken cancellationToken)
     {
         var devices = RolloutPlanComposer.LiveStepCount(result);
+        var zone = _timeZones == null ? TimeZoneInfo.Local : await _timeZones.ResolveAsync(_siteSlug, cancellationToken);
+        var format = _timeZones == null ? DisplayFormat.Fallback : await _timeZones.ResolveFormatAsync(_siteSlug, cancellationToken);
 
         await _eventBus.PublishAsync(new AlertEvent
         {
@@ -314,7 +332,7 @@ public class RolloutAutopilot : IRolloutAutopilot
             Title = $"Firmware Rollout Scheduled{_siteSuffix}",
             Message =
                 $"{RolloutScopeCopy.Sentence(RolloutScopeCopy.Subject(result.Document, devices))} will be upgraded starting "
-                + $"{startAtUtc.ToLocalTime():ddd MMM d, h:mm tt}{RolloutScopeCopy.SiteAside(window.TimeZoneId, startAtUtc)}, "
+                + $"{RolloutScopeCopy.AlertStartLabel(startAtUtc, window.TimeZoneId, zone, format)}, "
                 + $"{RolloutScopeCopy.StartsIn(startAtUtc - Now)} - chosen from {window.Basis}. "
                 + "Open Firmware Rollout to postpone or stop it.",
             SourceUrl = RolloutAlerts.SourceUrl,
@@ -389,7 +407,8 @@ public class RolloutAutopilot : IRolloutAutopilot
     /// <summary>
     /// Drops the console's own UniFi OS step when the build on offer is too new. Its publish date
     /// comes from the console rather than the feed - the feed does not carry Cloud Gateway OS builds
-    /// per console model.
+    /// per console model. The date the plan captured wins: a target adopted from another site is
+    /// not the build the console itself is offering.
     /// </summary>
     private async Task ApplyUniFiOsRipenessAsync(
         RolloutPlanDocument document, int minAgeDays, CancellationToken cancellationToken)
@@ -397,24 +416,27 @@ public class RolloutAutopilot : IRolloutAutopilot
         if (minAgeDays <= 0 || !document.IncludesUniFiOsUpdate)
             return;
 
-        DateTime? created = null;
-        string? version = null;
-        try
+        DateTime? created = document.UniFiOsUpdate.PublishedAt;
+        string? version = created != null ? document.UniFiOsUpdate.TargetVersion : null;
+        if (created == null)
         {
-            var pending = await _commands.GetPendingUniFiOsUpdateAsync(cancellationToken);
-            created = pending?.Created;
-            version = pending?.Version;
-
-            if (created == null)
+            try
             {
-                var info = await _commands.GetConsoleSystemInfoAsync(cancellationToken);
-                created = info?.Firmware?.Latest?.Created;
-                version ??= info?.Firmware?.Latest?.Version;
+                var pending = await _commands.GetPendingUniFiOsUpdateAsync(cancellationToken);
+                created = pending?.Created;
+                version = pending?.Version;
+
+                if (created == null)
+                {
+                    var info = await _commands.GetConsoleSystemInfoAsync(cancellationToken);
+                    created = info?.Firmware?.Latest?.Created;
+                    version ??= info?.Firmware?.Latest?.Version;
+                }
             }
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _logger.LogDebug(ex, "Autopilot could not read the console's UniFi OS publish date on site {Site}", _siteSlug);
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogDebug(ex, "Autopilot could not read the console's UniFi OS publish date on site {Site}", _siteSlug);
+            }
         }
 
         if (ReleaseRipeness.IsRipe(created, Now, minAgeDays))

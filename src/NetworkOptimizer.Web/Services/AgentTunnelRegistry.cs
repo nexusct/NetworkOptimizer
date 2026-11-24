@@ -9,7 +9,7 @@ namespace NetworkOptimizer.Web.Services;
 /// message channel that the tunnel handler drains to its gRPC response stream,
 /// so any server code can push a message to a connected agent without touching
 /// the stream directly. One connection per agent: a reconnect replaces (and
-/// completes) the previous connection's channel.
+/// drops) the previous connection.
 /// </summary>
 public class AgentTunnelRegistry
 {
@@ -33,6 +33,30 @@ public class AgentTunnelRegistry
     // attempt; a tunnel down longer than this is a real outage, not a reconnect.
     private static readonly TimeSpan TunnelReconnectGrace = TimeSpan.FromSeconds(75);
 
+    // Reconnect times per agent, oldest first. A first connect after this server starts is not a
+    // reconnect, so a server restart never makes every agent look unstable.
+    private readonly ConcurrentDictionary<int, Queue<DateTime>> _reconnects = new();
+    private const int MaxReconnectsKept = 32;
+
+    // When each site last lost a registered tunnel, for WaitForReconnectAsync.
+    private readonly ConcurrentDictionary<string, DateTime> _lastDropBySite = new();
+
+    /// <summary>Window <see cref="IsUnstable"/> counts reconnects over.</summary>
+    public static readonly TimeSpan UnstableWindow = TimeSpan.FromMinutes(15);
+
+    /// <summary>Reconnects within <see cref="UnstableWindow"/> that mark a tunnel as unstable.</summary>
+    public const int UnstableReconnects = 3;
+
+    /// <summary>The usual cause of an unstable tunnel, shared by every surface that flags one.</summary>
+    public const string UnstableCause = "A reverse proxy read timeout or keep-alive setting usually causes this.";
+
+    /// <summary>The agent README's proxy settings, which is what fixes an unstable tunnel.</summary>
+    public const string ReverseProxyHelpUrl =
+        "https://github.com/Ozark-Connect/NetworkOptimizer/blob/main/src/NetworkOptimizer.Agent/README.md#reverse-proxy";
+
+    /// <summary>The pinned agent connection help issue.</summary>
+    public const string AgentConnectionHelpUrl = "https://github.com/Ozark-Connect/NetworkOptimizer/issues/1154";
+
     public AgentTunnelRegistry(AgentTunnelOptions tunnelOptions)
     {
         _tunnelEnabled = tunnelOptions.Enabled;
@@ -42,31 +66,94 @@ public class AgentTunnelRegistry
     public AgentTunnelConnection Register(int agentId, string siteSlug, string agentName)
     {
         var connection = new AgentTunnelConnection(agentId, siteSlug, agentName);
+        AgentTunnelConnection? displaced = null;
         _connections.AddOrUpdate(agentId, connection, (_, old) =>
         {
-            old.Complete();
+            displaced = old;
             return connection;
         });
-        _lastTunnelActivity[agentId] = DateTime.UtcNow;
+        // The agent has abandoned the old stream, but a proxy may never pass that on to us.
+        // Left running, its watchdog flags it stale 45s later and takes the console off the new one.
+        displaced?.Drop();
+        var now = DateTime.UtcNow;
+        if (_lastTunnelActivity.ContainsKey(agentId))
+        {
+            var times = _reconnects.GetOrAdd(agentId, _ => new Queue<DateTime>());
+            lock (times)
+            {
+                times.Enqueue(now);
+                while (times.Count > MaxReconnectsKept) times.Dequeue();
+            }
+        }
+        _lastTunnelActivity[agentId] = now;
+        try
+        {
+            AgentConnected?.Invoke(agentId);
+        }
+        catch
+        {
+            // A subscriber's failure must never fail the tunnel's connect.
+        }
         return connection;
     }
+
+    /// <summary>
+    /// Raised with the agent id when a tunnel connects or reconnects. The tunnel records the
+    /// hello's version before it registers, so a handler reads the agent's current version.
+    /// Raised on the tunnel's thread: handlers must return quickly and not throw.
+    /// </summary>
+    public event Action<int>? AgentConnected;
 
     /// <summary>
     /// Removes a connection if it is still the current one for its agent.
     /// A reconnect may already have replaced it; in that case this is a no-op.
     /// </summary>
-    public void Unregister(AgentTunnelConnection connection)
+    /// <returns>False when a newer connection had already replaced this one.</returns>
+    public bool Unregister(AgentTunnelConnection connection)
     {
         connection.Complete();
+        if (!IsCurrent(connection))
+            return false;
         // Stamp the drop time so the reconnect grace is measured from when the
         // tunnel actually went away, not from when it first connected.
-        _lastTunnelActivity[connection.AgentId] = DateTime.UtcNow;
-        ((ICollection<KeyValuePair<int, AgentTunnelConnection>>)_connections)
+        var now = DateTime.UtcNow;
+        _lastTunnelActivity[connection.AgentId] = now;
+        // A tunnel reaped after going silent is an outage, not a reconnect: dials keep failing fast.
+        if (!connection.IsStale) _lastDropBySite[connection.SiteSlug] = now;
+        return ((ICollection<KeyValuePair<int, AgentTunnelConnection>>)_connections)
             .Remove(new KeyValuePair<int, AgentTunnelConnection>(connection.AgentId, connection));
     }
 
+    /// <summary>
+    /// When the site has no registered tunnel because one dropped within <paramref name="window"/>, waits
+    /// until a tunnel registers or the window ends. True when the site has a tunnel at the end. A site that
+    /// never had a tunnel, or lost it longer ago, returns at once, so a real outage still fails fast.
+    /// </summary>
+    public async Task<bool> WaitForReconnectAsync(string siteSlug, TimeSpan window, CancellationToken ct)
+    {
+        if (GetForSite(siteSlug).Count > 0) return true;
+        if (!_lastDropBySite.TryGetValue(siteSlug, out var dropped)) return false;
+        var deadline = dropped + window;
+        while (DateTime.UtcNow < deadline)
+        {
+            var left = deadline - DateTime.UtcNow;
+            await Task.Delay(left < ReconnectPoll ? left : ReconnectPoll, ct);
+            if (GetForSite(siteSlug).Count > 0) return true;
+        }
+        return false;
+    }
+
+    private static readonly TimeSpan ReconnectPoll = TimeSpan.FromMilliseconds(200);
+
     /// <summary>Whether the agent currently holds an open tunnel.</summary>
     public bool IsConnected(int agentId) => _connections.ContainsKey(agentId);
+
+    /// <summary>
+    /// Whether this is still the agent's registered connection. A superseded one speaks for nothing:
+    /// its silence or teardown says nothing about the tunnel that replaced it.
+    /// </summary>
+    public bool IsCurrent(AgentTunnelConnection connection) =>
+        _connections.TryGetValue(connection.AgentId, out var current) && ReferenceEquals(current, connection);
 
     /// <summary>
     /// Whether an agent counts as online for status displays. An open tunnel is
@@ -90,6 +177,27 @@ public class AgentTunnelRegistry
         return AgentEnrollmentService.IsOnline(agent.LastSeenAt);
     }
 
+    /// <summary>How many times the agent's tunnel reconnected within <paramref name="window"/>.</summary>
+    public int ReconnectsWithin(int agentId, TimeSpan window)
+    {
+        if (!_reconnects.TryGetValue(agentId, out var times))
+            return 0;
+        var since = DateTime.UtcNow - window;
+        lock (times)
+            return times.Count(t => t >= since);
+    }
+
+    /// <summary>
+    /// Whether the agent's tunnel keeps dropping and reconnecting. A reconnect inside the grace
+    /// never shows as offline, so this is the only signal for a proxy that severs the tunnel on a
+    /// timer (a read timeout or keep-alive setting).
+    /// </summary>
+    public bool IsUnstable(int agentId) => ReconnectsWithin(agentId, UnstableWindow) >= UnstableReconnects;
+
+    /// <summary>The reconnect count over <see cref="UnstableWindow"/>, then the usual cause.</summary>
+    public string DescribeUnstable(int agentId) =>
+        $"Reconnected {ReconnectsWithin(agentId, UnstableWindow)} times in the last {(int)UnstableWindow.TotalMinutes} minutes. {UnstableCause}";
+
     /// <summary>
     /// Whether we've heard from the agent recently by any means - open tunnel or a
     /// fresh REST heartbeat. Deliberately looser than <see cref="IsAgentLive"/>,
@@ -106,6 +214,25 @@ public class AgentTunnelRegistry
     /// <summary>Live connections for a site (normally zero or one per agent).</summary>
     public List<AgentTunnelConnection> GetForSite(string siteSlug) =>
         _connections.Values.Where(c => c.SiteSlug == siteSlug).ToList();
+
+    /// <summary>
+    /// The connection a site-local dial (console, SSH, device endpoints) goes through: the site's
+    /// first agent, as always, unless it has gone silent (or <paramref name="usable"/> rejects it)
+    /// and another has not. A recovered agent takes new dials back as soon as it qualifies again.
+    /// With nothing better, the first agent, so its caller still sees why it cannot dial.
+    /// Null when the site has no agent.
+    /// </summary>
+    public AgentTunnelConnection? PickForSite(string siteSlug, Func<AgentTunnelConnection, bool>? usable = null)
+    {
+        var connections = GetForSite(siteSlug);
+        return connections.FirstOrDefault(c => !c.IsStale && (usable == null || usable(c)))
+            ?? connections.FirstOrDefault(c => !c.IsStale)
+            ?? connections.FirstOrDefault();
+    }
+
+    /// <summary>Whether another of this connection's site agents is registered and not silent.</summary>
+    public bool HasOtherLiveForSite(AgentTunnelConnection connection) =>
+        GetForSite(connection.SiteSlug).Any(c => !ReferenceEquals(c, connection) && !c.IsStale);
 
     /// <summary>All live connections across sites.</summary>
     public List<AgentTunnelConnection> GetAll() => _connections.Values.ToList();
@@ -173,11 +300,63 @@ public sealed class AgentTunnelConnection
     /// </summary>
     public bool? OnGateway { get; internal set; }
 
+    /// <summary>
+    /// When this connection, as the site's collector, was first sent its SNMP config; null until then, and
+    /// again once it is pushed as a non-collector. The other agents keep polling until a grace has passed
+    /// since it, so a handover overlaps rather than leaving a gap.
+    /// </summary>
+    public DateTime? CollectorSnmpSince { get; internal set; }
+
+    /// <summary>As <see cref="CollectorSnmpSince"/>, for the site's primary-WAN and fabric probe targets.</summary>
+    public DateTime? CollectorProbesSince { get; internal set; }
+
+    /// <summary>The last probe config this agent was sent carried the site's primary-WAN and fabric targets.</summary>
+    public bool HoldsSiteTargets { get; internal set; }
+
+    private long _probeIssued, _probeSent, _snmpIssued, _snmpSent;
+
+    /// <summary>Numbers a probe push at its start, before it reads the registry.</summary>
+    internal long BeginProbePush() => Interlocked.Increment(ref _probeIssued);
+
+    /// <summary>
+    /// False when a probe push that started later has already been sent: this one read an older registry
+    /// and must not overwrite it.
+    /// </summary>
+    internal bool CommitProbePush(long seq) => Commit(ref _probeSent, seq);
+
+    /// <summary>Numbers an SNMP push at its start.</summary>
+    internal long BeginSnmpPush() => Interlocked.Increment(ref _snmpIssued);
+
+    /// <summary>As <see cref="CommitProbePush"/>, for SNMP config.</summary>
+    internal bool CommitSnmpPush(long seq) => Commit(ref _snmpSent, seq);
+
+    private static bool Commit(ref long sent, long seq)
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref sent);
+            if (seq < current) return false;
+            if (Interlocked.CompareExchange(ref sent, seq, current) == current) return true;
+        }
+    }
+
     /// <summary>Feature capabilities from the hello (e.g. "conntrack-accounting"). Empty from older agents.</summary>
     public IReadOnlyList<string> Capabilities { get; internal set; } = Array.Empty<string>();
 
     /// <summary>The conntrack accounting capability string, shared by agent and server.</summary>
     public const string ConntrackCapability = "conntrack-accounting";
+
+    /// <summary>Per-flow Live Traffic under a viewer's lease (agent: ConntrackRunner.LiveTrafficCapability).</summary>
+    public const string LiveTrafficCapability = "live-traffic";
+
+    /// <summary>Live DNS capture on the gateway (agent: DnsCapture.Capability).</summary>
+    public const string LiveDnsCapability = "live-dns";
+
+    /// <summary>Times connection handshakes for Live Traffic's round trips (agent: ConntrackEventSocket.Capability).</summary>
+    public const string FlowLatencyCapability = "flow-latency";
+
+    /// <summary>The UCI inform capture capability string, shared by agent and server.</summary>
+    public const string UciInformCapability = "uci-inform";
 
     public bool HasCapability(string capability) =>
         Capabilities.Contains(capability, StringComparer.OrdinalIgnoreCase);
@@ -202,7 +381,8 @@ public sealed class AgentTunnelConnection
 
     public int AgentId { get; }
     public string SiteSlug { get; }
-    public string AgentName { get; }
+    /// <summary>The agent's name; a rename updates it on the live connection.</summary>
+    public string AgentName { get; internal set; }
     public DateTime ConnectedAt { get; }
     public DateTime LastMessageAt { get; internal set; }
 

@@ -1,3 +1,7 @@
+using NetworkOptimizer.Web.Services.ChangeControl;
+using NetworkOptimizer.Web.Services.Monitoring;
+using NetworkOptimizer.Web.Services.Monitoring.IspHealth;
+using NetworkOptimizer.Web.Services.Monitoring.LiveTraffic;
 using ApexCharts;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Mvc.ViewFeatures;
@@ -13,7 +17,6 @@ using NetworkOptimizer.UniFi;
 using NetworkOptimizer.Web;
 using NetworkOptimizer.Web.Endpoints;
 using NetworkOptimizer.Web.Services;
-using NetworkOptimizer.Web.Services.WiredPortPresence;
 using NetworkOptimizer.Web.Services.Authorization;
 using NetworkOptimizer.Web.Services.CableModemProviders;
 using NetworkOptimizer.Web.Services.CellularModemProviders;
@@ -23,6 +26,8 @@ using NetworkOptimizer.Web.Services.Licensing;
 using NetworkOptimizer.Web.Services.OntProviders;
 using NetworkOptimizer.Web.Services.SqmLearning;
 using NetworkOptimizer.Web.Services.Ssh;
+using NetworkOptimizer.Web.Services.WiredPortPresence;
+using NetworkOptimizer.Web.Services.Monitoring.PathMap;
 using Serilog;
 using Serilog.Events;
 
@@ -82,8 +87,11 @@ var loggerConfig = new LoggerConfiguration()
     .Enrich.FromLogContext()
     .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}");
 
-// Add file logging for Windows (in the logs folder under install directory)
-if (OperatingSystem.IsWindows())
+// File logging beside the console sink, in the logs folder under the install directory: the
+// Windows service dir, /app/logs in Docker (bind-mounted by every compose file, so it outlives a
+// container rebuild; `docker logs` is lost to every recreate and holds hours at Debug), and the
+// install dir on native macOS and Linux. Capped so a Debug site cannot fill a disk.
+try
 {
     var logFolder = Path.Combine(AppContext.BaseDirectory, "logs");
     Directory.CreateDirectory(logFolder);
@@ -92,8 +100,15 @@ if (OperatingSystem.IsWindows())
     loggerConfig.WriteTo.File(
         logPath,
         rollingInterval: RollingInterval.Day,
+        fileSizeLimitBytes: 200L * 1024 * 1024,
+        rollOnFileSizeLimit: true,
         retainedFileCountLimit: 7,
         outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}{Exception}");
+}
+catch (Exception ex)
+{
+    // A read-only install dir loses the file, not the app; the console sink still carries the log.
+    Console.Error.WriteLine($"File logging disabled: {ex.Message}");
 }
 
 Log.Logger = loggerConfig.CreateLogger();
@@ -256,10 +271,22 @@ builder.Services.AddScoped<NetworkOptimizer.Storage.Interfaces.ISqmLearningRepos
 builder.Services.AddScoped<NetworkOptimizer.Alerts.Interfaces.IAlertRepository, NetworkOptimizer.Storage.Repositories.AlertRepository>();
 builder.Services.AddScoped<NetworkOptimizer.Storage.Interfaces.ISiteRepository, NetworkOptimizer.Storage.Repositories.SiteRepository>();
 builder.Services.AddSingleton<SiteRegistryChangeNotifier>();
+builder.Services.AddScoped<SiteLeftoverCleanup>();
 builder.Services.AddScoped<SiteManagementService>();
 builder.Services.AddMutatingService<ISiteManagementService>(sp => sp.GetRequiredService<SiteManagementService>());
 builder.Services.AddScoped<SiteContextService>();
 builder.Services.AddScoped<SiteSwitchService>();
+builder.Services.AddScoped<AddressBarState>();
+// Scoped so a host that partitions the instance can answer per caller.
+builder.Services.AddScoped<IScopeBadgeText, InstanceScopeBadgeText>();
+// Registered twice so pages can subscribe to the same instance the circuit calls.
+builder.Services.AddScoped<CircuitReconnectNotifier>();
+builder.Services.AddScoped<Microsoft.AspNetCore.Components.Server.Circuits.CircuitHandler>(sp => sp.GetRequiredService<CircuitReconnectNotifier>());
+// The viewer's clock. The preference source is the seam a host decorates to add a layer between
+// the user's own choice and the install default.
+builder.Services.AddScoped<ITimeZonePreferenceSource, TimeZonePreferenceSource>();
+builder.Services.AddScoped<IDisplayTimeZone, DisplayTimeZone>();
+builder.Services.AddScoped<Microsoft.AspNetCore.Components.Server.Circuits.CircuitHandler, DisplayTimeZoneCircuitHandler>();
 
 // In-app search. Not a mutating service: it holds no state and returns only navigation metadata
 // compiled into the app. Each provider filters its own entries against the caller, so adding an
@@ -268,18 +295,27 @@ builder.Services.AddScoped<NetworkOptimizer.Web.Services.Search.IAppSearchServic
     NetworkOptimizer.Web.Services.Search.AppSearchService>();
 builder.Services.AddScoped<NetworkOptimizer.Web.Services.Search.IAppSearchProvider,
     NetworkOptimizer.Web.Services.Search.SettingsSearchProvider>();
+builder.Services.AddScoped<NetworkOptimizer.Web.Services.Search.IAppSearchProvider,
+    NetworkOptimizer.Web.Services.Search.AccountSearchProvider>();
 // The alert pipeline pins its scope to an event's originating site through this seam.
 builder.Services.AddScoped<NetworkOptimizer.Alerts.Interfaces.IAlertSiteScope>(sp =>
     sp.GetRequiredService<SiteContextService>());
 // Resolves a site's display name so delivered alerts name their originating site.
 builder.Services.AddSingleton<NetworkOptimizer.Alerts.Interfaces.IAlertSiteNameResolver, AlertSiteNameResolver>();
+// Each site's console zone, cached: the site layer of both the viewer's clock and the notification clock.
+builder.Services.AddSingleton<ISiteTimeZones, SiteTimeZones>();
+// The clock for text written with no viewer (alerts, digests, stored reports). A host decorates it
+// to put its own zone first.
+builder.Services.AddSingleton<NetworkOptimizer.Alerts.Interfaces.INotificationTimeZoneResolver, NotificationTimeZoneResolver>();
 builder.Services.AddSingleton<AgentEnrollmentService>();
 // Which of a site's agents hosts the LAN speed test - one pick shared by the client target, the
 // Settings hint, and path analysis.
 builder.Services.AddSingleton<SiteSpeedTestHostSelector>();
 // The agent tunnel keeps using the concrete singleton (it authenticates with the agent scheme and
-// runs as system); the admin-facing enrollment surface is gated.
-builder.Services.AddMutatingService<IAgentEnrollmentService>(sp => sp.GetRequiredService<AgentEnrollmentService>());
+// runs as system); the admin-facing enrollment surface is gated, and built per scope so its agent
+// lists narrow to the caller's sites.
+builder.Services.AddMutatingService<IAgentEnrollmentService>(
+    sp => ActivatorUtilities.CreateInstance<SiteScopedAgentEnrollmentService>(sp));
 // Detects agents running on the site's UniFi gateway itself (monitoring-only
 // installs) so speed-test surfaces can gate accordingly.
 builder.Services.AddSiteScopedRegistry<AgentOnGatewayDetector>();
@@ -300,6 +336,10 @@ builder.Services.AddHttpClient(
     NetworkOptimizer.Web.Services.Firmware.UbiquitiReleaseFeedClient.HttpClientName,
     client => client.Timeout = TimeSpan.FromSeconds(15));
 builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Firmware.UbiquitiReleaseFeedClient>();
+// Reads an added firmware image's md5 (its .md5sum, or the image itself as a fallback); the service caps it at 3 minutes.
+builder.Services.AddHttpClient(
+    NetworkOptimizer.Web.Services.Firmware.SharedFirmwareCatalogService.HttpClientName,
+    client => client.Timeout = TimeSpan.FromMinutes(3));
 // Publish dates (autopilot's release-ripeness gate) and changelog links (the soak report) off that feed.
 builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Firmware.IReleaseMetadataSource,
     NetworkOptimizer.Web.Services.Firmware.ReleaseFeedMetadataSource>();
@@ -341,6 +381,8 @@ builder.Services.AddSiteScopedRegistry<SiteAgentCoverage>();
 builder.Services.AddSiteScopedRegistry<GatewaySshRegistry>();
 builder.Services.AddScoped<IGatewaySshService>(sp => sp.GetRequiredService<GatewaySshRegistry>()
     .GetFor(sp.GetRequiredService<SiteContextService>().Slug));
+builder.Services.AddScoped(sp => sp.GetRequiredService<GatewaySshRegistry>()
+    .GetNeighborTableFor(sp.GetRequiredService<SiteContextService>().Slug));
 
 // Register udm-boot installer (scoped - shared gateway boot-script infrastructure
 // used by Adaptive SQM, Monitoring Interfaces, etc.; follows the current site's
@@ -352,6 +394,7 @@ builder.Services.AddScoped<IUdmBootService, UdmBootService>();
 // forwards to the current site's instance; singleton consumers inject the
 // registry and pin GetDefault() or GetFor(slug).
 builder.Services.AddSiteScopedRegistry<UniFiSshRegistry>();
+builder.Services.AddSiteScopedRegistry<NetworkOptimizer.Web.Services.Ssh.DeviceSshRouterRegistry>();
 builder.Services.AddScoped(sp => sp.GetRequiredService<UniFiSshRegistry>()
     .GetFor(sp.GetRequiredService<SiteContextService>().Slug));
 
@@ -372,6 +415,13 @@ builder.Services.AddSingleton<ICableModemProvider, MotorolaHnapProvider>();
 builder.Services.AddSingleton<ICableModemProvider, XfinityGatewayProvider>();
 builder.Services.AddSingleton<ICableModemProvider, TechnicolorCgaProvider>();
 builder.Services.AddSingleton<ICableModemProvider, VodafoneStationProvider>();
+builder.Services.AddSingleton<ICableModemProvider, SagemcomF3896Provider>();
+builder.Services.AddSingleton<ICableModemProvider, FritzBoxCableProvider>();
+builder.Services.AddSingleton<ICableModemProvider, HitronCodaProvider>();
+// The UCI has no status page: on-gateway agents relay its inform frames, which the inform service
+// decrypts and the provider reads on the normal poll.
+builder.Services.AddSingleton<NetworkOptimizer.Web.Services.CableModemProviders.Uci.UciInformService>();
+builder.Services.AddSingleton<ICableModemProvider, UniFiCableInternetProvider>();
 builder.Services.AddSiteScopedRegistry<ModemMonitorRegistry>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ModemMonitorRegistry>());
 
@@ -386,7 +436,10 @@ builder.Services.AddSingleton<IOntProvider, GenericHttpOntProvider>();
 builder.Services.AddSingleton<IOntProvider, TelekomModem2OntProvider>();
 builder.Services.AddSingleton<IOntProvider, NokiaXs010xOntProvider>();
 builder.Services.AddSingleton<IOntProvider, ZyxelGponSfpOntProvider>();
+builder.Services.AddSingleton<IOntProvider, RicherlinkOntProvider>();
+builder.Services.AddSingleton<IOntProvider, PeterPonOntProvider>();
 builder.Services.AddSingleton<IOntProvider, NetOptCustomPonOntProvider>();
+builder.Services.AddSingleton<IOntProvider, OdiOssOntProvider>();
 
 // Starlink terminal monitoring is per site through ModemMonitorRegistry, which
 // builds each site's provider set (the gRPC provider keeps per-config history
@@ -562,12 +615,20 @@ builder.Services.AddSingleton<NetworkOptimizer.Alerts.Delivery.IAlertDeliveryCha
 builder.Services.AddSingleton<NetworkOptimizer.Threats.Enrichment.GeoEnrichmentService>();
 builder.Services.AddSingleton<NetworkOptimizer.Threats.CrowdSec.CrowdSecClient>();
 builder.Services.AddSingleton<NetworkOptimizer.Threats.CrowdSec.CrowdSecEnrichmentService>();
+// CTI answers are cached once for the instance; the key a site looks up with comes from the
+// credential scope, which a multi-tenant host decorates to give each tenant its own.
+builder.Services.AddSingleton<NetworkOptimizer.Threats.CrowdSec.ICtiReputationCache, NetworkOptimizer.Storage.Repositories.CtiReputationCache>();
+builder.Services.AddScoped<NetworkOptimizer.Threats.CrowdSec.ICtiCredentialScope, NetworkOptimizer.Threats.CrowdSec.InstanceCtiCredentialScope>();
+builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.ICtiSettingsAdmin>(
+    sp => ActivatorUtilities.CreateInstance<NetworkOptimizer.Web.Services.CtiSettingsAdminService>(sp));
 builder.Services.AddSingleton<NetworkOptimizer.Threats.ThreatEventNormalizer>();
 builder.Services.AddSingleton<NetworkOptimizer.Threats.Analysis.KillChainClassifier>();
 builder.Services.AddSingleton<NetworkOptimizer.Threats.Analysis.ThreatPatternAnalyzer>();
 builder.Services.AddSingleton<NetworkOptimizer.Threats.Analysis.ExposureValidator>();
-builder.Services.AddSingleton<NetworkOptimizer.Threats.ThreatCollectionService>();
-builder.Services.AddHostedService(sp => sp.GetRequiredService<NetworkOptimizer.Threats.ThreatCollectionService>());
+builder.Services.AddSingleton<NetworkOptimizer.Threats.Interfaces.IThreatSystemAudit, NetworkOptimizer.Web.Services.ThreatSystemAudit>();
+builder.Services.AddSingleton<NetworkOptimizer.Threats.Interfaces.IInfrastructureSourceProvider, NetworkOptimizer.Web.Services.AgentInfrastructureSourceProvider>();
+// Collection, Automatic Blocking, and gateway agent enforcement (see ThreatBlockingRegistration).
+builder.Services.AddThreatBlockingCore();
 builder.Services.AddScoped<NetworkOptimizer.Threats.Interfaces.IThreatRepository, NetworkOptimizer.Storage.Repositories.ThreatRepository>();
 builder.Services.AddScoped<NetworkOptimizer.Web.Services.ThreatDashboardService>();
 // Reads stay on the concrete service (the dashboard is a Viewer surface); the noise-filter writes
@@ -575,6 +636,57 @@ builder.Services.AddScoped<NetworkOptimizer.Web.Services.ThreatDashboardService>
 builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.IThreatFilterAdminService>(
     sp => sp.GetRequiredService<NetworkOptimizer.Web.Services.ThreatDashboardService>());
 builder.Services.AddScoped<NetworkOptimizer.Threats.Interfaces.IThreatSettingsAccessor, NetworkOptimizer.Web.Services.ThreatSettingsAccessor>();
+// Automatic Blocking: the loop is a singleton the admin service triggers. The gateway writer and the
+// sharing scope are scoped because they read settings through the scoped accessor. A multi-tenant
+// host narrows sharing by decorating IBlockSharingScope.
+// A site's WAF is read and given its ban list through the site's agent when the site is routed that way.
+builder.Services.AddSingleton<NetworkOptimizer.Threats.Interfaces.ISiteHttpClientProvider, NetworkOptimizer.Web.Services.SiteHttpClientProvider>();
+builder.Services.AddScoped<NetworkOptimizer.Threats.Blocking.GatewayBlocklist>();
+builder.Services.AddScoped<NetworkOptimizer.Threats.Blocking.TrustedSourcesGroup>();
+// Public block lists and Cloudflare's ranges, fetched once per instance and kept in the main database.
+builder.Services.AddSingleton<NetworkOptimizer.Threats.Blocking.PublicBlockListCache>();
+builder.Services.AddHttpClient("PublicBlockLists", client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(30);
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("NetworkOptimizer (+https://github.com/Ozark-Connect/NetworkOptimizer)");
+});
+builder.Services.AddScoped<NetworkOptimizer.Threats.Blocking.IGatewayBlocklistWriter>(sp => sp.GetRequiredService<NetworkOptimizer.Threats.Blocking.GatewayBlocklist>());
+builder.Services.AddScoped<NetworkOptimizer.Threats.Blocking.IBlockSharingScope, NetworkOptimizer.Threats.Blocking.InstanceBlockSharingScope>();
+// Public lists that need a key are shared within a pool: the install here; a multi-tenant host decorates this.
+builder.Services.AddScoped<NetworkOptimizer.Threats.Blocking.IBlockListPool, NetworkOptimizer.Threats.Blocking.InstanceBlockListPool>();
+builder.Services.AddScoped<NetworkOptimizer.Threats.Interfaces.IProbedAddressProvider, NetworkOptimizer.Web.Services.LatencyTargetAddressProvider>();
+builder.Services.AddScoped<NetworkOptimizer.Web.Services.ThreatBlockingOperations>();
+builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.IWafConnectionAdmin>(
+    sp => ActivatorUtilities.CreateInstance<NetworkOptimizer.Web.Services.WafConnectionAdminService>(sp));
+// Tailscale: each site's tailnet device names and local status, held in memory per site.
+builder.Services.AddSiteScopedRegistry<NetworkOptimizer.Web.Services.Tailscale.TailscaleDirectoryRegistry>();
+builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Tailscale.TailnetFlowObserver>();
+builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.Tailscale.ITailscaleDirectory>(
+    sp => ActivatorUtilities.CreateInstance<NetworkOptimizer.Web.Services.Tailscale.TailscaleDirectoryService>(sp));
+// The caller's own view of the 3D LAN Flow Map (Hide Device), per user per site.
+builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.LanFlowMap.ILanMapView>(
+    sp => ActivatorUtilities.CreateInstance<NetworkOptimizer.Web.Services.LanFlowMap.LanMapViewService>(sp));
+// Client icons: the icon UniFi Network shows per client, fetched once and kept on disk.
+builder.Services.AddSiteScopedRegistry<NetworkOptimizer.Web.Services.ClientIcons.ClientIconRegistry>();
+builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.ClientIcons.IClientIcons>(
+    sp => ActivatorUtilities.CreateInstance<NetworkOptimizer.Web.Services.ClientIcons.ClientIconService>(sp));
+// The custom icon host answers 403 to a request with no User-Agent, which HttpClient sends by default.
+builder.Services.AddHttpClient(NetworkOptimizer.Web.Services.ClientIcons.ClientIconRegistry.HttpClientName, client =>
+    {
+        client.Timeout = TimeSpan.FromSeconds(10);
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("NetworkOptimizer");
+    })
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
+builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.IThreatBlockingAdmin>(
+    sp => ActivatorUtilities.CreateInstance<NetworkOptimizer.Web.Services.ThreatBlockingAdminService>(sp));
+builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.IThreatBlockingSiteAdmin>(
+    sp => ActivatorUtilities.CreateInstance<NetworkOptimizer.Web.Services.ThreatBlockingSiteAdminService>(sp));
+// WAN Flood Protection: the loop configures each site's gateway agent and records what it reports.
+builder.Services.AddScoped<NetworkOptimizer.Storage.Interfaces.IWanFloodIncidentRepository, NetworkOptimizer.Storage.Repositories.WanFloodIncidentRepository>();
+builder.Services.AddSingleton<NetworkOptimizer.Web.Services.WanFlood.WanFloodService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<NetworkOptimizer.Web.Services.WanFlood.WanFloodService>());
+builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.WanFlood.IWanFloodAdmin>(
+    sp => ActivatorUtilities.CreateInstance<NetworkOptimizer.Web.Services.WanFlood.WanFloodAdminService>(sp));
 builder.Services.AddSingleton<NetworkOptimizer.Threats.Interfaces.IUniFiClientAccessor, NetworkOptimizer.Web.Services.UniFiClientAccessor>();
 
 // Register Schedule services (scheduling engine for periodic audits, speed tests)
@@ -605,6 +717,7 @@ builder.Services.AddSingleton<ISystemSettingsService>(sp => sp.GetRequiredServic
 // Reads stay ungated (pollers and collectors read settings on every cycle); the UI's writes go
 // through the gated admin interface so each one is authorized and audited.
 builder.Services.AddMutatingService<ISystemSettingsAdmin>(sp => sp.GetRequiredService<SystemSettingsService>());
+builder.Services.AddMutatingService<ISiteSettingsAdmin, SiteSettingsAdmin>();
 
 // Register Sponsorship service (singleton - reads from DB, limited state)
 builder.Services.AddSingleton<ISponsorshipService, SponsorshipService>();
@@ -625,18 +738,14 @@ builder.Services.AddSingleton<IPasswordHasher, PasswordHasher>();
 builder.Services.AddSingleton<NetworkOptimizer.Web.Services.AdminAuthCache>();
 builder.Services.AddScoped<IAdminAuthService, AdminAuthService>();
 
-// Register JWT service (singleton - caches secret key)
-builder.Services.AddSingleton<IJwtService, JwtService>();
-
 // Add HttpContextAccessor for accessing cookies in Blazor
 builder.Services.AddHttpContextAccessor();
 
 // ASP.NET Core Identity on the dedicated main-DB AuthDbContext (users, roles, RBAC, audit),
 // plus the interactive cookie authentication pipeline that REPLACES the legacy self-issued
 // JWT-in-cookie scheme. The Identity application cookie gains server-side revocation via security
-// stamps (which the JWT cookie fundamentally lacked). Sessions from before the upgrade survive via
-// the LegacyJwtBridgeMiddleware (added below). JwtService is retained only for that bridge and is
-// removed one release after the cutover (design docs 02, 06).
+// stamps (which the JWT cookie fundamentally lacked). A leftover legacy auth_token cookie is
+// ignored, and sign-out deletes it.
 builder.Services.AddNetOptIdentityCore(dbPath);
 builder.Services.AddNetOptIdentityAuthentication();
 builder.Services.AddCascadingAuthenticationState();
@@ -685,6 +794,8 @@ builder.Services.AddScoped(sp => sp.GetRequiredService<NetworkOptimizer.Web.Serv
 // Scoped - forwards to the current site's Influx client and database.
 builder.Services.AddScoped<NetworkOptimizer.Web.Services.Monitoring.FlakyTargetService>();
 builder.Services.AddScoped<NetworkOptimizer.Web.Services.Monitoring.MonitoringPathView>();
+// One WAN-to-counter resolution for the WAN live chart and Device Stats' WAN Throughput.
+builder.Services.AddScoped<NetworkOptimizer.Web.Services.Monitoring.WanCounterInterfaces>();
 // Transient: every live-tile surface keeps its own selection state and re-render callback.
 builder.Services.AddTransient<NetworkOptimizer.Web.Services.Monitoring.LiveWanScope>();
 // Per-user teaching hints that retire once seen (UiHintKeys).
@@ -706,11 +817,21 @@ builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.WanOutage
 builder.Services.AddSiteScopedRegistry<NetworkOptimizer.Web.Services.Monitoring.UpstreamTracerRegistry>();
 builder.Services.AddScoped(sp => sp.GetRequiredService<NetworkOptimizer.Web.Services.Monitoring.UpstreamTracerRegistry>()
     .GetFor(sp.GetRequiredService<SiteContextService>().Slug));
+// Holds discovery off a WAN that is down, saturated, or lossy (automatic runs wait, manual runs warn).
+builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.UpstreamDiscoveryGate>();
+// Path Localization: per-site watchers fed by both latency write paths, traceroutes from the
+// measuring vantage while an Internet/Custom target is degraded and the rest of the WAN is clean.
+builder.Services.AddSiteScopedRegistry<NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodeRegistry>();
+builder.Services.AddHostedService<NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodeRunner>();
+builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.Monitoring.PathLocalization.IPathEpisodeService>(sp =>
+    ActivatorUtilities.CreateInstance<NetworkOptimizer.Web.Services.Monitoring.PathLocalization.PathEpisodeService>(sp));
 builder.Services.AddMutatingService<IInfluxDbProvisioningService, InfluxDbProvisioningService>();
 // The same implementation behind a site-scoped gate, for the one thing a Site Admin should be able
 // to finish alone: adding their own site's buckets to a shared connection that already exists.
 builder.Services.AddMutatingService<ISiteInfluxProvisioningService>(
     sp => ActivatorUtilities.CreateInstance<InfluxDbProvisioningService>(sp));
+// AP Telemetry's silent bucket step; it calls the gated service above, so the gate still decides.
+builder.Services.AddScoped<SiteInfluxBucketSetup>();
 // Probe-execution layer: the server-side LocalProbeExecutor is the default vantage. SSH
 // vantages (gateway/switch/AP) are constructed per-device via SshProbeExecutor later.
 builder.Services.AddSingleton<NetworkOptimizer.Monitoring.Probes.LocalProbeExecutor>();
@@ -720,6 +841,10 @@ builder.Services.AddSingleton<NetworkOptimizer.Monitoring.Probes.IProbeExecutor>
 // analysis at a hostname override the way the site's clients resolve it.
 builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.SiteVantageDnsResolver>();
 builder.Services.AddScoped<NetworkOptimizer.Web.Services.Monitoring.ProbeExecutorFactory>();
+// Data-plane check behind device offline alerts: tells an outage from a device that only stopped
+// reporting to UniFi Network. Resolved by the per-site DeviceStateAlertEvaluator.
+builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.IDeviceReachabilityProbe,
+    NetworkOptimizer.Web.Services.Monitoring.DeviceReachabilityProbe>();
 // Read-only gateway interface diagnostics (Network Tools). Scoped because it runs through
 // the current site's gateway SSH service.
 builder.Services.AddScoped<NetworkOptimizer.Web.Services.Monitoring.GatewayDiagnosticsService>();
@@ -735,6 +860,7 @@ builder.Services.AddSiteScopedRegistry<MonitoringCollectionRegistry>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<MonitoringCollectionRegistry>());
 builder.Services.AddScoped(sp => sp.GetRequiredService<MonitoringCollectionRegistry>()
     .GetFor(sp.GetRequiredService<SiteContextService>().Slug));
+builder.Services.AddMutatingService<ISfpModulePollService, SfpModulePollService>();
 // Firmware Rollout executors — the per-device upgrade state machine, canary holds, channel
 // group switches and rollout alerts. One instance per site, owned by the registry on the same
 // terms as monitoring collection (default always runs; non-default sites start/stop on site
@@ -748,6 +874,8 @@ builder.Services.AddHostedService(sp =>
 // client is site-pinned the same way the registry pins it for the executor.
 builder.Services.AddScoped<NetworkOptimizer.Web.Services.Firmware.IRolloutPlanningSource,
     NetworkOptimizer.Web.Services.Firmware.RolloutPlanningSource>();
+builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.Firmware.ISharedFirmwareCatalogService>(sp =>
+    ActivatorUtilities.CreateInstance<NetworkOptimizer.Web.Services.Firmware.SharedFirmwareCatalogService>(sp));
 builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.Firmware.IFirmwareRolloutService>(sp =>
 {
     var slug = sp.GetRequiredService<SiteContextService>().Slug;
@@ -756,8 +884,28 @@ builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.Firmware.IFirm
         sp.GetRequiredService<NetworkOptimizer.Web.Services.Firmware.FirmwareRolloutRegistry>().GetFor(slug),
         ActivatorUtilities.CreateInstance<NetworkOptimizer.Web.Services.Firmware.FirmwareCommandClient>(sp, slug));
 });
+// Change Control: config snapshots, change detection, plans. One engine per site.
+builder.Services.AddChangeControl();
+builder.Services.AddMutatingService<IChangeControlService, ChangeControlService>();
+builder.Services.AddMutatingService<IConfigTemplateService, ConfigTemplateService>();
+// Trace hop locations set by hand: install-wide, read on every trace render.
+builder.Services.AddSingleton<HopLocationOverrideCache>();
+builder.Services.AddSingleton<IHopLocationOverrideSource, InstallHopLocationOverrideSource>();
+// Places each site's own traces gave hop addresses, for traces that later have only GeoLite2.
+builder.Services.AddSingleton<ILearnedHopPeers, InstallLearnedHopPeers>();
+builder.Services.AddSingleton<LearnedHopLocations>();
+builder.Services.AddMutatingService<IHopLocationOverrideService, HopLocationOverrideService>();
+// Path Map: target routes traced from the vantage that measures them, placed with the Route Map's engine.
+builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.PathMap.RoutePlacer>();
+builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.PathMap.PathRouteRecorder>();
+// One re-trace loop per site, shared by every viewer of the map, plus the slow background pass.
+builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.PathMap.PathMapTraceScheduler>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<NetworkOptimizer.Web.Services.Monitoring.PathMap.PathMapTraceScheduler>());
+builder.Services.AddMutatingService<IPathMapService, PathMapService>();
+builder.Services.AddMutatingService<IChangeControlFleetService, ChangeControlFleetService>();
 // Re-runs upstream tracer discovery every 7 days; flips a review flag on diff.
 builder.Services.AddHostedService<NetworkOptimizer.Web.Services.Monitoring.UpstreamRediscoveryService>();
+builder.Services.AddHostedService<NetworkOptimizer.Web.Services.Monitoring.FarTransitSweepService>();
 // 3D LAN flow map (spec 5.7) - composes topology + live + historic feeds for the JS layer.
 // Per-site map cache: the registry owns one LanFlowMapCache per site and scoped
 // forwarding hands each request the current site's instance, so a secondary
@@ -811,9 +959,10 @@ builder.Services.AddMutatingService<ISshKeyService, SshKeyService>();
 builder.Services.AddMutatingService<ISshSettingsAdminService, SshSettingsAdminService>();
 // One-click placement of the site's public key on a Cloud Gateway, via the shared udm-boot mechanism.
 builder.Services.AddMutatingService<ISshKeyDeploymentService, SshKeyDeploymentService>();
-// Per site: the update banner reflects the current site's gateway module deployment
-// state. Scoped so each site's Perf Tweaks / WAN Steering status is its own; a circuit
-// is session-lived, so the compute still runs about once per session.
+// Per site: the update banner reflects the current site's gateway module deployment state. The
+// registry holds one shared state per site and runs the SSH checks on triggers, never per circuit.
+builder.Services.AddSiteScopedRegistry<ModuleUpdateRegistry>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ModuleUpdateRegistry>());
 builder.Services.AddScoped<ModuleUpdateNotificationService>();
 builder.Services.AddMutatingService<IMonitoringInterfaceDeploymentService, MonitoringInterfaceDeploymentService>();
 // Curating the site's monitoring configuration from the Monitoring page: the Latency targets card's
@@ -821,6 +970,8 @@ builder.Services.AddMutatingService<IMonitoringInterfaceDeploymentService, Monit
 // as direct DbContext writes in the components, so none of them were audited.
 builder.Services.AddMutatingService<IMonitoringTargetService, MonitoringTargetService>();
 builder.Services.AddMutatingService<IMonitoringSettingsService, MonitoringSettingsService>();
+builder.Services.AddMutatingService<IErrorCounterWindowService, ErrorCounterWindowService>();
+builder.Services.AddMutatingService<ISignalSparklineService, SignalSparklineService>();
 builder.Services.AddMutatingService<IUpstreamDiscoveryService, UpstreamDiscoveryService>();
 
 // Register WiFi Optimizer rules and engine
@@ -867,14 +1018,32 @@ builder.Services.AddMutatingService<IUpnpNoteService>(sp => sp.GetRequiredServic
 builder.Services.AddScoped<NetworkOptimizer.Web.Services.Monitoring.BandwidthHogs.ConntrackStatusService>();
 builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.Monitoring.BandwidthHogs.IConntrackStatusService>(
     sp => sp.GetRequiredService<NetworkOptimizer.Web.Services.Monitoring.BandwidthHogs.ConntrackStatusService>());
+// Live Traffic: per-site in-memory flows and DNS from the gateway agent, read under a viewer's lease.
+builder.Services.AddSiteScopedRegistry<NetworkOptimizer.Web.Services.Monitoring.LiveTraffic.LiveTrafficRegistry>();
+builder.Services.AddSiteScopedRegistry<NetworkOptimizer.Web.Services.Monitoring.LiveTraffic.LiveTrafficPolicyResolver>();
+builder.Services.AddScoped<NetworkOptimizer.Web.Services.Monitoring.LiveTraffic.LiveTrafficService>();
+builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.Monitoring.LiveTraffic.ILiveTrafficService>(
+    sp => sp.GetRequiredService<NetworkOptimizer.Web.Services.Monitoring.LiveTraffic.LiveTrafficService>());
+builder.Services.AddMutatingService<ICustomAppService, CustomAppService>();
 builder.Services.AddScoped<CustomOidService>();
 builder.Services.AddMutatingService<ICustomOidService>(sp => sp.GetRequiredService<CustomOidService>());
+// Device health checks: shipped templates (JSON files), one runner per site that executes the
+// checks over SSH and runs their remedies, and the gated service the Setup page edits through.
+builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.HealthChecks.HealthCheckTemplateService>();
+builder.Services.AddSiteScopedRegistry<NetworkOptimizer.Web.Services.Monitoring.HealthChecks.HealthCheckRegistry>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<NetworkOptimizer.Web.Services.Monitoring.HealthChecks.HealthCheckRegistry>());
+builder.Services.AddScoped<NetworkOptimizer.Web.Services.Monitoring.HealthChecks.HealthCheckService>();
+builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.Monitoring.HealthChecks.IHealthCheckService>(
+    sp => sp.GetRequiredService<NetworkOptimizer.Web.Services.Monitoring.HealthChecks.HealthCheckService>());
 // Per-site: buildings, floor plans, planned APs, and their heatmap cache are
 // per-site data. Scoped so each site's WiFi optimizer / floor plan / heatmap reads
 // its own data (consumers - WiFiOptimizerService, floor-plan endpoints - are scoped).
 builder.Services.AddScoped<FloorPlanService>();
 builder.Services.AddMutatingService<IFloorPlanAdminService>(sp => sp.GetRequiredService<FloorPlanService>());
 builder.Services.AddScoped<HeatmapDataCache>();
+builder.Services.AddScoped<NetworkOptimizer.Web.Services.InnerSpace.InnerSpaceImportService>();
+builder.Services.AddMutatingService<NetworkOptimizer.Web.Services.InnerSpace.IInnerSpaceImportService>(
+    sp => sp.GetRequiredService<NetworkOptimizer.Web.Services.InnerSpace.InnerSpaceImportService>());
 builder.Services.AddScoped<PlannedApService>();
 builder.Services.AddMutatingService<IPlannedApAdminService>(sp => sp.GetRequiredService<PlannedApService>());
 builder.Services.AddSingleton<ConfigTransferService>();
@@ -906,17 +1075,25 @@ builder.Services.AddScoped<NetworkOptimizer.Storage.Interfaces.IWiFiInsightRepos
         sp.GetRequiredService<SiteContextService>().Slug,
         sp.GetRequiredService<SiteContextService>().IsDefault));
 builder.Services.AddMutatingService<IWiFiIssueAcknowledgmentService, WiFiIssueAcknowledgmentService>();
+builder.Services.AddMutatingService<IIspFindingAcknowledgmentService, IspFindingAcknowledgmentService>();
 builder.Services.AddMutatingService<IWiFiRadioKeepService, WiFiRadioKeepService>();
+builder.Services.AddSingleton<ChannelPlanApplyRunner>();
+builder.Services.AddMutatingService<IChannelPlanApplyService, ChannelPlanApplyService>();
+builder.Services.AddMutatingService<IClientSettingsService, ClientSettingsService>();
 
 // Add ApexCharts for Wi-Fi Optimizer visualizations
 builder.Services.AddApexCharts();
 
 // Configure HTTP client for API calls
 builder.Services.AddHttpClient();
+// The TC monitor and AP Agent never redirect, and on an agent-routed site a followed redirect is
+// dialed from this server, outside the site's tunnel.
 builder.Services.AddHttpClient("TcMonitor", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(5);
-});
+}).ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
+builder.Services.AddHttpClient(NetworkOptimizer.Web.Services.ApAgent.ApAgentHttpTransport.HttpClientName)
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
 
 // CORS for client speed test endpoint (OpenSpeedTest sends results from browser)
 // Auto-construct allowed origins from HOST_IP/HOST_NAME, or use CORS_ORIGINS if set
@@ -1172,6 +1349,20 @@ using (var scope = app.Services.CreateScope())
             using var siteDb = new NetworkOptimizerDbContext(siteOptions);
             NetworkOptimizer.Storage.MigrationSafety.MigrateWithFriendlyErrors(siteDb);
 
+            // The CrowdSec CTI cache is instance-wide now: carry this site's unexpired answers over.
+            try
+            {
+                // Its own main context, so a failed merge leaves nothing pending on `db`.
+                using var cacheDb = scope.ServiceProvider.GetRequiredService<IDbContextFactory<NetworkOptimizerDbContext>>().CreateDbContext();
+                var carried = NetworkOptimizer.Storage.Repositories.CtiReputationCache.MergeFromSite(cacheDb, siteDb);
+                if (carried > 0)
+                    app.Logger.LogInformation("Moved {Count} CrowdSec CTI cache entries from site {Slug} to the shared cache", carried, site.Slug);
+            }
+            catch (Exception ex)
+            {
+                app.Logger.LogWarning(ex, "Could not move site {Slug}'s CrowdSec CTI cache entries", site.Slug);
+            }
+
             // Seed the Alerts & Schedule defaults into each site's DB too, so secondary
             // sites match the main site instead of showing blank lists. The main-DB seed
             // below only covers the default site.
@@ -1191,6 +1382,8 @@ using (var scope = app.Services.CreateScope())
 
                 AlertRuleAutoEnable.EnableFreshlySeeded(siteDb, "cable_modem", siteSeededPatterns, () => siteDb.CmConfigurations.Any());
                 AlertRuleAutoEnable.EnableFreshlySeeded(siteDb, "ont", siteSeededPatterns, () => siteDb.OntConfigurations.Any());
+                AlertRuleAutoEnable.EnableFreshlySeededWhen(siteDb, "ont.management_unresponsive", siteSeededPatterns,
+                    () => siteDb.OntConfigurations.Any(o => o.AttachedSfpId != null));
                 AlertRuleAutoEnable.EnableFreshlySeeded(siteDb, "cellular", siteSeededPatterns, () => siteDb.ModemConfigurations.Any());
                 AlertRuleAutoEnable.EnableFreshlySeeded(siteDb, "starlink", siteSeededPatterns, () => siteDb.StarlinkConfigurations.Any());
             }
@@ -1268,6 +1461,8 @@ using (var scope = app.Services.CreateScope())
 
             AlertRuleAutoEnable.EnableFreshlySeeded(db, "cable_modem", seededPatterns, () => db.CmConfigurations.Any());
             AlertRuleAutoEnable.EnableFreshlySeeded(db, "ont", seededPatterns, () => db.OntConfigurations.Any());
+            AlertRuleAutoEnable.EnableFreshlySeededWhen(db, "ont.management_unresponsive", seededPatterns,
+                () => db.OntConfigurations.Any(o => o.AttachedSfpId != null));
             AlertRuleAutoEnable.EnableFreshlySeeded(db, "cellular", seededPatterns, () => db.ModemConfigurations.Any());
             AlertRuleAutoEnable.EnableFreshlySeeded(db, "starlink", seededPatterns, () => db.StarlinkConfigurations.Any());
         }
@@ -1310,16 +1505,12 @@ app.Services.GetRequiredService<NetworkOptimizer.Storage.Services.ICredentialPro
 var geoDataPath = Path.GetDirectoryName(dbPath)!;
 app.Services.GetRequiredService<NetworkOptimizer.Threats.Enrichment.GeoEnrichmentService>().Initialize(geoDataPath);
 
-// Load CrowdSec daily quota from settings
-{
-    var sysSettings = app.Services.GetRequiredService<ISystemSettingsService>();
-    var csQuota = await sysSettings.GetGlobalAsync("crowdsec.daily_quota");
-    var dailyLimit = 30;
-    if (!string.IsNullOrEmpty(csQuota) && int.TryParse(csQuota, out var q) && q >= 1)
-        dailyLimit = q;
-    app.Services.GetRequiredService<NetworkOptimizer.Threats.CrowdSec.CrowdSecClient>()
-        .LoadRateLimitState(0, DateOnly.FromDateTime(DateTime.UtcNow), dailyLimit);
-}
+// Reverse lookups ask for the PTR record only, never forward-resolving the answer through search domains.
+NetworkOptimizer.Core.Helpers.ReverseDnsCache.PtrLookup = NetworkOptimizer.Web.Services.Monitoring.DnsClientPtrLookup.LookupAsync;
+
+// Created before any console connects, so it reads each site's time zone as its connection comes up,
+// and loaded with the zones read before the restart, so no schedule starts on the server's clock.
+await app.Services.GetRequiredService<ISiteTimeZones>().LoadRememberedAsync();
 
 // Register schedule executor delegates (bridges Alerts project to Web project services)
 app.RegisterScheduleExecutors();
@@ -1470,12 +1661,6 @@ await app.Services.GetRequiredService<DynamicSchemeManager>().SyncAsync();
 // Standard ASP.NET Core authentication middleware (must come before auth check).
 // Authentication is now the Identity application cookie (see AddNetOptIdentityAuthentication).
 app.UseAuthentication();
-
-// Transitional bridge: upgrade a still-valid legacy auth_token JWT into an Identity cookie so
-// sessions from before the upgrade are not forced to re-login. Runs after UseAuthentication (so an
-// existing Identity cookie short-circuits it) and before authorization/the auth-required gate.
-// SUNSET: remove with JwtService one release after the cutover (30-day legacy token lifetime).
-app.UseMiddleware<NetworkOptimizer.Web.Services.Identity.LegacyJwtBridgeMiddleware>();
 
 // Populate the ambient caller context (actor/IP/UA/correlation) for HTTP requests, after auth so the
 // principal is resolved. Circuit calls are populated separately by CallerContextCircuitHandler.
@@ -1707,7 +1892,8 @@ static Dictionary<string, string?> LoadWindowsRegistrySettings()
             ["TRAEFIK_OPTIMIZER_HOSTNAME"] = "TRAEFIK_OPTIMIZER_HOSTNAME",
             ["TRAEFIK_SPEEDTEST_HOSTNAME"] = "TRAEFIK_SPEEDTEST_HOSTNAME",
             ["TRAEFIK_LISTEN_IP"] = "TRAEFIK_LISTEN_IP",
-            ["TRAEFIK_LOG_LEVEL"] = "TRAEFIK_LOG_LEVEL"
+            ["TRAEFIK_LOG_LEVEL"] = "TRAEFIK_LOG_LEVEL",
+            ["TRAEFIK_WAF_MODE"] = "TRAEFIK_WAF_MODE"
         };
 
         foreach (var mapping in keyMappings)
@@ -1751,6 +1937,7 @@ class SecretDecryptorAdapter(NetworkOptimizer.Storage.Services.ICredentialProtec
 {
     public string Decrypt(string encrypted) => inner.Decrypt(encrypted);
     public string Encrypt(string plaintext) => inner.Encrypt(plaintext);
+    public string EncryptForSite(string plaintext, string siteSlug) => inner.EncryptForSite(plaintext, siteSlug);
 }
 
 // Adapter to bridge IDigestStateStore (Alerts project) to SystemSettings (Storage project)

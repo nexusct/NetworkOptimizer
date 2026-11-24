@@ -3,6 +3,7 @@
 @inject IStarlinkMonitorService StarlinkService
 @inject IJSRuntime JS
 @implements IAsyncDisposable
+@inject IDisplayTimeZone DisplayTime
 
 <div class="starlink-stats-panel">
     @if (isLoading)
@@ -49,7 +50,7 @@
                 @if (stats != null)
                 {
                     <div class="tc-timestamp">
-                        <small>Updated: @stats.Timestamp.ToLocalTime().ToString("HH:mm:ss")</small>
+                        <small>Updated: @stats.Timestamp.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.TimeSeconds, DisplayFormat.Culture)</small>
                     </div>
                 }
             </div>
@@ -243,7 +244,10 @@
     }
 
     .starlink-metric-value {
-        font-family: monospace;
+        font-family: var(--font-display);
+        font-variant-numeric: tabular-nums;
+        word-spacing: var(--display-word-spacing);
+        font-weight: 500;
         color: var(--text-primary);
         text-align: right;
         display: flex;
@@ -264,7 +268,7 @@
 
     .starlink-badge {
         padding: 2px 8px;
-        border-radius: 4px;
+        border-radius: var(--border-radius);
         font-size: 0.7rem;
         font-weight: 600;
     }

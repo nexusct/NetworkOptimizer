@@ -135,9 +135,12 @@ public class FirewallRuleParser
         var action = policy.GetStringOrNull("action");
         var protocol = policy.GetStringOrNull("protocol");
         var matchOppositeProtocol = policy.GetBoolOrDefault("match_opposite_protocol", false);
+        var ipVersion = policy.GetStringOrNull("ip_version");
         var index = policy.GetIntOrDefault("index", 0);
         var predefined = policy.GetBoolOrDefault("predefined", false);
         var icmpTypename = policy.GetStringOrNull("icmp_typename");
+        var scheduleMode = policy.TryGetProperty("schedule", out var schedule) && schedule.ValueKind == JsonValueKind.Object
+            ? schedule.GetStringOrNull("mode") : null;
 
         // Extract connection state info
         var connectionStateType = policy.GetStringOrNull("connection_state_type");
@@ -248,6 +251,7 @@ public class FirewallRuleParser
         string? destPort = null;
         string? destMatchingTarget = null;
         List<string>? webDomains = null;
+        List<string>? destRegions = null;
         List<string>? destNetworkIds = null;
         List<string>? destIps = null;
         List<int>? appIds = null;
@@ -270,6 +274,14 @@ public class FirewallRuleParser
             if (dest.TryGetProperty("web_domains", out var domains) && domains.ValueKind == JsonValueKind.Array)
             {
                 webDomains = domains.EnumerateArray()
+                    .Where(e => e.ValueKind == JsonValueKind.String)
+                    .Select(e => e.GetString()!)
+                    .ToList();
+            }
+
+            if (dest.TryGetProperty("regions", out var regionList) && regionList.ValueKind == JsonValueKind.Array)
+            {
+                destRegions = regionList.EnumerateArray()
                     .Where(e => e.ValueKind == JsonValueKind.String)
                     .Select(e => e.GetString()!)
                     .ToList();
@@ -364,6 +376,22 @@ public class FirewallRuleParser
             }
         }
 
+        // UniFi's IPv6 isolation for a prefix-delegated network is reported with an ANY source, but the
+        // gateway enforces it for that network only (ip6tables matches the network's prefix ipset).
+        // Taken literally it would isolate every Internal network over IPv6, so rescope it to the
+        // network its name identifies, or to none when the name does not parse.
+        int? pdIsolationVlanId = null;
+        if (predefined &&
+            string.Equals(ipVersion, "IPV6", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(policy.GetStringOrNull("origin_type"), "network_config", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(sourceMatchingTarget, "ANY", StringComparison.OrdinalIgnoreCase))
+        {
+            pdIsolationVlanId = ParsePdInterfaceVlan(name) ?? -1;
+            sourceMatchingTarget = "NETWORK";
+            sourceNetworkIds = [];
+            _logger.LogDebug("Rescoped PD IPv6 isolation rule '{RuleName}' to VLAN {Vlan}", name, pdIsolationVlanId);
+        }
+
         return new FirewallRule
         {
             Id = id,
@@ -373,12 +401,16 @@ public class FirewallRuleParser
             Action = action,
             Protocol = protocol,
             MatchOppositeProtocol = matchOppositeProtocol,
+            IpVersion = ipVersion,
+            PdIsolationVlanId = pdIsolationVlanId,
             SourcePort = sourcePort,
             DestinationType = destMatchingTarget,
             DestinationPort = destPort,
             SourceNetworkIds = sourceNetworkIds,
             WebDomains = webDomains,
+            DestinationRegions = destRegions,
             Predefined = predefined,
+            OriginType = policy.GetStringOrNull("origin_type"),
             // Extended matching criteria
             SourceMatchingTarget = sourceMatchingTarget,
             SourceIps = sourceIps,
@@ -389,6 +421,7 @@ public class FirewallRuleParser
             AppIds = appIds,
             AppCategoryIds = appCategoryIds,
             IcmpTypename = icmpTypename,
+            ScheduleMode = scheduleMode,
             // Zone and match opposite flags
             SourceZoneId = sourceZoneId,
             DestinationZoneId = destZoneId,
@@ -727,6 +760,7 @@ public class FirewallRuleParser
             HasBeenHit = hitCount > 0,
             HitCount = hitCount,
             Ruleset = ruleset,
+            IpVersion = IpVersionForLegacyRuleset(ruleset),
             SourceNetworkIds = sourceNetworkIds,
             SourceMatchingTarget = sourceMatchingTarget,
             SourceIps = sourceIps,
@@ -743,6 +777,37 @@ public class FirewallRuleParser
             ConnectionStateType = connectionStateType,
             ConnectionStates = connectionStates
         };
+    }
+
+    /// <summary>
+    /// Extract the VLAN from a PD isolation rule name ("... from PD interface br69 ..."). The bridge
+    /// number is the VLAN; br0 is the untagged default network, which the audit models as VLAN 1.
+    /// </summary>
+    internal static int? ParsePdInterfaceVlan(string? ruleName)
+    {
+        if (string.IsNullOrEmpty(ruleName))
+            return null;
+
+        var match = System.Text.RegularExpressions.Regex.Match(ruleName, @"\bbr(\d{1,4})\b");
+        if (!match.Success || !int.TryParse(match.Groups[1].Value, out var bridge) || bridge > 4094)
+            return null;
+
+        return bridge == 0 ? 1 : bridge;
+    }
+
+    /// <summary>
+    /// Address family of a legacy ruleset: the v6 rulesets (LANv6_IN, WANv6_OUT, ...) are IPv6-only,
+    /// every other named ruleset is IPv4-only. Unknown or missing rulesets stay unscoped.
+    /// </summary>
+    internal static string? IpVersionForLegacyRuleset(string? ruleset)
+    {
+        if (string.IsNullOrEmpty(ruleset))
+            return null;
+
+        if (ruleset.Contains("v6_", StringComparison.OrdinalIgnoreCase))
+            return "IPV6";
+
+        return MapRulesetToZones(ruleset) != (null, null) ? "IPV4" : null;
     }
 
     /// <summary>
@@ -775,8 +840,9 @@ public class FirewallRuleParser
         if (string.IsNullOrEmpty(ruleset))
             return (null, null);
 
-        // Normalize to uppercase for comparison
-        return ruleset.ToUpperInvariant() switch
+        // Normalize to uppercase for comparison. The v6 rulesets share their v4 twin's zones;
+        // their family comes from IpVersionForLegacyRuleset.
+        return ruleset.ToUpperInvariant().Replace("V6_", "_") switch
         {
             // WAN_OUT: Traffic from internal networks going to the internet
             // Most relevant for DNS security checks (blocking external DNS)

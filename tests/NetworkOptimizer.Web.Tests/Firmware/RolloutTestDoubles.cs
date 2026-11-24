@@ -7,16 +7,25 @@ using NetworkOptimizer.Storage.Interfaces;
 using NetworkOptimizer.Storage.Models;
 using NetworkOptimizer.Storage.Repositories;
 using NetworkOptimizer.UniFi.Models;
-using NetworkOptimizer.Web.Services;
 using NetworkOptimizer.Web.Services.Firmware;
 using NetworkOptimizer.Web.Services.Gates;
 using NetworkOptimizer.Web.Services.Identity;
 
 namespace NetworkOptimizer.Web.Tests.Firmware;
 
+/// <summary>
+/// Answers every request 404 without touching the network. The harness's release feed must not be
+/// Ubiquiti's live one: a GA build published there changes what a preview picks.
+/// </summary>
 internal sealed class NullHttpClientFactory : IHttpClientFactory
 {
-    public HttpClient CreateClient(string name) => new();
+    public HttpClient CreateClient(string name) => new(new NotFoundHandler());
+
+    private sealed class NotFoundHandler : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.NotFound) { RequestMessage = request });
+    }
 }
 
 /// <summary>Clock the executor's grace windows, budgets and cool-downs are driven by.</summary>
@@ -134,16 +143,27 @@ internal sealed class FakeFirmwareCommandClient : IFirmwareCommandClient
         return Task.FromResult(ExternalResult);
     }
 
-    public Task<FirmwareCommandResult> TriggerSshUpgradeAsync(string host, string firmwareUrl, bool isGateway, CancellationToken cancellationToken = default)
+    /// <summary>Runs while an SSH device upgrade is in flight, e.g. to show the device Upgrading.</summary>
+    public Action? DuringSshUpgrade { get; set; }
+
+    public Task<FirmwareCommandResult> TriggerSshUpgradeAsync(
+        string deviceMac, string host, string firmwareUrl, NetworkOptimizer.Core.Enums.DeviceType role, bool isGateway,
+        CancellationToken cancellationToken = default)
     {
         SshCommands.Add((host, firmwareUrl, isGateway));
+        DuringSshUpgrade?.Invoke();
         return Task.FromResult(SshResult);
     }
+
+    /// <summary>When set, answers Check for Updates by call number (1-based), e.g. to restage on the Nth read.</summary>
+    public Func<int, IReadOnlyList<UniFiFirmwareCatalogEntry>>? CatalogOnCall { get; set; }
 
     public Task<IReadOnlyList<UniFiFirmwareCatalogEntry>> CheckForUpdatesAsync(CancellationToken cancellationToken = default)
     {
         CheckForUpdatesCalls++;
         Calls.Add("list-available");
+        if (CatalogOnCall != null)
+            return Task.FromResult(CatalogOnCall(CheckForUpdatesCalls));
         return Task.FromResult<IReadOnlyList<UniFiFirmwareCatalogEntry>>(
             CatalogByChannel.TryGetValue(DeviceChannel, out var staged) ? staged : Catalog);
     }
@@ -167,6 +187,24 @@ internal sealed class FakeFirmwareCommandClient : IFirmwareCommandClient
 
     public Task<bool?> GetAutoUpgradeEnabledAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult(AutoUpgradeEnabled);
+
+    /// <summary>Whether each auto-update turn-off is accepted, keyed by "devices" or the schedule key.</summary>
+    public Dictionary<string, bool> AutoUpdateDisableAccepted { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Auto-update turn-offs, in order: "devices" or the console schedule key.</summary>
+    public List<string> AutoUpdateDisables { get; } = [];
+
+    public Task<bool> DisableDeviceAutoUpgradeAsync(CancellationToken cancellationToken = default)
+    {
+        AutoUpdateDisables.Add("devices");
+        return Task.FromResult(AutoUpdateDisableAccepted.GetValueOrDefault("devices", true));
+    }
+
+    public Task<bool> DisableConsoleAutoUpdateAsync(string scheduleKey, CancellationToken cancellationToken = default)
+    {
+        AutoUpdateDisables.Add(scheduleKey);
+        return Task.FromResult(AutoUpdateDisableAccepted.GetValueOrDefault(scheduleKey, true));
+    }
 
     public Task<bool> SetDeviceChannelAsync(string channel, CancellationToken cancellationToken = default)
     {
@@ -222,11 +260,15 @@ internal sealed class FakeFirmwareCommandClient : IFirmwareCommandClient
         return Task.FromResult(BackupResult);
     }
 
-    public Task<bool> TriggerNetworkApplicationUpdateAsync(CancellationToken cancellationToken = default)
+    /// <summary>Runs while the Network app update command is in flight, before it returns.</summary>
+    public Func<Task>? DuringNetworkAppUpdate { get; set; }
+
+    public async Task<bool> TriggerNetworkApplicationUpdateAsync(CancellationToken cancellationToken = default)
     {
         NetworkAppUpdateCalls++;
         Calls.Add("network-app-update");
-        return Task.FromResult(NetworkAppUpdateAccepted);
+        if (DuringNetworkAppUpdate != null) await DuringNetworkAppUpdate();
+        return NetworkAppUpdateAccepted;
     }
 
     public Task<UniFiConsoleFirmwareRelease?> GetPendingUniFiOsUpdateAsync(CancellationToken cancellationToken = default) =>
@@ -242,16 +284,78 @@ internal sealed class FakeFirmwareCommandClient : IFirmwareCommandClient
     public FirmwareCommandResult SshNetworkAppResult { get; set; } = FirmwareCommandResult.Ok();
     public FirmwareCommandResult SshUniFiOsResult { get; set; } = FirmwareCommandResult.Ok();
 
-    public Task<FirmwareCommandResult> TriggerSshNetworkAppUpdateAsync(string debUrl, CancellationToken cancellationToken = default)
+    public Task<FirmwareCommandResult> TriggerSshNetworkAppUpdateAsync(
+        string debUrl, IReadOnlyList<string>? companionUrls = null, CancellationToken cancellationToken = default)
     {
         Calls.Add("ssh-network-app-update");
         return Task.FromResult(SshNetworkAppResult);
     }
 
-    public Task<FirmwareCommandResult> TriggerSshUniFiOsUpdateAsync(string firmwareUrl, CancellationToken cancellationToken = default)
+    /// <summary>Runs while the SSH UniFi OS install is in flight, before it returns.</summary>
+    public Func<Task>? DuringSshUniFiOsUpdate { get; set; }
+
+    /// <summary>The attempt id the last SSH UniFi OS install was started with.</summary>
+    public string? LastSshUniFiOsAttemptId { get; private set; }
+
+    /// <summary>
+    /// What the gateway's install log reads. Null: unreadable. A function, so a test can answer
+    /// with the attempt id the orchestrator generated.
+    /// </summary>
+    public Func<UniFiOsInstallLog?>? SshUniFiOsLog { get; set; }
+
+    public async Task<FirmwareCommandResult> TriggerSshUniFiOsUpdateAsync(string firmwareUrl, string attemptId, CancellationToken cancellationToken = default)
     {
         Calls.Add("ssh-unifi-os-update");
-        return Task.FromResult(SshUniFiOsResult);
+        LastSshUniFiOsAttemptId = attemptId;
+        if (DuringSshUniFiOsUpdate != null) await DuringSshUniFiOsUpdate();
+        return SshUniFiOsResult;
+    }
+
+    public Task<UniFiOsInstallLog?> ReadSshUniFiOsInstallLogAsync(CancellationToken cancellationToken = default)
+    {
+        Calls.Add("ssh-unifi-os-log");
+        return Task.FromResult(SshUniFiOsLog?.Invoke());
+    }
+
+    public bool GatewaySshConfigured { get; set; } = true;
+
+    public Task<bool> HasGatewaySshAsync(CancellationToken cancellationToken = default) =>
+        Task.FromResult(GatewaySshConfigured);
+
+    /// <summary>What the console's own log reports; null reads as no gateway SSH.</summary>
+    public ConsoleNetworkPackages? NetworkPackages { get; set; }
+
+    /// <summary>The detached SSH Network install's log; null reads as unreadable.</summary>
+    public NetworkInstallLog? SshNetworkInstallLog { get; set; }
+
+    public Task<NetworkInstallLog?> ReadSshNetworkInstallLogAsync(CancellationToken cancellationToken = default) =>
+        Task.FromResult(SshNetworkInstallLog);
+
+    public Task<ConsoleNetworkPackages?> ReadConsoleNetworkPackagesAsync(bool fresh = false, CancellationToken cancellationToken = default) =>
+        Task.FromResult(NetworkPackages);
+
+    /// <summary>What the route probe reads; null is SSH not answering. Routed by default.</summary>
+    public NetworkRouteState? NetworkRoute { get; set; } = NetworkRouteState.Routed;
+
+    public FirmwareCommandResult RestartNetworkResult { get; set; } = FirmwareCommandResult.Ok();
+    public FirmwareCommandResult RebootConsoleResult { get; set; } = FirmwareCommandResult.Ok();
+
+    public Task<NetworkRouteState?> ProbeNetworkRouteAsync(CancellationToken cancellationToken = default)
+    {
+        Calls.Add("ssh-network-route");
+        return Task.FromResult(NetworkRoute);
+    }
+
+    public Task<FirmwareCommandResult> RestartNetworkApplicationAsync(CancellationToken cancellationToken = default)
+    {
+        Calls.Add("ssh-restart-network");
+        return Task.FromResult(RestartNetworkResult);
+    }
+
+    public Task<FirmwareCommandResult> RebootConsoleAsync(CancellationToken cancellationToken = default)
+    {
+        Calls.Add("ssh-reboot-console");
+        return Task.FromResult(RebootConsoleResult);
     }
 }
 
@@ -318,8 +422,28 @@ internal sealed class FakeHealthGate : IRolloutHealthGate
 {
     public RolloutHealthVerdict Verdict { get; set; } = RolloutHealthVerdict.Ok();
 
-    public Task<RolloutHealthVerdict> EvaluateAsync(CancellationToken cancellationToken = default) =>
-        Task.FromResult(Verdict);
+    /// <summary>The <c>openedSince</c> of every evaluation, in order.</summary>
+    public List<DateTime?> Asked { get; } = [];
+
+    public Task<RolloutHealthVerdict> EvaluateAsync(DateTime? openedSince, CancellationToken cancellationToken = default)
+    {
+        Asked.Add(openedSince);
+        return Task.FromResult(Verdict);
+    }
+}
+
+/// <summary>Alert editor that records every rewrite, and can be told to fail.</summary>
+internal sealed class RecordingAlertEditor : IRolloutAlertEditor
+{
+    public List<(IReadOnlyCollection<string> EventTypes, string Message)> Rewrites { get; } = [];
+    public bool Throws { get; set; }
+
+    public Task<int> RewriteOpenAsync(IReadOnlyCollection<string> eventTypes, string message, CancellationToken cancellationToken = default)
+    {
+        if (Throws) throw new InvalidOperationException("The alert history is unavailable");
+        Rewrites.Add((eventTypes, message));
+        return Task.FromResult(1);
+    }
 }
 
 /// <summary>Mesh queue that records what it was asked to re-pair.</summary>
@@ -327,7 +451,7 @@ internal sealed class RecordingMeshRepairQueue : IMeshRepairQueue
 {
     public List<(string? Ip, string? Iface, string? Name)> Enqueued { get; } = [];
 
-    public bool Enqueue(string? childIp, string? iface, string? apName)
+    public bool Enqueue(string? childIp, string? iface, string? apName, string? childMac)
     {
         Enqueued.Add((childIp, iface, apName));
         return childIp != null && iface != null && iface.StartsWith("vwiresta", StringComparison.OrdinalIgnoreCase);
@@ -502,6 +626,34 @@ internal sealed class ScriptedRebootWitness : IRolloutRebootWitness
         Task.FromResult(_boots.TryGetValue(deviceMac, out var b) && b.BootedAt >= since ? b : null);
 }
 
+/// <summary>Keeps every audit event written, for asserting what the executor recorded on its own.</summary>
+internal sealed class CapturingAuditLogger : NetworkOptimizer.Web.Services.Auditing.IAuditLogger
+{
+    public List<NetworkOptimizer.Storage.Models.Identity.AuditEvent> Events { get; } = new();
+    public void Log(NetworkOptimizer.Storage.Models.Identity.AuditEvent auditEvent) => Events.Add(auditEvent);
+}
+
+/// <summary>Change Control's rollout hooks, scripted.</summary>
+internal sealed class FakeConfigGuard : IRolloutConfigGuard
+{
+    public int? PinnedSnapshotId { get; set; } = 42;
+    public string? HoldReason { get; set; }
+    public int Pins { get; private set; }
+    public int Checks { get; private set; }
+
+    public Task<int?> PinBeforeRolloutAsync(string siteSlug, int planId, CancellationToken cancellationToken)
+    {
+        Pins++;
+        return Task.FromResult(PinnedSnapshotId);
+    }
+
+    public Task<string?> CheckAfterNetworkAppAsync(string siteSlug, DateTime rolloutStartedUtc, CancellationToken cancellationToken)
+    {
+        Checks++;
+        return Task.FromResult(HoldReason);
+    }
+}
+
 internal sealed class RolloutHarness : IDisposable
 {
     public static readonly DateTime Start = new(2026, 8, 14, 3, 0, 0, DateTimeKind.Utc);
@@ -516,13 +668,16 @@ internal sealed class RolloutHarness : IDisposable
     public FakeObserverLocator Locator { get; } = new();
     public FakeLitmusService Litmus { get; } = new();
     public FakeHealthGate Health { get; } = new();
+    public RecordingAlertEditor AlertEditor { get; } = new();
     public RecordingMeshRepairQueue Mesh { get; } = new();
     public RolloutSuppressionRegistry Suppression { get; } = new();
     public CapturingBus Bus { get; } = new();
     public FakeRolloutPlanningSource Planning { get; } = new();
     public FakeReleaseMetadataSource Releases { get; } = new();
     public ScriptedRebootWitness Reboots { get; } = new();
+    public FakeConfigGuard ConfigGuard { get; } = new();
     public AuditContext Audit { get; } = new();
+    public CapturingAuditLogger AuditLog { get; } = new();
     public CallerContext Caller { get; } = new();
     public RolloutAutopilot Autopilot { get; }
     public FirmwareRolloutOrchestrator Orchestrator { get; }
@@ -549,7 +704,8 @@ internal sealed class RolloutHarness : IDisposable
             Time,
             NullLogger<RolloutAutopilot>.Instance,
             SharedCatalog,
-            feed);
+            feed,
+            audit: AuditLog);
         Orchestrator = NewOrchestrator();
 
         Caller.SetUser(new CallerInfo { ActorName = Actor });
@@ -595,7 +751,14 @@ internal sealed class RolloutHarness : IDisposable
         Time,
         NullLogger<FirmwareRolloutOrchestrator>.Instance,
         rebootWitness: Reboots,
-        observerLocator: Locator);
+        observerLocator: Locator,
+        audit: AuditLog,
+        configGuard: ConfigGuard,
+        alertEditor: AlertEditor)
+    {
+        // The settle wait runs on the wall clock; tests decide the device state up front.
+        SshDropSettleWindow = TimeSpan.Zero,
+    };
 
     public NetworkOptimizerDbContext NewContext()
     {

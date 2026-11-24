@@ -1,0 +1,489 @@
+// "On this page": an index of the cards on a long page, so a card under a long table is one click
+// away. App-wide and automatic: every page with 2 or more titled cards, one of them starting below
+// the first screen, gets it; a page opts out with data-no-card-index on any element, and a card
+// with no .card-title joins with data-card-index="Name". A card with data-card-index-side-only shows
+// in the side list but not the row, for a card whose own control already sits beside the row.
+// The row leaves out the cards already on the first screen: it sits at the top, where they are in
+// view. A page with data-card-index-merge on any element (the Dashboard) also folds neighbors in
+// the row that end in the same words into one link ("LAN & WAN Speed Test"), and neighbors that
+// carry the same data-card-index-fold="Label" into one link with that label.
+//
+// Two forms, by the room there is. Beside the content, when its left gutter fits the list: a list
+// that follows the scroll, the card in view highlighted. Otherwise a row of card names just above
+// the first card. Blazor owns the page's DOM, so the list lives on <body>; the row is the one node
+// this adds to a page, never inside a grid or side-by-side row, and is rebuilt whenever Blazor
+// re-renders it away.
+(function () {
+    'use strict';
+
+    var MIN_CARDS = 2;
+    var LIST_WIDTH = 168;   // the narrowest list, matching .card-index width in app.css
+    var LIST_MAX = 260;     // a wider gutter widens the list up to this, so names wrap less
+    var LINE = 48;          // the reading line, in px below the pane's top
+    var GAP = 12;          // between the list and the content, and the list and the gutter's far edge
+    var IDLE_MS = 1000;    // the side list dims after this long without a scroll (.card-index-idle)
+    var list = null, row = null, cards = [], signature = '', pending = 0, scroller = null;
+    // The cards behind each link: one, or several where the row folds neighbors into one link.
+    var linkCards = [];
+    // The row's cards so far for one set of cards. Once the reader scrolls it only grows: a card
+    // moving back onto the first screen as data loads would otherwise drop out, and the row's
+    // height would jitter under them. Before that it follows the layout, so a page that first lays
+    // out taller (a deep link loading its moment) does not keep a card that settles in view.
+    var listed = { key: '', names: {}, since: 0 };
+    // The card a click jumped to stays highlighted until the reader scrolls: one near the end
+    // cannot reach the top, and the page's bottom would otherwise mark the last card.
+    var pinned = -1;
+    // The card lit last and the scroll position then, so a scroll moves the highlight only its way.
+    var shown = -1, lastTop = 0;
+    // Where a scroll down began stepping through the rows left near the end (see place).
+    var stepFrom = null;
+
+    function content() { return document.querySelector('article.content'); }
+
+    function scrollerOf(node) {
+        for (var n = node.parentElement; n && n !== document.body; n = n.parentElement) {
+            var oy = getComputedStyle(n).overflowY;
+            if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight + 4) return n;
+        }
+        return document.scrollingElement || document.documentElement;
+    }
+
+    function paneRect(sc) {
+        var isDoc = sc === document.scrollingElement || sc === document.documentElement;
+        return isDoc ? { top: 0, bottom: window.innerHeight, left: 0 } : sc.getBoundingClientRect();
+    }
+
+    // A card's name: its title without the grey suffix ("Snapshots", not "Snapshots 170 kept, 5 MB")
+    // or any control in it (Access Layer's technology select would add every option's text).
+    // A card without a .card-title names itself with data-card-index="Name".
+    function nameOf(card) {
+        var given = card.getAttribute('data-card-index');
+        if (given) return given;
+        var title = card.querySelector('.card-header .card-title');
+        if (!title || title.closest('.card') !== card) return '';
+        var copy = title.cloneNode(true);
+        Array.prototype.forEach.call(copy.querySelectorAll('.card-title-suffix, .tooltip-icon, select, button, input, textarea'),
+            function (n) { n.remove(); });
+        return copy.textContent.replace(/\s+/g, ' ').trim();
+    }
+
+    // In reading order, not DOM order: top to bottom, then left to right along a shared top. A grid
+    // that places cards itself (the Dashboard) puts its second column's first card after the first
+    // column's in the DOM.
+    function findCards(root) {
+        var found = Array.prototype.filter.call(root.querySelectorAll('.card'), function (c) {
+            return c.offsetParent !== null && !c.parentElement.closest('.card')
+                && !c.closest('.modal, .modal-backdrop, [role="dialog"]') && nameOf(c).length > 0;
+        });
+        var at = found.map(function (c, i) { var r = c.getBoundingClientRect(); return { c: c, top: r.top, left: r.left, i: i }; });
+        at.sort(function (a, b) {
+            return Math.abs(a.top - b.top) >= 4 ? a.top - b.top : a.left - b.left || a.i - b.i;
+        });
+        return at.map(function (a) { return a.c; });
+    }
+
+    // The cards the row lists: those that start below the first screen, plus any it listed before.
+    function belowFirstScreen(found, sc) {
+        var key = found.map(nameOf).join('|');
+        if (listed.key !== key) listed = { key: key, names: {}, since: Date.now() };
+        else if (lastInput <= listed.since) listed.names = {};
+        var paneTop = paneRect(sc).top;
+        return found.filter(function (c) {
+            var name = nameOf(c);
+            var start = c.getBoundingClientRect().top - paneTop + sc.scrollTop;
+            if (start > sc.clientHeight - LINE) listed.names[name] = true;
+            return listed.names[name] === true;
+        });
+    }
+
+    // A name's words and its trailing parenthetical: "ONT Stats (GPON/XGS-PON)" is ONT, Stats, and the bracket.
+    function nameParts(name) {
+        var m = /^(.*?)\s*(\([^)]*\))\s*$/.exec(name);
+        return { words: (m ? m[1] : name).split(' '), paren: m ? m[2] : '' };
+    }
+
+    // The trailing words two names share, each keeping at least one word of its own.
+    function sharedTail(a, b) {
+        var n = 0;
+        while (n < a.length - 1 && n < b.length - 1 && a[a.length - 1 - n] === b[b.length - 1 - n]) n++;
+        return n;
+    }
+
+    // Neighbors that end in the same words become one link, the shared words said once:
+    // "ONT Stats (GPON/XGS-PON)" and "Starlink Stats" read "ONT (GPON/XGS-PON) & Starlink Stats".
+    function groupsOf(names, merge, folds) {
+        var groups = [];
+        for (var i = 0; i < names.length;) {
+            var first = nameParts(names[i]), members = [i], tail = 0;
+            if (merge && folds[i]) {
+                while (folds[i + members.length] === folds[i]) members.push(i + members.length);
+                if (members.length > 1) {
+                    groups.push({ label: folds[i], cards: members });
+                    i += members.length;
+                    continue;
+                }
+            }
+            while (merge && i + members.length < names.length && !folds[i + members.length]) {
+                var next = nameParts(names[i + members.length]);
+                var shared = sharedTail(first.words, next.words);
+                if (shared === 0 || (tail && shared < tail)) break;
+                tail = tail ? tail : shared;
+                members.push(i + members.length);
+            }
+            var label = names[i];
+            if (members.length > 1) {
+                var heads = members.map(function (m) {
+                    var p = nameParts(names[m]);
+                    return p.words.slice(0, p.words.length - tail).join(' ') + (p.paren ? ' ' + p.paren : '');
+                });
+                var joined = heads.length === 2 ? heads.join(' & ')
+                    : heads.slice(0, -1).join(', ') + ', & ' + heads[heads.length - 1];
+                label = joined + ' ' + first.words.slice(first.words.length - tail).join(' ');
+            }
+            groups.push({ label: label, cards: members });
+            i += members.length;
+        }
+        return groups;
+    }
+
+    // By index, not node: a re-render replaces the cards under the same links.
+    function link(i, name, cls) {
+        var a = document.createElement('a');
+        a.href = '#';
+        a.className = cls;
+        a.textContent = name;
+        a.addEventListener('click', function (e) {
+            e.preventDefault();
+            var card = cards[i];
+            if (!card) return;
+            pinned = i;
+            clickPin = true;
+            aim = i;
+            aimTries = 0;
+            place();
+            openIfCollapsed(card);
+            jumpTo(card);
+        });
+        return a;
+    }
+
+    // A collapsed card opens on the way there. The header's own click handler does it, so the page
+    // keeps and saves the state. A body still display:none has not loaded its saved state yet.
+    function openIfCollapsed(card) {
+        var header = card.querySelector('.card-header-collapsible');
+        if (!header || header.closest('.card') !== card) return;
+        var body = Array.prototype.filter.call(header.parentElement.children, function (n) {
+            return n.classList.contains('expand-wrapper');
+        })[0];
+        if (!body || body.classList.contains('expanded') || body.style.display === 'none') return;
+        header.click();
+    }
+
+    // fade: the index is going away rather than being replaced, so let it fade out.
+    function clear(fade) {
+        var gone = function (n) {
+            if (!fade) return n.remove();
+            n.classList.add('card-index-out');
+            setTimeout(function () { n.remove(); }, 150);
+        };
+        if (list) { gone(list); list = null; }
+        // Every row, not just the one held: a re-render can leave a copy behind.
+        Array.prototype.forEach.call(document.querySelectorAll('.card-index-row:not(.card-index-out)'), gone);
+        row = null;
+        pinned = -1;
+        shown = -1;
+        stepFrom = null;
+        if (scroller) scroller.removeEventListener('scroll', onScroll);
+        scroller = null;
+        cards = [];
+        linkCards = [];
+    }
+
+    // Before the first card, unless it sits in a grid or a side-by-side flex row: then before the
+    // ancestor that does not, so the row never takes a grid cell or squeezes a column.
+    function rowAnchor(card, root) {
+        var at = card;
+        while (at.parentElement && at.parentElement !== root) {
+            var s = getComputedStyle(at.parentElement);
+            var sideBySide = s.display.indexOf('grid') >= 0 || (s.display.indexOf('flex') >= 0 && s.flexDirection.indexOf('row') === 0);
+            if (!sideBySide) break;
+            at = at.parentElement;
+        }
+        return at;
+    }
+
+    function build() {
+        pending = 0;
+        var root = content();
+        if (!root) return clear();
+        var found = root.querySelector('[data-no-card-index]') ? [] : findCards(root);
+        var first = found[0];
+        var sc = found.length ? scrollerOf(found[0]) : null;
+        var gutter = root.getBoundingClientRect().left - (sc ? paneRect(sc).left : 0);
+        var mode = gutter >= LIST_WIDTH + 2 * GAP + 8 ? 'list' : 'row';
+        if (mode === 'row') {
+            found = found.filter(function (c) { return !c.hasAttribute('data-card-index-side-only'); });
+        }
+        // Worth it once a card starts below the first screen: two cards are enough when the second is
+        // far down (Device Stats under its charts); three that all fit on screen hide nothing.
+        var hidden = sc && found.some(function (c) {
+            return c.getBoundingClientRect().top - paneRect(sc).top + sc.scrollTop > sc.clientHeight;
+        });
+        var enough = found.length >= MIN_CARDS;
+        if (mode === 'row' && sc && hidden) found = belowFirstScreen(found, sc);
+        var groups = groupsOf(found.map(nameOf), mode === 'row' && !!root.querySelector('[data-card-index-merge]'),
+            found.map(function (c) { return c.getAttribute('data-card-index-fold') || ''; }));
+        var names = enough ? groups.map(function (g) { return g.label; }).join('|') : '';
+        // Once shown, the same cards keep it: a page near one screen tall (Edit, as its Problems list
+        // grows and shrinks) would otherwise add and drop it, shifting the whole page each time.
+        var sig = hidden || (names && names === signature) ? names : '';
+        // Same cards, same form, row still in the page: keep the index, follow the new nodes.
+        if (sig === signature && (sig === '' || (mode === 'list' ? list : row && row.isConnected))) {
+            if (sig) {
+                cards = found;
+                linkCards = groups.map(function (g) { return g.cards; });
+            }
+            place();
+            return;
+        }
+        var keep = pinned >= 0 && cards[pinned] ? nameOf(cards[pinned]) : '';
+        clear(!sig);
+        signature = sig;
+        if (!sig) return;
+        cards = found;
+        linkCards = groups.map(function (g) { return g.cards; });
+        if (keep) pinned = found.map(nameOf).indexOf(keep);
+        scroller = sc;
+        if (mode === 'list') {
+            list = document.createElement('nav');
+            list.className = 'card-index';
+            list.setAttribute('aria-label', 'On this page');
+            var label = document.createElement('div');
+            label.className = 'card-index-label';
+            label.textContent = 'On this page';
+            list.appendChild(label);
+            cards.forEach(function (c, i) { list.appendChild(link(i, nameOf(c), 'card-index-link')); });
+            // The list sits on <body>, outside the scroller: a wheel over it would scroll nothing.
+            list.addEventListener('wheel', function (e) {
+                if (!scroller) return;
+                e.preventDefault();
+                var unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? scroller.clientHeight : 1;
+                scroller.scrollBy({ top: e.deltaY * unit, left: 0 });
+            }, { passive: false });
+            document.body.appendChild(list);
+            wake();
+        } else {
+            row = document.createElement('nav');
+            row.className = 'card-index-row';
+            row.setAttribute('aria-label', 'On this page');
+            groups.forEach(function (g) { row.appendChild(link(g.cards[0], g.label, 'card-index-link')); });
+            // Before the page's first card, which the row may not list.
+            var anchor = rowAnchor(first, root);
+            anchor.parentElement.insertBefore(row, anchor);
+        }
+        scroller.addEventListener('scroll', onScroll, { passive: true });
+        place();
+    }
+
+    // The card in view: the last whose top has passed a reading line. Cards side by side share a top,
+    // so they light up together; a click lights only the card clicked.
+    function place(towards) {
+        if (!scroller || !cards.length) return;
+        var pane = paneRect(scroller);
+        var height = pane.bottom - pane.top;
+        var toEnd = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop;
+        // Just under the top, so a card scrolled there (a deep link, block: 'start') is the one lit even
+        // when it is short. Over the last two thirds of a screen the line moves down to the bottom, so
+        // the highlight only moves forward and the last cards still get their turn.
+        var line = Math.min(LINE, scroller.scrollTop);
+        var zone = height * 2 / 3;
+        if (toEnd < zone) line = Math.max(line, LINE + (height - LINE) * (1 - toEnd / zone));
+        var tops = cards.map(function (c) { return c.getBoundingClientRect().top; });
+        var activeTop = tops[0];
+        tops.forEach(function (t) { if (t <= pane.top + line) activeTop = Math.max(activeTop, t); });
+        var natural = tops.findIndex(function (t) { return Math.abs(t - activeTop) < 4; });
+        // The highlight moves with the scroll, never against it: leaving a click's pin near the end,
+        // where the line sits low, would otherwise drop it to a later card while scrolling up.
+        var prevTop = lastTop;
+        var dir = scroller.scrollTop - lastTop || towards || 0;
+        lastTop = scroller.scrollTop;
+        if (pinned >= 0 || dir < 0) stepFrom = null;
+        // Scrolling down near the end from a card the line has already left behind (a click there)
+        // would jump to the last card: the rows after it share the scroll that is left instead.
+        var rowOf = function (idx) {
+            var n = 0;
+            for (var q = 1; q <= idx; q++) if (Math.abs(tops[q] - tops[q - 1]) >= 4) n++;
+            return n;
+        };
+        if (!stepFrom && pinned < 0 && dir > 0 && shown >= 0 && shown < cards.length && toEnd < zone && rowOf(natural) > rowOf(shown) + 1) {
+            stepFrom = { top: prevTop, idx: shown };
+        }
+        if (stepFrom && pinned < 0 && dir > 0) {
+            var rows = [];
+            for (var r = stepFrom.idx + 1; r < cards.length; r++) {
+                var prevRow = rows.length ? tops[rows[rows.length - 1]] : tops[stepFrom.idx];
+                if (Math.abs(tops[r] - prevRow) >= 4) rows.push(r);
+            }
+            // One row at a time: when the scroll that is left says so, or per wheel turn once nothing
+            // is left to scroll.
+            var span = scroller.scrollHeight - scroller.clientHeight - stepFrom.top;
+            var k = span > 0 ? Math.floor((scroller.scrollTop - stepFrom.top) / span * rows.length + 0.001) : rows.length;
+            var rank = rows.indexOf(shown) + 1;
+            var next = rows.filter(function (q) { return tops[q] > tops[shown] + 4; })[0];
+            var moved = scroller.scrollTop !== prevTop;
+            natural = next !== undefined && (moved ? k > rank : true) ? Math.min(natural, next) : shown;
+        }
+        if (pinned >= 0) shown = pinned;
+        else if (shown < 0 || shown >= cards.length || (dir < 0 ? natural < shown : dir > 0 ? natural > shown : false)) shown = natural;
+        var links = (list || row).querySelectorAll('.card-index-link');
+        // The row can start at a card further down: nothing is lit until the reader gets to one.
+        var notReached = !!row && pinned < 0 && tops[shown] >= pane.bottom;
+        Array.prototype.forEach.call(links, function (a, i) {
+            var behind = linkCards[i] || [i];
+            a.classList.toggle('active', !notReached && behind.some(function (c) {
+                return pinned >= 0 ? c === pinned : Math.abs(tops[c] - tops[shown]) < 4;
+            }));
+        });
+        if (list) {
+            var root = content().getBoundingClientRect();
+            var width = Math.max(LIST_WIDTH, Math.min(LIST_MAX, root.left - pane.left - 2 * GAP - 8));
+            list.style.width = width + 'px';
+            list.style.left = Math.max(GAP, root.left - width - GAP) + 'px';
+            // Level with the first card, and never beside the back button floating in the same gutter.
+            var top = Math.max(pane.top + 16, cards[0].getBoundingClientRect().top);
+            var back = document.querySelector('.page-back-float .page-back-btn');
+            if (back && back.offsetParent !== null) top = Math.max(top, back.getBoundingClientRect().bottom + 16);
+            list.style.top = top + 'px';
+        }
+    }
+
+    // A scroll no scroll input started is the page's own (a deep link's scrollIntoView): pin the first
+    // card at or below the top, which a card near the end could not otherwise win.
+    // A click's own smooth scroll lasts until its scroll events stop, however long that takes; a
+    // fixed window let the tail of a long one re-pin to the card below. A click's pin gives way only
+    // to a deep link's scrollIntoView, never to a scroll the browser makes on its own.
+    var lastInput = 0, own = false, ownTimer = 0, clickPin = false;
+    var aim = -1, aimTries = 0;
+    function ownScrolling() {
+        own = true;
+        clearTimeout(ownTimer);
+        ownTimer = setTimeout(settled, 200);
+    }
+    function jumpTo(card) {
+        ownScrolling();
+        var sc = scrollerOf(card);
+        var top = card.getBoundingClientRect().top - paneRect(sc).top;
+        sc.scrollTo({ top: sc.scrollTop + top - 16, behavior: 'smooth' });
+    }
+    // Content above can change height while the smooth scroll runs (a data refresh), leaving it short
+    // or past the card; once it settles, go again until the card is where it was sent.
+    function settled() {
+        own = false;
+        var card = aim >= 0 && pinned === aim ? cards[aim] : null;
+        if (!card || !scroller) { aim = -1; return; }
+        var off = card.getBoundingClientRect().top - paneRect(scroller).top - 16;
+        var toEnd = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop;
+        var canMove = off < 0 ? scroller.scrollTop > 1 : toEnd > 1;
+        if (Math.abs(off) > 4 && canMove && aimTries++ < 3) jumpTo(card);
+        else aim = -1;
+    }
+    // Partway up while the page scrolls; hover and focus bring it to full in CSS.
+    var idleTimer = 0;
+    function wake() {
+        if (!list) return;
+        list.classList.remove('card-index-idle');
+        clearTimeout(idleTimer);
+        var held = list;
+        idleTimer = setTimeout(function () { if (held === list) held.classList.add('card-index-idle'); }, IDLE_MS);
+    }
+    function onScroll() {
+        wake();
+        if (own) ownScrolling();
+        var target = Date.now() - intoViewAt < 1500 ? intoView : null;
+        if (Date.now() - lastInput > 600 && !own && scroller && !(clickPin && !target)) {
+            var pane = paneRect(scroller);
+            var at = -1;
+            // Only while that card is where the scroll put it, at the top or (near the end) on screen:
+            // a reload's scroll restore moves on past a deep link.
+            var atEnd = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop <= 2;
+            for (var i = 0; target && i < cards.length; i++) {
+                if (cards[i].contains(target) || target.contains(cards[i])) {
+                    var r = cards[i].getBoundingClientRect();
+                    var placed = atEnd ? r.top < pane.bottom && r.bottom > pane.top
+                        : r.top <= pane.top + LINE && r.bottom > pane.top + LINE;
+                    if (placed) at = i;
+                    break;
+                }
+            }
+            for (var j = 0; at < 0 && j < cards.length; j++) {
+                if (cards[j].getBoundingClientRect().top >= pane.top - 8) at = j;
+            }
+            if (at >= 0) { pinned = at; clickPin = false; }
+        }
+        if (frame) return;
+        frame = requestAnimationFrame(function () { frame = 0; place(); });
+    }
+    var frame = 0;
+
+    // At most every 150 ms, not after a quiet 150 ms: a page with live charts never goes quiet.
+    function schedule() {
+        if (!pending) pending = setTimeout(build, 150);
+    }
+
+    // Deep links scroll with scrollIntoView; noting the element tells two cards that both end at the
+    // page's bottom apart.
+    var intoView = null, intoViewAt = 0;
+    var nativeIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function () {
+        intoView = this;
+        intoViewAt = Date.now();
+        var result = nativeIntoView.apply(this, arguments);
+        // Pinned here as well: a card already in place scrolls nothing, so no scroll event follows.
+        for (var i = 0; i < cards.length && !own; i++) {
+            if (cards[i].contains(this) || this.contains(cards[i])) { pinned = i; clickPin = false; onScroll(); break; }
+        }
+        return result;
+    };
+
+    function start() {
+        // Blazor re-renders on navigation, tab switches, and data loads; the row this adds is ignored.
+        // Class changes count too: Settings switches tabs by class, with every tab's cards rendered.
+        new MutationObserver(function (records) {
+            for (var i = 0; i < records.length; i++) {
+                var t = records[i].target;
+                if (!(row && (t === row || row.contains(t))) && !(list && list.contains(t))) { schedule(); return; }
+            }
+        }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'hidden'] });
+        // The reader scrolling themselves ends a pin. A press on the scroller itself is its scrollbar;
+        // any other click is not a scroll, so a deep link after it still pins.
+        ['wheel', 'touchstart', 'keydown', 'pointerdown'].forEach(function (type) {
+            window.addEventListener(type, function (e) {
+                if (type === 'pointerdown' && e.target !== scroller && e.target !== document.documentElement) return;
+                lastInput = Date.now();
+                own = false;
+                clickPin = false;
+                aim = -1;
+                // The wheel's direction stands in for a scroll that cannot happen (already at an end).
+                var atEnd = scroller && scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop <= 1;
+                if (pinned >= 0) { pinned = -1; place(type === 'wheel' ? Math.sign(e.deltaY) : 0); }
+                else if (type === 'wheel' && e.deltaY > 0 && atEnd) place(1);
+            }, { passive: true, capture: true });
+        });
+        // The app scrolling back to the top for the reader (the logo on the Dashboard) ends a pin
+        // as their own scroll would; without it a click's pin held the card it lit over the top.
+        window.addEventListener('netopt:scroll-top', function () {
+            pinned = -1;
+            clickPin = false;
+            aim = -1;
+            own = false;
+            // Already at the top, no scroll follows to relight it.
+            place(-1);
+        });
+        // A resize can change the form (list or row), so rebuild even with the same cards.
+        window.addEventListener('resize', function () { signature = null; listed = { key: '', names: {}, since: 0 }; schedule(); });
+        schedule();
+    }
+
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+    else start();
+})();

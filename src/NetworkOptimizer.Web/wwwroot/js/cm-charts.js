@@ -2,14 +2,16 @@
 // Same control pattern as cellular-charts.js.
 
 import ApexCharts from '/_content/Blazor-ApexCharts/js/apexcharts.esm.js';
-import { computeStats, renderStatsTable as renderTable } from './chart-stats.js?v=9';
-import { valueSortedTooltip, tooltipHeld, alignedPoints } from './chart-tooltip.js?v=17';
+import { computeStats, renderStatsTable as renderTable } from './chart-stats.js?v=10';
+import { valueSortedTooltip, tooltipHeld, alignedPoints } from './chart-tooltip.js?v=22';
 import { renderFilterReset, isFiltered } from './chart-filter.js?v=6';
-import { createAxisDateCaption } from './chart-axis-date.js?v=3';
-import { syncIdentity } from './chart-sync.js?v=7';
+import { createAxisDateCaption } from './chart-axis-date.js?v=5';
+import { syncIdentity } from './chart-sync.js?v=9';
 import { awaitContainer } from './chart-mount.js?v=1';
-import { loadWindowHours, saveWindowHours, markActiveRange, notifyWindowMoved } from './chart-window.js?v=2';
-import { detailsTableHtml } from './detail-table.js?v=1';
+import { loadWindowHours, saveWindowHours, markActiveRange, notifyWindowMoved } from './chart-window.js?v=3';
+import { detailsTableHtml, fmtUptime } from './detail-table.js?v=1';
+import { createMarkLayer } from './chart-event-marks.js?v=14';
+import { renderSpectrum, disposeSpectrum } from './cm-spectrum.js?v=5';
 
 // Storage scope for this tab's remembered time window.
 const WINDOW_TAB = 'cm';
@@ -38,11 +40,37 @@ let visibility = {};
 let visibilityObserver = null;
 let isInViewport = true;
 let lastData = null;
+let lastEvents = [];
+let markResizeTimer = null;
 
 const axisDate = createAxisDateCaption({ charts: () => [dsPowerChart, dsSnrChart, usPowerChart, errorsChart], window: effectiveWindow });
 
 // Every chart this tab stacks shares one group - see chart-sync.js.
 const SYNC_GROUP = 'cm';
+
+// The modem's own logged events (T3/T4 timeouts and the like) as marks on every chart, for modems
+// that report an event log.
+const markLayer = createMarkLayer({
+    charts: () => {
+        const container = document.getElementById(containerId);
+        return [
+            [dsPowerChart, container?.querySelector('.cm-ds-power-chart')],
+            [dsSnrChart, container?.querySelector('.cm-ds-snr-chart')],
+            [usPowerChart, container?.querySelector('.cm-us-power-chart')],
+            [errorsChart, container?.querySelector('.cm-errors-chart')],
+        ].filter(([chart]) => chart);
+    },
+});
+
+function applyAnnotations() {
+    markLayer.apply(lastEvents, visibility);
+}
+
+// A narrower plot fits fewer marks before they collide, so the folds have to be recomputed.
+function onMarkResize() {
+    clearTimeout(markResizeTimer);
+    markResizeTimer = setTimeout(applyAnnotations, 200);
+}
 
 function baseOpts(height, yTitle, yFormatter, extra, group = SYNC_GROUP) {
     const base = {
@@ -66,20 +94,16 @@ function baseOpts(height, yTitle, yFormatter, extra, group = SYNC_GROUP) {
         dataLabels: { enabled: false },
         xaxis: {
             type: 'datetime',
-            labels: {
-                style: { colors: '#9ca3af' },
-                datetimeUTC: false,
-                datetimeFormatter: { hour: 'HH:mm', day: 'MMM dd' },
-            },
+            labels: noTime.timeAxisLabels({ style: { colors: '#9ca3af' } }),
             title: axisDate.option(),
         },
         yaxis: {
             title: { text: yTitle, style: { color: '#9ca3af' } },
-            labels: { style: { colors: '#9ca3af' }, formatter: yFormatter },
+            labels: { minWidth: 20, style: { colors: '#9ca3af' }, formatter: yFormatter },
         },
         grid: { borderColor: '#374151', strokeDashArray: 3 },
         legend: { show: false },
-        tooltip: { theme: 'dark', shared: true, x: { format: 'MMM dd, HH:mm:ss' }, custom: valueSortedTooltip,
+        tooltip: { theme: 'dark', shared: true, x: { formatter: noTime.chartTooltipFormatter() }, custom: valueSortedTooltip,
             y: { formatter: yFormatter } },
         noData: { text: 'No data in this time range', style: { color: '#64748b' } },
     };
@@ -153,12 +177,14 @@ function renderBadges(container) {
             }
             updateVisibility();
             renderBadges(container);
+            renderSpectrumCards(container);
             renderStatsTable(container, false);
+            renderEventLog(container);
         });
     }
 
     // Last: the chip rebuild above wipes the row, so the reset is re-added after it.
-    renderFilterReset(el, isFiltered(visibility), () => { visibility = {}; updateVisibility(); renderBadges(container); });
+    renderFilterReset(el, isFiltered(visibility), () => { visibility = {}; updateVisibility(); renderBadges(container); renderSpectrumCards(container); renderEventLog(container); });
 }
 
 // Downstream, upstream and the two error counts each get their own color per modem, so the four
@@ -195,6 +221,7 @@ function updateVisibility() {
     if (dsSnrChart) dsSnrChart.updateSeries(dsSnrSeries, false);
     if (usPowerChart) usPowerChart.updateSeries(usPowerSeries, false);
     if (errorsChart) errorsChart.updateSeries(errorsSeries, false);
+    applyAnnotations();
 }
 
 async function loadAndUpdate() {
@@ -204,16 +231,32 @@ async function loadAndUpdate() {
         id: d.id, label: d.label, color: PALETTE[i % PALETTE.length],
     }));
 
-    // Before updateVisibility, which draws from it.
+    // Before updateVisibility, which draws from both.
     lastData = data;
+    lastEvents = data.events || [];
     // Ahead of the redraw below - see apply().
     axisDate.apply();
     updateVisibility();
     const container = document.getElementById(containerId);
     if (container) {
         renderBadges(container);
+        renderSpectrumCards(container);
         renderDetails(container);
         renderStatsTable(container);
+        renderEventLog(container);
+    }
+}
+
+// The latest poll's channels, one card per visible modem. It follows the device filter like the
+// charts, but not the time window: per-channel values are not stored. Guarded: it renders ahead of
+// the details, stats, and event log, so a bad channel row must cost only this card.
+function renderSpectrumCards(container) {
+    try {
+        renderSpectrum(container.querySelector('.cm-spectrum'),
+            (lastData?.devices || []).filter(d => visibility[d.id] !== false),
+            { live: !isCustomRange && windowOffset === 0, showDeviceName: (lastData?.devices?.length ?? 0) > 1 });
+    } catch (e) {
+        console.error('Channel Spectrum failed to render', e);
     }
 }
 
@@ -252,7 +295,7 @@ function renderStatsTable(container, showAll) {
         ],
         filter: { meta: () => deviceMeta, key: 'id', visibility: () => visibility,
             resetVisibility: () => { visibility = {}; },
-            onChanged: (c) => { updateVisibility(); renderBadges(c); renderStatsTable(c, true); } },
+            onChanged: (c) => { updateVisibility(); renderBadges(c); renderSpectrumCards(c); renderStatsTable(c, true); renderEventLog(c); } },
     });
 }
 
@@ -267,8 +310,7 @@ function startPoll() {
 function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 
 function toLocalDatetimeString(d) {
-    const pad = n => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    return noTime.inputValue(d);
 }
 
 // A plain preset keeps no explicit bounds - getEffectiveFrom/To answer null for it - so its window
@@ -303,7 +345,7 @@ function updateCustomLabel(container) {
         btn.classList.add('active');
         const from = getEffectiveFrom(), to = getEffectiveTo();
         if (from && to) {
-            const fmt = d => d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+            const fmt = d => noTime.date(d, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
             btn.setAttribute('data-tooltip', `${fmt(from)} - ${fmt(to)}`);
         }
         if (!clearBtn) {
@@ -329,8 +371,9 @@ function applyDragZoom(xaxis) {
     notifyWindowMoved();
     const container = document.getElementById(containerId);
     if (container && xaxis && Number.isFinite(xaxis.min) && Number.isFinite(xaxis.max) && xaxis.min < xaxis.max) {
-        customFrom = new Date(xaxis.min);
-        customTo = new Date(xaxis.max);
+        // The selection is in chart x (noTime.toChart); the window is real instants.
+        customFrom = new Date(noTime.fromChart(xaxis.min));
+        customTo = new Date(noTime.fromChart(xaxis.max));
         isCustomRange = true;
         windowOffset = 0;
         container.querySelectorAll('[data-range]').forEach(b => b.classList.remove('active'));
@@ -511,8 +554,8 @@ export async function mount(elId) {
 
     container.querySelector('[data-action="apply-custom"]')?.addEventListener('click', () => {
         notifyWindowMoved();
-        const from = fromInput?.value ? new Date(fromInput.value) : null;
-        const to = toInput?.value ? new Date(toInput.value) : null;
+        const from = fromInput?.value ? noTime.fromInputValue(fromInput.value) : null;
+        const to = toInput?.value ? noTime.fromInputValue(toInput.value) : null;
         if (!from || !to || isNaN(from) || isNaN(to) || from >= to) return;
         customFrom = from;
         customTo = to;
@@ -540,6 +583,8 @@ export async function mount(elId) {
     }, { threshold: 0 });
     visibilityObserver.observe(container);
 
+    window.addEventListener('resize', onMarkResize);
+
     await loadAndUpdate();
     startPoll();
 }
@@ -549,21 +594,27 @@ export function soloDevice(deviceId) {
     deviceMeta.forEach(m => { visibility[m.id] = m.id === deviceId; });
     updateVisibility();
     const container = document.getElementById(containerId);
-    if (container) { renderBadges(container); renderStatsTable(container, false); }
+    if (container) { renderBadges(container); renderSpectrumCards(container); renderStatsTable(container, false); renderEventLog(container); }
 }
 
 export function unmount() {
     stopPoll();
+    window.removeEventListener('resize', onMarkResize);
+    clearTimeout(markResizeTimer);
+    markResizeTimer = null;
     if (visibilityObserver) { visibilityObserver.disconnect(); visibilityObserver = null; }
     if (fetchController) { fetchController.abort(); fetchController = null; }
     if (dsPowerChart) { dsPowerChart.destroy(); dsPowerChart = null; }
     if (dsSnrChart) { dsSnrChart.destroy(); dsSnrChart = null; }
     if (usPowerChart) { usPowerChart.destroy(); usPowerChart = null; }
     if (errorsChart) { errorsChart.destroy(); errorsChart = null; }
+    disposeSpectrum(document.getElementById(containerId)?.querySelector('.cm-spectrum'));
     containerId = null;
     deviceMeta = [];
     visibility = {};
     lastData = null;
+    lastEvents = [];
+    markLayer.reset();
     currentRangeHours = 24;
     windowOffset = 0;
     isCustomRange = false;
@@ -587,5 +638,37 @@ function renderDetails(container) {
                 return ds == null && us == null ? null : `${ds ?? '-'} / ${us ?? '-'}`;
             },
         },
+        {
+            header: 'DOCSIS State',
+            cell: d => {
+                const parts = [d.current?.docsisMode, d.current?.docsisState].filter(Boolean);
+                return parts.length ? escapeHtml(parts.join(' · ')) : null;
+            },
+        },
+        { header: 'Last Reinit', cell: d => d.current?.reinitReason ? escapeHtml(d.current.reinitReason) : null },
+        { header: 'Firmware', cell: d => d.current?.firmware ? escapeHtml(d.current.firmware) : null },
+        { header: 'Uptime', cell: d => fmtUptime(d.current?.uptimeSeconds) },
     ]);
+}
+
+// The modem's own DOCSIS event log, for modems that report one: the latest entries as the modem
+// holds them, newest first. Follows the device filter, like the charts.
+function renderEventLog(container) {
+    const el = container.querySelector('.cm-event-log');
+    if (!el) return;
+    const devices = (lastData?.devices || []).filter(d => d.log?.length && visibility[d.id] !== false);
+    if (!devices.length) { el.innerHTML = ''; return; }
+
+    const fmtTime = t => t ? noTime.string(t, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'Time not established';
+    el.innerHTML = devices.map(d => {
+        const rows = d.log.map(e => `<tr>
+            <td style="white-space: nowrap;">${escapeHtml(fmtTime(e.time))}</td>
+            <td>${escapeHtml(e.level || '-')}</td>
+            <td>${escapeHtml(e.text)}</td></tr>`).join('');
+        return `<div class="chart-card">
+            <div class="chart-header"><h3 class="chart-title">Event Log${devices.length > 1 || (lastData?.devices?.length ?? 0) > 1 ? ' - ' + escapeHtml(d.label) : ''}</h3></div>
+            <div class="table-responsive"><table class="data-table">
+                <thead><tr><th>Time</th><th>Level</th><th>Event</th></tr></thead>
+                <tbody>${rows}</tbody></table></div></div>`;
+    }).join('');
 }

@@ -44,7 +44,8 @@ public class IspHealthScorerTests
         HashSet<string>? notTracedTargetIds = null,
         double? expectedDownMbps = null,
         double? expectedUpMbps = null,
-        PhysicalLinkInput? physicalLink = null)
+        PhysicalLinkInput? physicalLink = null,
+        List<PathCongestionEpisode>? pathCongestion = null)
     {
         // lineIdle: a near-zero, flat WAN with no load bursts (~0% average load), for
         // exercising the load-calibrated packet-loss ceiling at the idle end.
@@ -88,8 +89,74 @@ public class IspHealthScorerTests
             SmartQueuesEnabled = smartQueuesEnabled,
             HopOrderKnown = hopOrderKnown,
             NotTracedTargetIds = notTracedTargetIds ?? new HashSet<string>(),
-            Outages = outages ?? new List<OutageEvent>()
+            Outages = outages ?? new List<OutageEvent>(),
+            PathCongestion = pathCongestion ?? new List<PathCongestionEpisode>()
         };
+    }
+
+    [Fact]
+    public void PathCongestion_ComesOffTransitHealth_ByImpact()
+    {
+        var transit = new List<AsnSeries> { TestSeries.Asn(64500, "TransitOne", TestSeries.Flat(TestSeries.Start, Day, 12.0, 0.3)) };
+        PathCongestionEpisode Episode(int id, double startHour, double hours, int degradedAsns = 2, double loss = 12) => new()
+        {
+            EpisodeId = id,
+            Start = TestSeries.Start.AddHours(startHour),
+            End = TestSeries.Start.AddHours(startHour + hours),
+            DegradedAsns = degradedAsns,
+            DestinationAsns = 4,
+            PeakLossPct = loss
+        };
+        IspHealthReport With(params PathCongestionEpisode[] episodes) => new IspHealthScorer(Options)
+            .Score(BuildInputs(transit: transit, pathCongestion: episodes.ToList()), Gpon);
+
+        var clean = With();
+        clean.PathCongestionTransitPoints.Should().Be(0);
+
+        // Two hours across half the destination networks at full depth: 60 effective minutes, 4.2% of
+        // the day, which the share curve reads as ~15. One episode carries no recurrence.
+        var one = With(Episode(1, 19, 2));
+        one.PathCongestionTransitPoints.Should().Be(15);
+        one.TransitDimension.Score.Should().Be(clean.TransitDimension.Score - 15);
+        one.OverallScore.Should().BeLessThan(clean.OverallScore);
+        one.PathCongestion[0].ScorePenaltyPoints.Should().Be(clean.OverallScore - one.OverallScore);
+
+        // Shallower (a +13 ms slowdown, no loss) and narrower episodes cost less.
+        var shallow = With(new PathCongestionEpisode
+        {
+            EpisodeId = 2, Start = TestSeries.Start.AddHours(19), End = TestSeries.Start.AddHours(21),
+            DegradedAsns = 2, DestinationAsns = 4, RttRiseMs = 13
+        });
+        shallow.PathCongestionTransitPoints.Should().BeInRange(1, 14);
+
+        // A second episode adds recurrence on top of its share.
+        var two = With(Episode(1, 7, 2), Episode(2, 19, 2));
+        two.PathCongestionTransitPoints.Should().BeGreaterThan(one.PathCongestionTransitPoints);
+    }
+
+    [Fact]
+    public void AccessFloor_is_reported_with_two_or_more_access_hops()
+    {
+        var hops = new List<List<LatencySample>>
+        {
+            TestSeries.Flat(TestSeries.Start, Day, 1.5, 0.3),
+            TestSeries.Flat(TestSeries.Start, Day, 1.7, 0.3)
+        };
+
+        var floor = new IspHealthScorer(Options).Score(BuildInputs(accessHops: hops), Gpon).AccessFloor;
+
+        floor.Should().NotBeNull();
+        floor!.HopCount.Should().Be(2);
+        floor.RttMs.Should().NotBeNull();
+        floor.JitterMs.Should().BeApproximately(0.3, 1e-9);
+    }
+
+    [Fact]
+    public void AccessFloor_is_absent_with_one_access_hop()
+    {
+        var hops = new List<List<LatencySample>> { TestSeries.Flat(TestSeries.Start, Day, 1.5, 0.3) };
+
+        new IspHealthScorer(Options).Score(BuildInputs(accessHops: hops), Gpon).AccessFloor.Should().BeNull();
     }
 
     [Fact]
@@ -714,6 +781,46 @@ public class IspHealthScorerTests
     public void A_clean_loaded_pool_still_reports_zero_rather_than_going_quiet()
     {
         LoadedLossValueText(WithLossyProbesUnderDownLoad()).Should().StartWith("0% down");
+    }
+
+    private static SpeedTestSample LossyTest(double downMbps, SpeedTestLoss? down = null, SpeedTestLoss? idle = null) =>
+        new(TestSeries.Start.AddHours(6), downMbps, 490, IdleLoss: idle, DownloadLoss: down);
+
+    [Fact]
+    public void Speed_test_loaded_loss_joins_a_clean_monitoring_pool()
+    {
+        var inputs = BuildInputs(speedTests: [LossyTest(980, down: new SpeedTestLoss(2.0, 400))]);
+
+        LoadedLossValueText(inputs).Should().NotStartWith("0% down").And.NotStartWith("n/a down");
+    }
+
+    [Fact]
+    public void Speed_test_that_did_not_fill_the_pipe_adds_no_loaded_loss()
+    {
+        var inputs = BuildInputs(speedTests: [LossyTest(500, down: new SpeedTestLoss(2.0, 400))]);
+
+        LoadedLossValueText(inputs).Should().StartWith("0% down");
+    }
+
+    [Fact]
+    public void Speed_tests_alone_grade_loaded_loss_on_a_line_never_loaded_otherwise()
+    {
+        var inputs = BuildInputs(lineIdle: true, speedTests: [LossyTest(980, down: new SpeedTestLoss(1.0, 400))]);
+
+        LoadedLossValueText(inputs).Should().NotStartWith("n/a down");
+    }
+
+    [Fact]
+    public void Speed_test_idle_loss_joins_packet_loss()
+    {
+        int? PacketLossScore(SpeedTestSample test) => new IspHealthScorer(Options)
+            .Score(BuildInputs(lineIdle: true, speedTests: [test]), Gpon)
+            .AccessDimension.Factors.Single(f => f.Name == "Packet Loss").Score;
+
+        var clean = PacketLossScore(LossyTest(980, idle: new SpeedTestLoss(0, 500)));
+        var lossy = PacketLossScore(LossyTest(980, idle: new SpeedTestLoss(2.0, 500)));
+
+        lossy.Should().BeLessThan(clean!.Value);
     }
 
     [Fact]
@@ -1547,6 +1654,109 @@ public class IspHealthScorerTests
             "a clean destination routing through the hop proves its jitter is an ICMP artifact");
     }
 
+    // The WAN's L2 neighbor, found in the gateway's ARP table: on no trace, so no witness lists it
+    // as an ancestor.
+    private static AsnSeries L2Neighbor(double jitterMs, bool flagged = true) => new()
+    {
+        AsnNumber = 64496,
+        AsnName = "ISP",
+        TargetIds = { "isp-l2" },
+        RoleTargetIds = { "isp-l2" },
+        Samples = TestSeries.Flat(TestSeries.Start, Day, 2.2, jitterMs),
+        HopIps = { "10.0.0.254" },
+        IsL2Neighbor = flagged
+    };
+
+    private static AsnSeries TracedIspHop(double jitterMs) => new()
+    {
+        AsnNumber = 64496,
+        AsnName = "ISP",
+        TargetIds = { "isp-traced" },
+        RoleTargetIds = { "isp-traced" },
+        Samples = TestSeries.Flat(TestSeries.Start, Day, 2.5, jitterMs),
+        HopIps = { "10.0.0.1" }
+    };
+
+    private static AsnSeries Destination(double jitterMs, params string[] ancestors) => new()
+    {
+        AsnNumber = 64512,
+        AsnName = "Destination",
+        TargetIds = { "dest" },
+        Samples = TestSeries.Flat(TestSeries.Start, Day, 6, jitterMs),
+        HopIps = { "30.0.0.1" },
+        AncestorIps = ancestors.ToList(),
+        IsDestination = true
+    };
+
+    [Fact]
+    public void A_destination_leaving_through_the_isp_absolves_the_l2_neighbor()
+    {
+        // The destination's trace crosses the traced ISP hop, never the L2 neighbor, yet it left
+        // through this WAN, so it crossed the L2 neighbor too.
+        var traced = TracedIspHop(jitterMs: 2.7);
+        var destination = Destination(jitterMs: 0.3, "10.0.0.1");
+
+        IspTargetHealth Grade(AsnSeries l2)
+        {
+            var hops = new List<AsnSeries> { l2, traced };
+            return new IspHealthScorer(Options).Score(
+                    BuildInputs(ispAsn: hops, ispTargets: hops, firstHopTargetId: "isp-l2",
+                        destinations: new List<AsnSeries> { destination }, hopOrderKnown: true), Gpon)
+                .IspTargets.Single(t => t.TargetId == "isp-l2");
+        }
+
+        var absolved = Grade(L2Neighbor(jitterMs: 2.64));
+        var unflagged = Grade(L2Neighbor(jitterMs: 2.64, flagged: false));
+
+        absolved.ScoredJitterMs.Should().BeApproximately(0.3, 0.05, "the destination's jitter bounds the L2 neighbor's");
+        absolved.JitterAssimilated.Should().BeTrue();
+        absolved.OverallScore.Should().BeGreaterThan(unflagged.OverallScore!.Value,
+            "without the flag nothing proves the destination crossed the hop");
+    }
+
+    [Fact]
+    public void A_destination_that_crossed_none_of_this_wans_isp_hops_does_not_absolve_the_l2_neighbor()
+    {
+        // On a load-balanced multi-WAN site an unpinned destination may leave by the other WAN;
+        // only a trace through this WAN's ISP proves it crossed this L2 neighbor.
+        var l2 = L2Neighbor(jitterMs: 2.64);
+        var hops = new List<AsnSeries> { l2 };
+
+        var graded = new IspHealthScorer(Options).Score(
+                BuildInputs(ispAsn: hops, ispTargets: hops, firstHopTargetId: "isp-l2",
+                    destinations: new List<AsnSeries> { Destination(jitterMs: 0.3, "10.9.9.9") }, hopOrderKnown: true), Gpon)
+            .IspTargets.Single(t => t.TargetId == "isp-l2");
+
+        graded.JitterAssimilated.Should().BeFalse();
+        graded.ScoredJitterMs.Should().BeApproximately(2.64, 0.05);
+    }
+
+    [Fact]
+    public void Another_isp_hop_absolves_the_l2_neighbor_but_not_the_reverse()
+    {
+        // Every other ISP hop on this WAN is reached through the L2 neighbor, with or without
+        // trace ancestry. The L2 neighbor is reached through none of them, so it absolves nothing.
+        var l2 = L2Neighbor(jitterMs: 0.4);
+        var traced = TracedIspHop(jitterMs: 2.7);
+        var hops = new List<AsnSeries> { l2, traced };
+
+        var report = new IspHealthScorer(Options).Score(
+            BuildInputs(ispAsn: hops, ispTargets: hops, firstHopTargetId: "isp-l2"), Gpon);
+
+        var tracedGrade = report.IspTargets.Single(t => t.TargetId == "isp-traced");
+        tracedGrade.JitterAssimilated.Should().BeFalse("the L2 neighbor sits upstream of the traced hop");
+        tracedGrade.ScoredJitterMs.Should().BeApproximately(2.7, 0.05);
+
+        var cleanTraced = TracedIspHop(jitterMs: 0.4);
+        var l2Jittery = L2Neighbor(jitterMs: 2.64);
+        var reversed = new List<AsnSeries> { l2Jittery, cleanTraced };
+        var l2Grade = new IspHealthScorer(Options).Score(
+                BuildInputs(ispAsn: reversed, ispTargets: reversed, firstHopTargetId: "isp-l2"), Gpon)
+            .IspTargets.Single(t => t.TargetId == "isp-l2");
+        l2Grade.ScoredJitterMs.Should().BeApproximately(0.4, 0.05, "the traced hop is reached through the L2 neighbor");
+        l2Grade.JitterAssimilated.Should().BeTrue();
+    }
+
     [Fact]
     public void Isp_target_health_carries_per_target_grade()
     {
@@ -2168,6 +2378,51 @@ public class IspHealthScorerTests
             "the internet-relative blend lifts a hop that's modest relative to internet distance");
         // Lift only - the near (zero-distance) hop is untouched at the top.
         withContext.IspTargets.Single(t => t.TargetId == "isp-near").OverallScore.Should().Be(100);
+    }
+
+    // ── ISP hop reach beyond the transit egress ───────────────────────────────────
+
+    private static AsnSeries TransitCluster(double rttMs) => new()
+    {
+        AsnNumber = 64500,
+        AsnName = "Transit",
+        TargetIds = { "transit-a" },
+        Samples = TestSeries.Flat(TestSeries.Start, Day, rttMs, 0.3, 0),
+        RoleTargetIds = { "transit-a" }
+    };
+
+    private static int? FarHopScore(double farRtt, AsnSeries? transit)
+    {
+        var hops = new List<AsnSeries>
+        {
+            IspHop("isp-near", "Near", 2.0, 0.3),
+            IspHop("isp-far", "Far", farRtt, 0.3)
+        };
+        var report = new IspHealthScorer(Options).Score(
+            BuildInputs(idleRtt: 2.0, ispAsn: hops, ispTargets: hops, firstHopTargetId: "isp-near",
+                internetDeltaMs: 11.0, transit: transit is null ? null : new List<AsnSeries> { transit }), Gpon);
+        return report.IspTargets.Single(t => t.TargetId == "isp-far").OverallScore;
+    }
+
+    [Fact]
+    public void Isp_hop_past_a_nearer_transit_egress_is_eased_but_not_absolved()
+    {
+        // The ISP hands off to transit at +2 ms, so a hop at +12 ms is a second route, not the haul.
+        var without = FarHopScore(14.0, null);
+        var withEgress = FarHopScore(14.0, TransitCluster(4.0));
+        var atEgress = FarHopScore(4.0, null);
+
+        withEgress.Should().BeGreaterThan(without!.Value + 10);
+        withEgress.Should().BeLessThan(atEgress!.Value, "distance past the egress still leaves a mark");
+    }
+
+    [Fact]
+    public void Isp_hop_that_is_the_way_out_keeps_its_reach_ceiling()
+    {
+        // Transit sits beyond the far hop (the Comcast Stockton -> LAX shape): nothing changes.
+        FarHopScore(14.0, TransitCluster(16.0)).Should().Be(FarHopScore(14.0, null));
+        // A hop nearer than the egress is untouched as well.
+        FarHopScore(3.5, TransitCluster(5.0)).Should().Be(FarHopScore(3.5, null));
     }
 }
 

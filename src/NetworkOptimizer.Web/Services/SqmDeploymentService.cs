@@ -25,9 +25,8 @@ public class SqmDeploymentService : ISqmDeploymentService
     private const string OnBootDir = "/data/on_boot.d";
     private const string SqmDir = "/data/sqm";
 
-    // The boot script installs its dependencies inline on a first deploy: it adds the
-    // Ookla packagecloud repo (which runs its own apt-get update and fetches a GPG key),
-    // then apt-get installs speedtest, bc and jq. On a cold apt cache or a slow WAN that
+    // The boot script installs its dependencies inline on a first deploy: it downloads
+    // the verified Ookla binary, then apt-get installs jq. On a cold apt cache or a slow WAN that
     // runs well past the 30 second default, so give it room rather than tearing down a
     // deployment that is still working. Re-deploys skip the whole block and finish fast.
     // Five minutes is comfortably clear of a slow first install without leaving the page
@@ -123,6 +122,27 @@ public class SqmDeploymentService : ISqmDeploymentService
     private static string GetSection(Dictionary<string, string> sections, string key)
         => sections.TryGetValue(key, out var value) ? value : "";
 
+    internal static string BuildDeploymentStatusCommand()
+    {
+        return
+            "echo '---UDM_BOOT_CHECK---'; test -f /etc/systemd/system/udm-boot.service && echo 'installed' || echo 'missing'; " +
+            "echo '---UDM_BOOT_ENABLED---'; systemctl is-enabled udm-boot 2>/dev/null || echo 'disabled'; " +
+            $"echo '---SQM_BOOT_SCRIPTS---'; ls {OnBootDir}/20-sqm-*.sh 2>/dev/null | grep -v 'sqm-monitor' | wc -l; " +
+            $"echo '---SQM_SPEEDTEST_SCRIPTS---'; ls {SqmDir}/*-speedtest.sh 2>/dev/null | wc -l; " +
+            $"echo '---SQM_MONITOR_CHECK---'; test -f {OnBootDir}/20-sqm-monitor.sh && echo 'exists' || echo 'missing'; " +
+            "echo '---WATCHDOG_RUNNING---'; crontab -l 2>/dev/null | grep -q sqm-watchdog && echo 'active' || echo 'inactive'; " +
+            "echo '---CRON_CHECK---'; crontab -l 2>/dev/null | grep -c sqm || echo '0'; " +
+            $"echo '---SPEEDTEST_CLI---'; SPEEDTEST_SHA256=$(case \"$(uname -m)\" in aarch64|arm64) echo '{ScriptGenerator.ManagedSpeedtestAarch64BinarySha256}' ;; armv7l|armv7) echo '{ScriptGenerator.ManagedSpeedtestArmhfBinarySha256}' ;; x86_64|amd64) echo '{ScriptGenerator.ManagedSpeedtestX86_64BinarySha256}' ;; *) echo 'unsupported' ;; esac); test \"$SPEEDTEST_SHA256\" != 'unsupported' && command -v sha256sum >/dev/null 2>&1 && test -f '{ScriptGenerator.ManagedSpeedtestPath}' && test ! -L '{ScriptGenerator.ManagedSpeedtestPath}' && test -x '{ScriptGenerator.ManagedSpeedtestPath}' && printf '%s  %s\\n' \"$SPEEDTEST_SHA256\" '{ScriptGenerator.ManagedSpeedtestPath}' | sha256sum -c - >/dev/null 2>&1 && '{ScriptGenerator.ManagedSpeedtestPath}' --version 2>/dev/null | head -n 1 | grep -Fq 'Speedtest by Ookla {ScriptGenerator.ManagedSpeedtestCliVersion} ({ScriptGenerator.ManagedSpeedtestBuildId})' && echo 'installed' || echo 'missing'; " +
+            "echo '---BC_CHECK---'; command -v bc >/dev/null 2>&1 && echo 'installed' || echo 'missing'; " +
+            "echo '---JQ_CHECK---'; command -v jq >/dev/null 2>&1 && echo 'installed' || echo 'missing'; " +
+            // Scripts from before the awk change compute rates with bc, which every upgrade
+            // removes. A redeploy replaces them.
+            $"echo '---SCRIPTS_ON_BC---'; grep -l '| bc' {SqmDir}/*.sh 2>/dev/null | wc -l; " +
+            // Ping scripts from before the probe lock existed keep adjusting during a congestion
+            // learning sample; a redeploy installs the guard.
+            $"echo '---PING_GUARD_MISSING---'; for f in {SqmDir}/*-ping.sh; do [ -f \"$f\" ] && ! grep -q PROBE_LOCK \"$f\" && echo \"$f\"; done | wc -l";
+    }
+
     /// <summary>
     /// Check if SQM scripts are already deployed
     /// </summary>
@@ -136,19 +156,7 @@ public class SqmDeploymentService : ISqmDeploymentService
             // TODO: use IUdmBootService.IsInstalledAsync() for the udm-boot check instead of
             // this inline test (shared gateway boot infrastructure -
             // NetworkOptimizer.Web.Services.Ssh.UdmBootService).
-            var combinedCommand =
-                "echo '---UDM_BOOT_CHECK---'; test -f /etc/systemd/system/udm-boot.service && echo 'installed' || echo 'missing'; " +
-                "echo '---UDM_BOOT_ENABLED---'; systemctl is-enabled udm-boot 2>/dev/null || echo 'disabled'; " +
-                $"echo '---SQM_BOOT_SCRIPTS---'; ls {OnBootDir}/20-sqm-*.sh 2>/dev/null | grep -v 'sqm-monitor' | wc -l; " +
-                $"echo '---SQM_SPEEDTEST_SCRIPTS---'; ls {SqmDir}/*-speedtest.sh 2>/dev/null | wc -l; " +
-                $"echo '---SQM_MONITOR_CHECK---'; test -f {OnBootDir}/20-sqm-monitor.sh && echo 'exists' || echo 'missing'; " +
-                "echo '---WATCHDOG_RUNNING---'; crontab -l 2>/dev/null | grep -q sqm-watchdog && echo 'active' || echo 'inactive'; " +
-                "echo '---CRON_CHECK---'; crontab -l 2>/dev/null | grep -c sqm || echo '0'; " +
-                "echo '---SPEEDTEST_CLI---'; which speedtest >/dev/null 2>&1 && echo 'installed' || echo 'missing'; " +
-                "echo '---BC_CHECK---'; which bc >/dev/null 2>&1 && echo 'installed' || echo 'missing'; " +
-                // Ping scripts from before the probe lock existed keep adjusting during a congestion
-                // learning sample; a redeploy installs the guard.
-                $"echo '---PING_GUARD_MISSING---'; for f in {SqmDir}/*-ping.sh; do [ -f \"$f\" ] && ! grep -q PROBE_LOCK \"$f\" && echo \"$f\"; done | wc -l";
+            var combinedCommand = BuildDeploymentStatusCommand();
 
             var result = await RunCommandAsync(combinedCommand);
             var sections = ParseDelimitedOutput(result.output);
@@ -183,10 +191,16 @@ public class SqmDeploymentService : ISqmDeploymentService
             status.SpeedtestCliInstalled = result.success && GetSection(sections, "SPEEDTEST_CLI").Contains("installed");
 
             status.BcInstalled = result.success && GetSection(sections, "BC_CHECK").Contains("installed");
+            status.JqInstalled = result.success && GetSection(sections, "JQ_CHECK").Contains("installed");
 
             if (int.TryParse(GetSection(sections, "PING_GUARD_MISSING").Trim(), out int unguarded))
             {
                 status.PingScriptsWithoutProbeGuard = unguarded;
+            }
+
+            if (int.TryParse(GetSection(sections, "SCRIPTS_ON_BC").Trim(), out int onBc))
+            {
+                status.ScriptsUsingBc = onBc;
             }
 
             status.IsDeployed = status.SpeedtestScriptDeployed && status.PingScriptDeployed;
@@ -204,11 +218,21 @@ public class SqmDeploymentService : ISqmDeploymentService
     /// Clean ALL SQM scripts and cron entries from the gateway.
     /// Call this ONCE before deploying any WANs to handle renamed connections.
     /// </summary>
-    public async Task<(bool success, string message)> CleanAllSqmScriptsAsync()
+    public async Task<(bool success, string message, List<string> warnings)> CleanAllSqmScriptsAsync(
+        IReadOnlyCollection<string>? deployInterfaces = null, IReadOnlyCollection<string>? cakeInterfaces = null)
     {
+        var warnings = new List<string>();
         try
         {
             _logger.LogInformation("Cleaning all SQM scripts and cron entries");
+
+            // Cron first so no new run starts, then let a running one (and a learning probe, whose
+            // lock lives in the directory about to go) finish before anything is read or deleted.
+            await RunCommandAsync(
+                "crontab -l 2>/dev/null | grep -v -E 'sqm|SQM' | crontab -");
+            if (!await WaitForSqmRunsAsync())
+                warnings.Add(SqmRunsStillGoingWarning);
+            var existing = ParseExistingSqm((await RunCommandAsync(BuildReadExistingSqmCommand())).output);
 
             // Remove all SQM boot scripts
             await RunCommandAsync(
@@ -218,19 +242,285 @@ public class SqmDeploymentService : ISqmDeploymentService
             await RunCommandAsync(
                 $"rm -rf {SqmDir}/*");
 
-            // Remove ALL SQM-related cron entries (catches renamed connections)
-            await RunCommandAsync(
-                "crontab -l 2>/dev/null | grep -v -E 'sqm|SQM' | crontab -");
+            var removed = await RemoveCakeRootsAsync(cakeInterfaces ?? Array.Empty<string>());
+            var reason = RestoreReason(existing, deployInterfaces, cakeInterfaces ?? Array.Empty<string>(), removed);
+            if (reason != null)
+            {
+                _logger.LogInformation("Restoring UniFi's QoS trees before deploy: {Reason}", reason);
+                var restoreError = await RestoreUniFiQueuesAsync(removed);
+                if (restoreError != null)
+                    warnings.Add(RestoreWarning(restoreError, removed));
+            }
 
             _logger.LogInformation("Successfully cleaned all SQM scripts and cron entries");
-            return (true, "Cleaned all SQM scripts and cron entries");
+            return (true, "Cleaned all SQM scripts and cron entries", warnings);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error cleaning SQM scripts");
-            return (false, ex.Message);
+            return (false, ex.Message, warnings);
         }
     }
+
+    /// <summary>
+    /// Deletes Adaptive SQM's own CAKE download root from every IFB except the ones a CAKE WAN is
+    /// about to use. <see cref="RestoreUniFiQueuesAsync"/> then gives each one UniFi's tree back.
+    /// </summary>
+    /// <returns>The IFBs it cleared.</returns>
+    private async Task<List<string>> RemoveCakeRootsAsync(IReadOnlyCollection<string> cakeInterfaces)
+    {
+        var result = await RunCommandAsync(BuildRemoveCakeRootsCommand(cakeInterfaces));
+        return ParseRemovedCakeRoots(result.output);
+    }
+
+    /// <summary>
+    /// Has UniFi rebuild every WAN's QoS trees from its own config, undoing everything the scripts
+    /// changed (rates, bursts, fq_codel sizing, a CAKE root). See <see cref="BuildRestoreUniFiQueuesCommand"/>.
+    /// </summary>
+    /// <param name="cakeRemovedFrom">IFBs Adaptive SQM's CAKE root was just deleted from. They no longer
+    /// show a tree, so the check is told to expect UniFi's back on them.</param>
+    /// <returns>Null when the trees are back or QoS is off; otherwise what went wrong, as a sentence fragment.</returns>
+    private async Task<string?> RestoreUniFiQueuesAsync(IReadOnlyCollection<string> cakeRemovedFrom)
+    {
+        try
+        {
+            var result = await RunCommandAsync(BuildRestoreUniFiQueuesCommand(cakeRemovedFrom), TimeSpan.FromSeconds(120));
+            var error = ParseRestoreUniFiQueues(result.output);
+            if (error != null)
+                _logger.LogWarning("UniFi's QoS trees were not restored: {Error}. Output: {Output}", error, result.output);
+            return error;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not restore UniFi's QoS trees");
+            return "the gateway did not answer";
+        }
+    }
+
+    /// <summary>The warning for a restore that failed, naming any WAN left without a download shaper.</summary>
+    private static string RestoreWarning(string error, IReadOnlyCollection<string> cakeRemovedFrom) =>
+        $"UniFi's Smart Queues were not restored: {error}. " +
+        (cakeRemovedFrom.Count > 0
+            ? $"Download on {string.Join(", ", cakeRemovedFrom)} is unshaped until UniFi Network applies Smart Queues again: turn Smart Queues off and on for the WAN, or edit any QoS rule."
+            : "Adaptive SQM's last rates stay in place until UniFi Network applies Smart Queues again: turn Smart Queues off and on for the WAN, or edit any QoS rule.");
+
+    /// <summary>A WAN's scripts as the gateway had them before a deploy replaced them.</summary>
+    /// <param name="Interface">INTERFACE from its ping script.</param>
+    /// <param name="Qdisc">DOWNLOAD_QDISC (cake or htb; empty for scripts from before CAKE).</param>
+    /// <param name="TreeModel">TREE_MODEL, 0 when the script predates it.</param>
+    internal sealed record ExistingSqmScript(string Interface, string Qdisc, int TreeModel);
+
+    /// <summary>What a deploy found on the gateway before it deleted the old scripts.</summary>
+    /// <param name="Scripts">One entry per WAN ping script.</param>
+    /// <param name="TunedIfbs">IFBs carrying the scripts' 100Kbit best-effort leaf.</param>
+    internal sealed record ExistingSqm(IReadOnlyList<ExistingSqmScript> Scripts, IReadOnlyList<string> TunedIfbs);
+
+    /// <summary>
+    /// Waits up to 60 s while a ping or calibration run is going or a congestion learning probe holds
+    /// its lock. Each retunes the trees when it finishes, so a restore under one would be undone.
+    /// Cron must already be cleared. A lock older than the probe's stale limit is ignored.
+    /// Prints <see cref="SqmRunsDoneMarker"/> once nothing is running; without it the wait ran out.
+    /// </summary>
+    internal static string BuildWaitForSqmRunsCommand() => $$"""
+        for _ in $(seq 1 60); do busy=''
+          pgrep -f -- '[-](ping|speedtest)\.sh' >/dev/null 2>&1 && busy=1
+          for l in {{SqmDir}}/probe-*.lock; do [ -e "$l" ] || continue
+            [ $(( $(date +%s) - $(stat -c %Y "$l" 2>/dev/null || echo 0) )) -lt {{Sqm.ScriptGenerator.ProbeLockMaxAgeSeconds}} ] && busy=1; done
+          [ -z "$busy" ] && { echo '{{SqmRunsDoneMarker}}'; break; }; sleep 1; done; true
+        """.Replace("\r\n", "\n");
+
+    /// <summary>
+    /// Leads a deployment step that is a warning. The Deployment Progress list draws it as the
+    /// warning icon; anything else that prints a step shows it as plain words.
+    /// </summary>
+    public const string StepWarningMark = "Warning: ";
+
+    /// <summary>What <see cref="BuildWaitForSqmRunsCommand"/> prints when no run is left.</summary>
+    internal const string SqmRunsDoneMarker = "SQM_RUNS_DONE";
+
+    /// <summary>
+    /// The warning for a wait that ran out. A calibration can itself wait up to 90 s for a probe lock
+    /// before it starts, so this can happen, and the run that outlived the wait retunes the trees
+    /// (or installs CAKE again) after the deploy or Remove is done.
+    /// </summary>
+    internal const string SqmRunsStillGoingWarning =
+        "An Adaptive SQM run (ping, calibration or learning probe) was still going after 60 s. When it ends it can " +
+        "set its rates again or put the CAKE download shaper back. Run this again in a few minutes.";
+
+    /// <summary>Runs <see cref="BuildWaitForSqmRunsCommand"/>; false when a run outlived it or the gateway did not answer.</summary>
+    private async Task<bool> WaitForSqmRunsAsync()
+    {
+        try
+        {
+            var result = await RunCommandAsync(BuildWaitForSqmRunsCommand(), TimeSpan.FromSeconds(90));
+            if (result.output?.Contains(SqmRunsDoneMarker, StringComparison.Ordinal) == true)
+                return true;
+            _logger.LogWarning("An Adaptive SQM run was still going after the wait. Output: {Output}", result.output);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not wait for running Adaptive SQM scripts");
+        }
+        return false;
+    }
+
+    /// <summary>Lists the WAN ping scripts and the tuned IFBs, for <see cref="ParseExistingSqm"/>.</summary>
+    internal static string BuildReadExistingSqmCommand() => $$"""
+        for f in {{SqmDir}}/*-ping.sh; do [ -e "$f" ] || continue
+          i=$(sed -n 's/^INTERFACE="\(.*\)"$/\1/p' "$f" | head -1)
+          q=$(sed -n 's/^DOWNLOAD_QDISC="\(.*\)"$/\1/p' "$f" | head -1)
+          m=$(sed -n 's/^TREE_MODEL=\([0-9]*\)$/\1/p' "$f" | head -1)
+          echo "SQM_SCRIPT|$i|$q|$m"; done
+        for d in /sys/class/net/ifb*; do [ -e "$d" ] || continue; n=${d##*/}
+          tc class show dev "$n" 2>/dev/null | grep -q 'rate 100Kbit' && echo "SQM_TUNED|$n"; done; true
+        """.Replace("\r\n", "\n");
+
+    /// <summary>Reads <see cref="BuildReadExistingSqmCommand"/>'s output.</summary>
+    internal static ExistingSqm ParseExistingSqm(string? output)
+    {
+        var scripts = new List<ExistingSqmScript>();
+        var tuned = new List<string>();
+        foreach (var line in (output ?? string.Empty).Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var parts = line.Split('|');
+            if (parts[0] == "SQM_SCRIPT" && parts.Length == 4 && parts[1].Length > 0)
+                scripts.Add(new ExistingSqmScript(parts[1], parts[2], int.TryParse(parts[3], out var model) ? model : 0));
+            else if (parts[0] == "SQM_TUNED" && parts.Length == 2 && parts[1].Length > 0)
+                tuned.Add(parts[1]);
+        }
+        return new ExistingSqm(scripts, tuned);
+    }
+
+    /// <summary>
+    /// Why a deploy must restore UniFi's trees, or null when the new scripts can take over the trees as
+    /// they are. A restore drops packets on every WAN for about a second, so a routine deploy skips it.
+    /// </summary>
+    /// <param name="existing">What the gateway had before the deploy.</param>
+    /// <param name="deployInterfaces">WANs about to be deployed; null restores, since nothing says which.</param>
+    /// <param name="cakeInterfaces">WANs about to be deployed with CAKE.</param>
+    /// <param name="cakeRemovedFrom">IFBs the deploy just took Adaptive SQM's CAKE root off.</param>
+    internal static string? RestoreReason(ExistingSqm existing, IReadOnlyCollection<string>? deployInterfaces,
+        IReadOnlyCollection<string> cakeInterfaces, IReadOnlyCollection<string> cakeRemovedFrom)
+    {
+        if (deployInterfaces == null) return "no deploy list";
+        if (cakeRemovedFrom.Count > 0) return $"CAKE turned off on {string.Join(", ", cakeRemovedFrom)}";
+        var cakeOff = existing.Scripts.Where(s => s.Qdisc == "cake" && !cakeInterfaces.Contains(s.Interface)).Select(s => s.Interface).ToList();
+        if (cakeOff.Count > 0) return $"CAKE turned off on {string.Join(", ", cakeOff)}";
+        var dropped = existing.Scripts.Select(s => s.Interface).Where(i => !deployInterfaces.Contains(i)).Distinct().ToList();
+        if (dropped.Count > 0) return $"Adaptive SQM no longer deployed on {string.Join(", ", dropped)}";
+        if (existing.Scripts.Any(s => s.TreeModel < Sqm.ScriptGenerator.TreeModel)) return "scripts from an earlier version";
+        if (existing.Scripts.Count == 0 && existing.TunedIfbs.Count > 0) return "trees left tuned by an earlier version";
+        return null;
+    }
+
+    /// <summary>Name of the temporary queue the restore adds and deletes.</summary>
+    internal const string RestoreQueueName = "netopt_rebuild";
+
+    /// <summary>
+    /// The command behind <see cref="RestoreUniFiQueuesAsync"/>. ubios-udapi-server rebuilds every WAN's
+    /// HTB tree, both directions, whenever its QoS queue list changes, so adding a temporary queue
+    /// and deleting it leaves UniFi's own trees and the console's exact config, with no console
+    /// write and no service restarts. An unchanged PUT is a no-op, and a force-provision only
+    /// fast-applies what changed, so neither works. The caller has already waited for running scripts.
+    /// A temporary queue left by an interrupted run is deleted first. Afterwards every IFB that carried
+    /// a tree must have its HTB root back, and every WAN that redirected to an IFB its redirect: the
+    /// rebuild recreates the WAN ingress qdiscs too, and WAN Flood Protection re-adding its own ingress
+    /// qdisc inside that window could leave the redirect out, so a miss gets one more rebuild.
+    /// QoS counts as off only when /qos/global says so; a read that fails is a failed restore.
+    /// </summary>
+    /// <param name="cakeRemovedFrom">IFBs whose CAKE root was just deleted. They carry only the kernel's
+    /// default qdisc now, which the scan below does not count as a tree, so they are expected by name.</param>
+    [NetworkOptimizer.Core.VendorSpecific("UniFi", "ubios-udapi-client /qos/fw/queues")]
+    internal static string BuildRestoreUniFiQueuesCommand(IEnumerable<string>? cakeRemovedFrom = null) => """
+        command -v ubios-udapi-client >/dev/null 2>&1 || { echo 'RESTORE_FAILED no-udapi'; exit 0; }
+        qos=$(ubios-udapi-client -r GET /qos/global 2>/dev/null)
+        if ! echo "$qos" | grep -qE '"enabled": *true'; then
+          if echo "$qos" | grep -qE '"enabled": *false'; then echo 'RESTORE_SKIPPED qos-off'; else echo 'RESTORE_FAILED qos-read'; fi
+          exit 0
+        fi
+        shaped='CLEARED_IFBS'
+        for d in /sys/class/net/ifb*; do [ -e "$d" ] || continue; n=${d##*/}
+          tc qdisc show dev "$n" 2>/dev/null | grep -qE '^qdisc (htb|cake) [0-9a-f]+: root' && shaped="$shaped $n"; done
+        redirected=''
+        for n in $(tc qdisc show 2>/dev/null | awk '$1=="qdisc" && $2=="ingress" {print $5}'); do
+          tc filter show dev "$n" parent ffff: 2>/dev/null | grep -q 'Redirect to device ifb' && redirected="$redirected $n"; done
+        rebuild() {
+          ubios-udapi-client -r DELETE /qos/fw/queues/QUEUE >/dev/null 2>&1
+          echo '[{"name":"QUEUE","priority":0,"downloadSpeed":null,"uploadSpeed":null}]' > /tmp/netopt-restore.json
+          if ! ubios-udapi-client -r POST /qos/fw/queues @/tmp/netopt-restore.json 2>&1 | grep -qE '"name": *"QUEUE"'; then
+            rm -f /tmp/netopt-restore.json; echo 'RESTORE_FAILED post'; return 1; fi
+          rm -f /tmp/netopt-restore.json
+          sleep 3
+          ubios-udapi-client -r DELETE /qos/fw/queues/QUEUE 2>&1 | grep -qE '"statusCode": *200' || { echo 'RESTORE_FAILED delete'; return 1; }
+        }
+        check() {
+          for _ in $(seq 1 15); do missing=''
+            for n in $shaped; do tc class show dev "$n" 2>/dev/null | grep -q 'class htb 1:1 root' || missing="$missing $n"; done
+            for n in $redirected; do tc filter show dev "$n" parent ffff: 2>/dev/null | grep -q 'Redirect to device ifb' || missing="$missing $n(redirect)"; done
+            [ -z "$missing" ] && return 0; sleep 1; done
+          return 1
+        }
+        rebuild || exit 0
+        if ! check; then rebuild || exit 0; check; fi
+        if [ -n "$missing" ]; then echo "RESTORE_MISSING$missing"; else echo 'RESTORE_OK'; fi
+        """.Replace("QUEUE", RestoreQueueName)
+        .Replace("CLEARED_IFBS", string.Concat((cakeRemovedFrom ?? Array.Empty<string>())
+            .Where(name => Sqm.InputSanitizer.ValidateInterface(name).isValid)
+            .Distinct(StringComparer.Ordinal)
+            .Select(name => $" {name}")))
+        .Replace("\r\n", "\n");
+
+    /// <summary>What the restore command reported: null when the trees are back or QoS is off.</summary>
+    internal static string? ParseRestoreUniFiQueues(string? output)
+    {
+        var line = (output ?? string.Empty)
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .LastOrDefault(l => l.StartsWith("RESTORE_", StringComparison.Ordinal));
+        if (line == null) return "the gateway gave no result";
+        if (line == "RESTORE_OK" || line.StartsWith("RESTORE_SKIPPED", StringComparison.Ordinal)) return null;
+        if (line.StartsWith("RESTORE_MISSING", StringComparison.Ordinal))
+            return $"UniFi had not rebuilt the queue on {line["RESTORE_MISSING".Length..].Trim().Replace(" ", ", ")}";
+        return line switch
+        {
+            "RESTORE_FAILED no-udapi" => "this gateway has no UniFi QoS service to ask",
+            "RESTORE_FAILED qos-read" => "the gateway's QoS settings could not be read",
+            "RESTORE_FAILED post" => "the gateway refused the temporary QoS queue",
+            "RESTORE_FAILED delete" => $"the temporary QoS queue {RestoreQueueName} could not be deleted",
+            _ => "the gateway gave an unexpected result",
+        };
+    }
+
+    /// <summary>Prefix of the line the CAKE removal prints for each IFB it cleared.</summary>
+    internal const string CakeRemovedMarker = "CAKE_REMOVED ";
+
+    /// <summary>
+    /// The command behind <see cref="RemoveCakeRootsAsync"/>. Only a cake root carrying Adaptive
+    /// SQM's handle is deleted; one that UniFi or an admin installed is never touched. The delete
+    /// names handle and kind, so the kernel refuses it if UniFi rebuilt its HTB tree in between.
+    /// The caller has already waited for running scripts (<see cref="BuildWaitForSqmRunsCommand"/>),
+    /// which would otherwise install CAKE again right after the delete.
+    /// </summary>
+    internal static string BuildRemoveCakeRootsCommand(IEnumerable<string> cakeInterfaces)
+    {
+        var keep = cakeInterfaces
+            .Where(name => Sqm.InputSanitizer.ValidateInterface(name).isValid)
+            .Select(name => $"ifb{name}")
+            .Distinct(StringComparer.Ordinal);
+        return $"KEEP=\" {string.Join(" ", keep)} \"; " +
+            "for d in /sys/class/net/ifb*; do [ -e \"$d\" ] || continue; n=${d##*/}; " +
+            "case \"$KEEP\" in *\" $n \"*) continue ;; esac; " +
+            $"tc qdisc show dev \"$n\" 2>/dev/null | grep -q '^qdisc cake {Sqm.ScriptGenerator.CakeHandle} root' || continue; " +
+            $"tc qdisc del dev \"$n\" root handle {Sqm.ScriptGenerator.CakeHandle} cake && echo \"{CakeRemovedMarker}$n\"; " +
+            "done; true";
+    }
+
+    /// <summary>The IFBs the removal command reports as cleared.</summary>
+    internal static List<string> ParseRemovedCakeRoots(string? output) =>
+        (output ?? string.Empty)
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(line => line.StartsWith(CakeRemovedMarker, StringComparison.Ordinal))
+            .Select(line => line[CakeRemovedMarker.Length..].Trim())
+            .ToList();
 
     /// <summary>
     /// Lightweight cleanup after a failed deployment.
@@ -400,6 +690,28 @@ public class SqmDeploymentService : ISqmDeploymentService
             }
             steps.Add($"IFB device {ifbDevice} is present");
 
+            // CAKE ships as a module (sch_cake) in the UniFi OS firmware tested so far; a build
+            // without it must not end with download unshaped after UniFi's tree is replaced.
+            if (config.CakeDownload)
+            {
+                steps.Add("Checking for CAKE support...");
+                var cakeCheckResult = await RunCommandAsync("modprobe sch_cake");
+                if (!cakeCheckResult.success)
+                {
+                    steps.Add("CAKE is not available, cleaning up...");
+                    await CleanupFailedDeploymentAsync(config.ConnectionName, config.Interface);
+                    steps.Add("Cleanup complete");
+
+                    result.Success = false;
+                    result.Error = "The CAKE download shaper is not available in this gateway's firmware (sch_cake did not load). " +
+                        "Turn the CAKE option off for this WAN to keep UniFi's HTB shaper.";
+                    result.Steps = steps;
+                    _logger.LogWarning("SQM deployment blocked: sch_cake not available on gateway");
+                    return result;
+                }
+                steps.Add("CAKE is available");
+            }
+
             // Step 1: Create directories
             steps.Add("Creating directories...");
             var mkdirResult = await RunCommandAsync(
@@ -420,10 +732,10 @@ public class SqmDeploymentService : ISqmDeploymentService
             foreach (var (filename, content) in scripts)
             {
                 steps.Add($"Deploying {filename}...");
-                var success = await DeployScriptAsync(filename, content);
-                if (!success)
+                var (deployed, deployError) = await DeployScriptAsync(filename, content);
+                if (!deployed)
                 {
-                    throw new Exception($"Failed to deploy {filename}");
+                    throw new Exception($"Failed to deploy {filename}: {deployError}");
                 }
             }
 
@@ -495,20 +807,18 @@ public class SqmDeploymentService : ISqmDeploymentService
     /// <summary>
     /// Deploy a single script to the gateway
     /// </summary>
-    private async Task<bool> DeployScriptAsync(string filename, string content)
+    private async Task<(bool success, string? error)> DeployScriptAsync(string filename, string content)
     {
         // All SQM scripts now go to on_boot.d (self-contained boot scripts)
         var targetPath = $"{OnBootDir}/{filename}";
 
-        // Base64 to avoid shell quoting issues; GatewayFile normalizes to LF on the way.
-        var base64Content = GatewayFile.ToBase64(content);
-        var writeCmd = $"echo '{base64Content}' | base64 -d > '{targetPath}'";
-        var writeResult = await RunCommandAsync(writeCmd);
+        // SFTP, not an echo | base64 -d exec: a boot script with dynamic upload outgrows the SSH exec packet.
+        var (written, error) = await _gatewaySsh.UploadTextFileAsync(content, targetPath);
 
-        if (!writeResult.success)
+        if (!written)
         {
-            _logger.LogError("Failed to write {File}: {Error}", filename, writeResult.output);
-            return false;
+            _logger.LogError("Failed to write {File}: {Error}", filename, error);
+            return (false, error);
         }
 
         // Make executable
@@ -519,7 +829,7 @@ public class SqmDeploymentService : ISqmDeploymentService
         }
 
         _logger.LogDebug("Deployed {File} to {Path}", filename, targetPath);
-        return true;
+        return (true, null);
     }
 
     /// <summary>
@@ -555,10 +865,10 @@ public class SqmDeploymentService : ISqmDeploymentService
             var sqmMonitorScript = GenerateSqmMonitorScript(wan1Interface, wan1Name, wan2Interface, wan2Name, settings.TcMonitorPort);
 
             // Deploy to on_boot.d
-            var success = await DeployScriptAsync("20-sqm-monitor.sh", sqmMonitorScript);
-            if (!success)
+            var (deployed, deployError) = await DeployScriptAsync("20-sqm-monitor.sh", sqmMonitorScript);
+            if (!deployed)
             {
-                return (false, null);
+                return (false, $"Failed to deploy 20-sqm-monitor.sh: {deployError}");
             }
 
             // Run the script to set up SQM monitor
@@ -625,6 +935,11 @@ public class SqmDeploymentService : ISqmDeploymentService
             await RunCommandAsync(
                 "crontab -l 2>/dev/null | grep -v -E 'sqm|SQM' | crontab -");
 
+            // A running ping, calibration or learning probe retunes the trees when it ends, and the
+            // probe's lock is in the directory deleted below: let them finish first.
+            if (!await WaitForSqmRunsAsync())
+                steps.Add($"{StepWarningMark}{SqmRunsStillGoingWarning}");
+
             // Remove boot scripts (new format: 20-sqm-{name}.sh)
             steps.Add("Removing SQM boot scripts...");
             await RunCommandAsync(
@@ -642,6 +957,12 @@ public class SqmDeploymentService : ISqmDeploymentService
             // Remove legacy data files
             await RunCommandAsync(
                 "rm -f /data/sqm-*.sh /data/sqm-*.txt /data/sqm-scripts");
+
+            // UniFi's own trees come back on every WAN, CAKE or HTB, so nothing the scripts set stays
+            steps.Add("Restoring UniFi's Smart Queues...");
+            var removed = await RemoveCakeRootsAsync(Array.Empty<string>());
+            var restoreError = await RestoreUniFiQueuesAsync(removed);
+            steps.Add(restoreError == null ? "UniFi's Smart Queues restored" : $"{StepWarningMark}{RestoreWarning(restoreError, removed)}");
 
             // Remove SQM Monitor if requested
             if (includeTcMonitor)
@@ -947,7 +1268,7 @@ public class SqmDeploymentService : ISqmDeploymentService
                     // Format: "Measured download speed: 206 Mbps"
                     var match = System.Text.RegularExpressions.Regex.Match(
                         resultFileResult.output, @"(\d+)\s*Mbps");
-                    if (match.Success && double.TryParse(match.Groups[1].Value, out var rate))
+                    if (match.Success && double.TryParse(match.Groups[1].Value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var rate))
                     {
                         status.CurrentRateMbps = rate;
                     }
@@ -993,7 +1314,7 @@ public class SqmDeploymentService : ISqmDeploymentService
             {
                 var measuredMatch = System.Text.RegularExpressions.Regex.Match(
                     line, @"Measured:\s*(\d+(?:\.\d+)?)\s*Mbps");
-                if (measuredMatch.Success && double.TryParse(measuredMatch.Groups[1].Value, out var measured))
+                if (measuredMatch.Success && double.TryParse(measuredMatch.Groups[1].Value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var measured))
                 {
                     status.LastSpeedtestMeasured = measured;
                     status.LastSpeedtest = timestamp;
@@ -1005,7 +1326,8 @@ public class SqmDeploymentService : ISqmDeploymentService
             {
                 var adjustedMatch = System.Text.RegularExpressions.Regex.Match(
                     line, @"Adjusted to\s*(\d+(?:\.\d+)?)\s*Mbps");
-                if (adjustedMatch.Success && double.TryParse(adjustedMatch.Groups[1].Value, out var adjusted))
+                if (adjustedMatch.Success && double.TryParse(adjustedMatch.Groups[1].Value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var adjusted)
+                    && adjusted > 0)
                 {
                     status.LastSpeedtestAdjusted = adjusted;
                     if (status.LastSpeedtest == null)
@@ -1020,9 +1342,9 @@ public class SqmDeploymentService : ISqmDeploymentService
                     line, @"Ping adjusted to\s*(\d+(?:\.\d+)?)\s*Mbps\s*\(latency:\s*(\d+(?:\.\d+)?)ms\)");
                 if (pingMatch.Success)
                 {
-                    if (double.TryParse(pingMatch.Groups[1].Value, out var pingRate))
+                    if (double.TryParse(pingMatch.Groups[1].Value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var pingRate))
                         status.LastPingRate = pingRate;
-                    if (double.TryParse(pingMatch.Groups[2].Value, out var latency))
+                    if (double.TryParse(pingMatch.Groups[2].Value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var latency))
                         status.LastLatencyMs = latency;
                     status.LastPingAdjustment = timestamp;
                 }
@@ -1075,7 +1397,10 @@ public class SqmDeploymentService : ISqmDeploymentService
         sb.AppendLine("# Get current TC rate for an interface");
         sb.AppendLine("get_tc_rate() {");
         sb.AppendLine("    local interface=$1");
-        sb.AppendLine("    tc class show dev \"$interface\" 2>/dev/null | grep \"class htb 1:1 root\" | grep -o 'rate [0-9.]*[MGK]bit' | head -n1 | awk '{print $2}'");
+        sb.AppendLine("    local rate=$(tc class show dev \"$interface\" 2>/dev/null | grep \"class htb 1:1 root\" | grep -o 'rate [0-9.]*[MGK]bit' | head -n1 | awk '{print $2}')");
+        // An opt-in CAKE download root has no classes; its bandwidth is the shaped rate.
+        sb.AppendLine("    [ -z \"$rate\" ] && rate=$(tc qdisc show dev \"$interface\" 2>/dev/null | grep -E '^qdisc cake [0-9a-f]+: root' | grep -o 'bandwidth [0-9.]*[MGK]bit' | head -n1 | awk '{print $2}')");
+        sb.AppendLine("    echo \"$rate\"");
         sb.AppendLine("}");
         sb.AppendLine();
         sb.AppendLine("# Convert rate to Mbps");
@@ -1388,6 +1713,7 @@ public class SqmDeploymentStatus
     public int CronJobsConfigured { get; set; }
     public bool SpeedtestCliInstalled { get; set; }
     public bool BcInstalled { get; set; }
+    public bool JqInstalled { get; set; }
     public string? Error { get; set; }
 
     /// <summary>
@@ -1395,6 +1721,9 @@ public class SqmDeploymentStatus
     /// learning sample. Zero once Adaptive SQM has been redeployed from a build that has the guard.
     /// </summary>
     public int PingScriptsWithoutProbeGuard { get; set; }
+
+    /// <summary>Deployed scripts still calculating rates with bc, which every upgrade removes.</summary>
+    public int ScriptsUsingBc { get; set; }
 
     /// <summary>
     /// True when the gateway is unreachable only because this site's on-site agent

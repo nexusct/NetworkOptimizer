@@ -96,6 +96,10 @@ jobs:
           context: .
           file: ./docker/agent/Dockerfile
           platforms: ${{ matrix.platform }}
+          # Fresh base and apt layer every release: the runtime stage's nginx/openssl come from
+          # Debian security updates, which a cached apt layer would never pick up.
+          pull: true
+          no-cache-filters: runtime
           labels: ${{ steps.agent-meta.outputs.labels }}
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
@@ -126,6 +130,24 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # A stable release moves :preview only if it is at least the newest preview's version, so a
+      # patch on the current line never rolls preview users back off the next minor's previews.
+      - name: Decide whether this release moves the preview tag
+        id: preview
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          if [[ "$tag" == *-preview* ]]; then echo "move=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [[ "$tag" == *-* ]]; then echo "move=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          newest=$(git tag -l 'v*-preview*' | sed 's/^v//; s/-preview.*//' | sort -V | tail -1)
+          if [[ -z "$newest" || "$(printf '%s\n%s\n' "$newest" "$tag" | sort -V | tail -1)" == "$tag" ]]; then
+            echo "move=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "move=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Newest preview base: ${newest:-none}; this release: $tag"
 
       - name: Download digests
         uses: actions/download-artifact@v4
@@ -157,7 +179,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
-            type=raw,value=preview
+            type=raw,value=preview,enable=${{ steps.preview.outputs.move == 'true' }}
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
@@ -187,7 +209,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
-            type=raw,value=preview
+            type=raw,value=preview,enable=${{ steps.preview.outputs.move == 'true' }}
 
       - name: Create agent manifest list and push
         working-directory: /tmp/agent-digests
@@ -210,7 +232,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
-            type=raw,value=preview
+            type=raw,value=preview,enable=${{ steps.preview.outputs.move == 'true' }}
 
       - name: Build and push speedtest image
         uses: docker/build-push-action@v5
@@ -218,6 +240,10 @@ jobs:
           context: .
           file: ./docker/openspeedtest/Dockerfile
           platforms: linux/amd64,linux/arm64
+          # nginx:1.30-alpine floats; pull so each release takes the newest 1.30.x patch, and skip
+          # the cache so the apk upgrade layer is never reused while the base digest is unchanged.
+          pull: true
+          no-cache: true
           push: true
           tags: ${{ steps.speedtest-meta.outputs.tags }}
           labels: ${{ steps.speedtest-meta.outputs.labels }}
@@ -246,10 +272,19 @@ jobs:
             cp "out/$rid/NetworkOptimizer.Agent" "NetworkOptimizer.Agent-$rid"
           done
 
+      # The segments GC module the installers add on 64K-page arm64 hosts (EFG, UDM-Beast class). A
+      # non-single-file publish copies it out of this build's own runtime pack, so it matches the binary.
+      - name: Extract the arm64 segments GC module
+        run: |
+          dotnet publish src/NetworkOptimizer.Agent/NetworkOptimizer.Agent.csproj \
+            -c Release -r linux-arm64 --self-contained true -p:PublishSingleFile=false \
+            -o out/gc-linux-arm64
+          cp out/gc-linux-arm64/libclrgc.so libclrgc-linux-arm64.so
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.27'
 
       # uwnspeedtest Go binary the agent runs for site-local WAN speed tests;
       # install-native.sh drops it next to the agent binary (imports cfspeedtest,
@@ -270,6 +305,7 @@ jobs:
           path: |
             NetworkOptimizer.Agent-linux-*
             uwnspeedtest-linux-*
+            libclrgc-linux-arm64.so
           if-no-files-found: error
           retention-days: 1
 
@@ -296,6 +332,7 @@ jobs:
             /tmp/agent-binaries/NetworkOptimizer.Agent-linux-arm64 \
             /tmp/agent-binaries/uwnspeedtest-linux-x64 \
             /tmp/agent-binaries/uwnspeedtest-linux-arm64 \
+            /tmp/agent-binaries/libclrgc-linux-arm64.so \
             --clobber --repo ${{ github.repository }} || echo "Release not found yet - agent binaries not attached"
           # Find draft release matching this tag and publish it
           gh release edit ${{ github.ref_name }} --draft=false --repo ${{ github.repository }} || echo "No draft release found for ${{ github.ref_name }}"

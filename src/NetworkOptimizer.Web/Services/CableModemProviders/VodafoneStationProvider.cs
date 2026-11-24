@@ -30,6 +30,12 @@ public sealed partial class VodafoneStationProvider : ICableModemProvider, IDisp
     /// <inheritdoc/>
     public string DisplayName => "Vodafone Station (ARRIS TG3442DE)";
 
+    /// <inheritdoc/>
+    public CmCredentialRequirement Credentials => CmCredentialRequirement.Required;
+
+    /// <inheritdoc/>
+    public bool BlankUsernameMeansAdmin => true;
+
     private const string DefaultDocsisPath = "/php/status_docsis_data.php";
     private const string LoginPath = "/php/ajaxSet_Password.php";
     private const string SessionPath = "/php/ajaxSet_Session.php";
@@ -71,7 +77,7 @@ public sealed partial class VodafoneStationProvider : ICableModemProvider, IDisp
             var stats = await TryPollAsync(context, cancellationToken);
             if (stats == null)
                 return PollResult<CableModemStats>.Failed(
-                    $"No stats could be read from {context.ConfiguredHost ?? context.Host}.");
+                    $"No stats could be read from {context.Host}.");
 
             _logger.LogDebug(
                 "Vodafone Station {Name} polled: {Model}, {DsCount} DS channels, {UsCount} US channels",
@@ -87,8 +93,8 @@ public sealed partial class VodafoneStationProvider : ICableModemProvider, IDisp
         catch (Exception ex)
         {
             _sessions.TryRemove(context.CacheKey, out _);
-            _logger.LogWarning(ex, "Error polling Vodafone Station {Name} at {Host}", context.Name, context.ConfiguredHost ?? context.Host);
-            return PollResult<CableModemStats>.Failed(HttpFailureSummary.Describe(ex, context.ConfiguredHost ?? context.Host));
+            _logger.LogWarning(ex, "Error polling Vodafone Station {Name} at {Host}", context.Name, context.Host);
+            return PollResult<CableModemStats>.Failed(HttpFailureSummary.Describe(ex, context.Host));
         }
     }
 
@@ -117,7 +123,7 @@ public sealed partial class VodafoneStationProvider : ICableModemProvider, IDisp
         }
         catch (Exception ex)
         {
-            return (false, HttpFailureSummary.Describe(ex, context.ConfiguredHost ?? context.Host));
+            return (false, HttpFailureSummary.Describe(ex, context.Host));
         }
     }
 
@@ -163,7 +169,7 @@ public sealed partial class VodafoneStationProvider : ICableModemProvider, IDisp
         var password = context.Password ?? "";
 
         var cookies = new CookieContainer();
-        using var client = CreateClient(cookies, baseUrl, csrfNonce: null);
+        using var client = CreateClient(context.Dialer, cookies, baseUrl, csrfNonce: null);
 
         var loginPage = await client.GetStringAsync(baseUrl + "/", cancellationToken);
 
@@ -266,7 +272,7 @@ public sealed partial class VodafoneStationProvider : ICableModemProvider, IDisp
         var session = new TgSession(csrfNonce, cookies, "ARRIS TG3442DE (Vodafone Station)");
 
         // Later requests need the nonce header, so build a fresh client for the remaining setup.
-        using var authedClient = CreateClient(cookies, baseUrl, csrfNonce);
+        using var authedClient = CreateClient(context.Dialer, cookies, baseUrl, csrfNonce);
 
         // Some firmware only marks the session live once this is posted; failure is not fatal.
         try
@@ -302,7 +308,7 @@ public sealed partial class VodafoneStationProvider : ICableModemProvider, IDisp
         var baseUrl = BuildBaseUrl(context);
         var path = string.IsNullOrWhiteSpace(context.StatusPagePath) ? DefaultDocsisPath : context.StatusPagePath;
 
-        using var client = CreateClient(session.Cookies, baseUrl, session.CsrfNonce);
+        using var client = CreateClient(context.Dialer, session.Cookies, baseUrl, session.CsrfNonce);
 
         try
         {
@@ -330,7 +336,7 @@ public sealed partial class VodafoneStationProvider : ICableModemProvider, IDisp
             return;
 
         var baseUrl = BuildBaseUrl(context);
-        using var client = CreateClient(session.Cookies, baseUrl, session.CsrfNonce);
+        using var client = CreateClient(context.Dialer, session.Cookies, baseUrl, session.CsrfNonce);
 
         try
         {
@@ -397,7 +403,7 @@ public sealed partial class VodafoneStationProvider : ICableModemProvider, IDisp
         var stats = new CableModemStats
         {
             Timestamp = DateTime.UtcNow,
-            DeviceHost = context.ConfiguredHost ?? context.Host,
+            DeviceHost = context.Host,
             DeviceName = context.Name,
             DeviceModel = deviceModel,
         };
@@ -595,15 +601,14 @@ public sealed partial class VodafoneStationProvider : ICableModemProvider, IDisp
     /// </summary>
     internal static string AesCcmEncryptHex(byte[] key, byte[] nonce, byte[] plaintext, string associatedData)
     {
-        var ccm = new CcmBlockCipher(new AesEngine());
-        ccm.Init(true, new AeadParameters(new KeyParameter(key), TagLengthBytes * 8, nonce, Encoding.ASCII.GetBytes(associatedData)));
+        // BouncyCastle, not System.Security.Cryptography.AesCcm: the platform class is unsupported
+        // on macOS. CCM output is ciphertext followed by the tag, the layout the modem expects.
+        var cipher = CreateCcm(forEncryption: true, key, nonce, associatedData);
+        var output = new byte[cipher.GetOutputSize(plaintext.Length)];
+        var written = cipher.ProcessBytes(plaintext, 0, plaintext.Length, output, 0);
+        written += cipher.DoFinal(output, written);
 
-        // CcmBlockCipher output is already ciphertext followed by the tag.
-        var output = new byte[ccm.GetOutputSize(plaintext.Length)];
-        var len = ccm.ProcessBytes(plaintext, 0, plaintext.Length, output, 0);
-        ccm.DoFinal(output, len);
-
-        return Convert.ToHexStringLower(output);
+        return Convert.ToHexStringLower(output.AsSpan(0, written));
     }
 
     internal static string? AesCcmDecryptText(byte[] key, byte[] nonce, string encryptedHex, string associatedData)
@@ -611,25 +616,32 @@ public sealed partial class VodafoneStationProvider : ICableModemProvider, IDisp
         if (!TryParseHex(encryptedHex, out var blob) || blob.Length <= TagLengthBytes)
             return null;
 
+        var cipher = CreateCcm(forEncryption: false, key, nonce, associatedData);
+        var plaintext = new byte[cipher.GetOutputSize(blob.Length)];
+        int written;
         try
         {
-            var ccm = new CcmBlockCipher(new AesEngine());
-            ccm.Init(false, new AeadParameters(new KeyParameter(key), TagLengthBytes * 8, nonce, Encoding.ASCII.GetBytes(associatedData)));
-
-            var plaintext = new byte[ccm.GetOutputSize(blob.Length)];
-            var len = ccm.ProcessBytes(blob, 0, blob.Length, plaintext, 0);
-            ccm.DoFinal(plaintext, len); // throws InvalidCipherTextException on tag mismatch
-
-            return Encoding.UTF8.GetString(plaintext);
+            written = cipher.ProcessBytes(blob, 0, blob.Length, plaintext, 0);
+            written += cipher.DoFinal(plaintext, written);
         }
         catch (InvalidCipherTextException)
         {
             return null;
         }
+
+        return Encoding.UTF8.GetString(plaintext, 0, written);
     }
 
-    // CCM (RFC 3610) allows 7-13 byte nonces; CcmBlockCipher enforces the same at Init.
-    private static bool IsSupportedNonceSize(int length) => length is >= 7 and <= 13;
+    private static CcmBlockCipher CreateCcm(bool forEncryption, byte[] key, byte[] nonce, string associatedData)
+    {
+        var cipher = new CcmBlockCipher(new AesEngine());
+        cipher.Init(forEncryption, new AeadParameters(
+            new KeyParameter(key), TagLengthBytes * 8, nonce, Encoding.ASCII.GetBytes(associatedData)));
+        return cipher;
+    }
+
+    /// <summary>CCM nonces are 7 to 13 bytes (NIST SP 800-38C).</summary>
+    internal static bool IsSupportedNonceSize(int length) => length is >= 7 and <= 13;
 
     private static bool TryParseHex(string value, out byte[] bytes)
     {
@@ -667,14 +679,15 @@ public sealed partial class VodafoneStationProvider : ICableModemProvider, IDisp
         return null;
     }
 
-    private static HttpClient CreateClient(CookieContainer cookies, string baseUrl, string? csrfNonce)
+    private static HttpClient CreateClient(IDeviceDialer dialer, CookieContainer cookies, string baseUrl, string? csrfNonce)
     {
-        var handler = new HttpClientHandler
+        var handler = new SocketsHttpHandler
         {
+            ConnectCallback = DeviceHttp.Via(dialer),
             CookieContainer = cookies,
             UseCookies = true,
             AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
-            ServerCertificateCustomValidationCallback = (_, _, _, _) => true,
+            SslOptions = { RemoteCertificateValidationCallback = (_, _, _, _) => true },
         };
 
         var client = new HttpClient(handler)

@@ -45,9 +45,13 @@
     <PackageReference Include="WixToolset.UI.wixext" Version="6.*" />
   </ItemGroup>
 
-  <!-- Download nginx before build -->
-  <Target Name="DownloadNginx" BeforeTargets="Build" Condition="!Exists('$(SpeedTestDir)nginx\nginx.exe')">
-    <Exec Command="powershell -ExecutionPolicy Bypass -File &quot;$(SpeedTestDir)Download-Nginx.ps1&quot;" />
+  <!-- Download nginx before build. Keyed on a per-version marker, not nginx.exe, so a version
+       bump replaces an already-staged older nginx. Keep on the nginx.org stable line. -->
+  <PropertyGroup>
+    <NginxVersion>1.30.6</NginxVersion>
+  </PropertyGroup>
+  <Target Name="DownloadNginx" BeforeTargets="Build" Condition="!Exists('$(SpeedTestDir)nginx\nginx-$(NginxVersion).version')">
+    <Exec Command="powershell -ExecutionPolicy Bypass -File &quot;$(SpeedTestDir)Download-Nginx.ps1&quot; -Version $(NginxVersion)" />
   </Target>
 
   <!-- Download iperf3 before build -->
@@ -62,6 +66,15 @@
        at whatever version the machine first downloaded. -->
   <Target Name="DownloadTraefik" BeforeTargets="Build">
     <Exec Command="powershell -ExecutionPolicy Bypass -File &quot;$(TraefikDir)Download-Traefik.ps1&quot;" />
+  </Target>
+
+  <!-- netopt-waf.exe is optional (Download-Traefik.ps1 builds it only when Go is available).
+       Define NetoptWafExe after staging, right before WiX compiles, so TraefikComponent.wxs includes it only when present. -->
+  <Target Name="DetectNetoptWaf" BeforeTargets="CoreCompile" DependsOnTargets="DownloadTraefik">
+    <PropertyGroup Condition="Exists('$(TraefikDir)netopt-waf.exe')">
+      <DefineConstants>$(DefineConstants);NetoptWafExe=1</DefineConstants>
+    </PropertyGroup>
+    <Message Importance="high" Text="netopt-waf.exe staged: the MSI includes the web application firewall" Condition="Exists('$(TraefikDir)netopt-waf.exe')" />
   </Target>
 
 </Project>

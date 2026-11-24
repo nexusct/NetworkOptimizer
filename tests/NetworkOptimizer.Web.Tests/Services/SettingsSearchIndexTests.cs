@@ -23,6 +23,13 @@ public class SettingsSearchIndexTests
     };
 
     [Fact]
+    public void The_account_time_zone_entry_lands_on_its_card()
+    {
+        ElementIdsInComponents().Should().Contain(AccountSearchProvider.TimeZone.Anchor!);
+        AccountSearchProvider.TimeZone.Route.Should().Be("/account/security");
+    }
+
+    [Fact]
     public void Every_anchor_exists_in_the_markup()
     {
         var ids = ElementIdsInComponents();
@@ -78,6 +85,8 @@ public class SettingsSearchIndexTests
     [InlineData("cable modem", "cable-modem")]
     [InlineData("starlink", "starlink")]
     [InlineData("guided tours", "guided-tours")]
+    [InlineData("time zone", "time-zone")]
+    [InlineData("timezone", "time-zone")]
     [InlineData("audit log", "auditlog")]
     [InlineData("multi site", "multi-site")]
     [InlineData("licensing", "licensing")]
@@ -103,6 +112,24 @@ public class SettingsSearchIndexTests
     [InlineData("enrollment token", "multi-site")]
     [InlineData("pre-release", "application-settings")]
     [InlineData("clear cache", "data-management")]
+    [InlineData("automatic blocking", "automatic-blocking")]
+    [InlineData("blocklist", "automatic-blocking")]
+    [InlineData("cloudflare", "automatic-blocking")]
+    [InlineData("dry run", "automatic-blocking")]
+    [InlineData("spamhaus", "automatic-blocking")]
+    [InlineData("trusted sources", "trusted-sources")]
+    [InlineData("port forward", "trusted-sources")]
+    [InlineData("waf url", "waf")]
+    // Typed a field label from inside a card.
+    [InlineData("pdf rows", "security-audit")]
+    [InlineData("top threat sources rows", "security-audit")]
+    [InlineData("unifi cable internet", "cable-modem")]
+    [InlineData("uci", "cable-modem")]
+    [InlineData("remove site", "multi-site")]
+    [InlineData("waf allow list", "trusted-sources")]
+    [InlineData("provisioning", "identity-sign-in")]
+    [InlineData("entity id", "identity-sign-in")]
+    [InlineData("global channels", "alert-channels")]
     // Typed the hardware they own rather than the card that monitors it.
     [InlineData("xfinity", "cable-modem")]
     [InlineData("quantum fiber", "ont-monitoring")]
@@ -215,6 +242,28 @@ public class SettingsSearchIndexTests
         best.Entry!.Anchor.Should().Be("security-audit");
     }
 
+    [Theory]
+    [InlineData("custom apps")]
+    [InlineData("custom ports")]
+    [InlineData("custom app defs")]
+    [InlineData("custom app definitions")]
+    [InlineData("dpi definitions")]
+    [InlineData("custom dpi")]
+    [InlineData("port naming")]
+    [InlineData("name this app")]
+    [InlineData("live traffic apps")]
+    public void Custom_apps_is_found_by_the_words_people_use_for_it(string query)
+    {
+        var best = Entries
+            .Select(e => (Entry: e, Match: AppSearchService.MatchEntry(e, query)))
+            .Where(x => x.Match.Matched > 0 && x.Match.Score >= NetworkOptimizer.Core.Helpers.FuzzyMatch.MinimumUsefulScore)
+            .OrderByDescending(x => x.Match.Matched).ThenByDescending(x => x.Match.Score)
+            .FirstOrDefault();
+
+        best.Entry.Should().NotBeNull();
+        best.Entry!.Anchor.Should().Be("custom-apps");
+    }
+
     [Fact]
     public void An_anchor_is_reachable_as_a_fragment_after_a_full_page_load()
     {
@@ -302,7 +351,8 @@ public class SettingsSearchIndexTests
         foreach (var file in ComponentFiles())
         foreach (Match match in Regex.Matches(
                      File.ReadAllText(file),
-                     @"class=""card settings-tab-[a-z]+""\s+id=""([A-Za-z0-9_-]+)"""))
+                     // Extra classes after the tab one are allowed; an exact match skipped such cards.
+                     @"class=""card settings-tab-[a-z]+(?: [^""]*)?""\s+id=""([A-Za-z0-9_-]+)"""))
             ids.Add(match.Groups[1].Value);
 
         return ids;

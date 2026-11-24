@@ -8,7 +8,10 @@
 @implements IDisposable
 @inject IApAgentDeploymentService ApAgents
 @inject ISshSettingsAdminService SshSettingsAdmin
+@inject UniFiConnectionService ConnectionService
 @inject ILogger<ApTelemetryPanel> Logger
+@inject IDisplayTimeZone DisplayTime
+@inject SiteInfluxBucketSetup InfluxSetup
 
 <div class="card @Class" id="ap-telemetry" data-tour="ap-telemetry">
     <div class="card-header">
@@ -61,7 +64,7 @@
         {
             <div class="form-group">
                 <label class="checkbox-label">
-                    <input type="checkbox" checked="@_siteEnabled" @onchange="OnSiteEnabledChangedAsync" />
+                    <input type="checkbox" data-autosave checked="@_siteEnabled" @onchange="OnSiteEnabledChangedAsync" />
                     <span>Collect Wi-Fi telemetry from this site's access points</span>
                 </label>
                 <small class="form-help">
@@ -75,7 +78,11 @@
                 <div class="alert alert-@_messageClass">@_message</div>
             }
 
-            @if (_fleet.Count == 0)
+            <ApTelemetryHistoryAlert Ready="@(!_siteEnabled || _influxReady)" />
+
+            <ConsoleConnectionBanner />
+
+            @if (_fleet.Count == 0 && !ConsoleDown)
             {
                 <div class="empty-state empty-state-small">
                     <div class="empty-icon">
@@ -89,7 +96,7 @@
                     <p>This site's UniFi Console reports no access points, so there is nowhere to deploy the AP Agent.</p>
                 </div>
             }
-            else
+            else if (_fleet.Count > 0)
             {
                 @if (_bulkRunning)
                 {
@@ -143,7 +150,7 @@
                             @foreach (var entry in _fleet)
                             {
                                 var mac = entry.DeviceMac;
-                                var busy = _busyMacs.Contains(mac) || entry.DeployInProgress;
+                                var busy = _busyMacs.Contains(mac) || _removingMacs.Contains(mac) || entry.DeployInProgress || entry.RemoveInProgress;
                                 var view = StatusView(entry);
                                 <tr class="@RowClass(entry)"
                                     @onclick="@(() => IsRowOpen(mac) ? CollapsePanelsAsync() : Task.CompletedTask)">
@@ -201,7 +208,7 @@
                                                         {
                                                             <button type="button" class="btn btn-primary btn-sm" @onclick="() => DeployOneAsync(entry)" @onclick:stopPropagation="true">Deploy</button>
                                                         }
-                                                        else if (entry.State is ApAgentState.Filtered or ApAgentState.Unhealthy)
+                                                        else if (entry.State is ApAgentState.Filtered or ApAgentState.Unhealthy or ApAgentState.ClockSkewed)
                                                         {
                                                             <button type="button" class="btn btn-secondary btn-sm" @onclick="() => RecheckOneAsync(entry)" @onclick:stopPropagation="true">Retry</button>
                                                         }
@@ -311,7 +318,7 @@
                                                                 {
                                                                     <div class="ap-agent-cap-row">
                                                                         <span class="ap-agent-cap-name">Next automatic attempt</span>
-                                                                        <span class="ap-agent-cap-src">@next.ToLocalTime().ToString("h:mm:ss tt")</span>
+                                                                        <span class="ap-agent-cap-src">@next.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.TimeSeconds, DisplayFormat.Culture)</span>
                                                                     </div>
                                                                 }
                                                             </div>
@@ -322,7 +329,7 @@
                                                         }
                                                         <div class="ap-agent-cap-footer">
                                                             <label class="checkbox-toggle" @onclick:stopPropagation="true">
-                                                                <input type="checkbox" checked="@entry.Enabled"
+                                                                <input type="checkbox" checked="@entry.Enabled" data-autosave
                                                                        @onchange="e => SetApEnabledAsync(entry, e)" />
                                                                 <span>Include in AP Agent deployment</span>
                                                             </label>
@@ -374,14 +381,18 @@
                     </p>
                     <h4>Credentials</h4>
                     <p>
-                        Deployment uses the shared Device SSH credentials from
-                        <strong>Settings - Connection - Device SSH</strong>.
+                        Access points use the shared Device SSH credentials from
+                        <a href="/settings?tab=connection#device-ssh"><strong>Settings - Connection - Device SSH</strong></a>.
+                        A gateway with built-in Wi-Fi uses the
+                        <a href="/settings?tab=connection#gateway-ssh"><strong>Gateway SSH</strong></a> credentials.
                     </p>
                     <h4>Supported hardware</h4>
                     <p>
-                        32-bit ARM (armv7l) access points, which covers the tested U7-series models.
-                        Unsupported models are listed and skipped; their telemetry keeps coming from
-                        the UniFi Console.
+                        32-bit ARM (armv7l), 64-bit ARM (aarch64), and 32-bit MIPS: the ARM-based U6
+                        and U7 models, gateways with built-in Wi-Fi such as the UDR7, UX7, and
+                        UCG-Industrial, and older MIPS-based models such as the U6-Lite, U6-Mesh, and
+                        UAP-AC-Pro. Unsupported models are listed and skipped; their telemetry keeps
+                        coming from the UniFi Console.
                     </p>
                 </div>
                     </div>
@@ -405,6 +416,9 @@
     private bool _loading;
     private bool _deviceSshConfigured;
     private bool _siteEnabled;
+
+    /// <summary>Whether the site's InfluxDB buckets answer; true until checked, so the alert never flashes.</summary>
+    private bool _influxReady = true;
 
     /// <summary>
     /// Guide open state. Collapsed on arrival: it is reference material, not the point of the tab.
@@ -441,6 +455,7 @@
     private string _messageClass = "info";
 
     private readonly HashSet<string> _busyMacs = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _removingMacs = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _rowProgress = new(StringComparer.OrdinalIgnoreCase);
     private bool _bulkRunning;
     private int _bulkTotal;
@@ -476,7 +491,7 @@
     private static string ProbeLabel(string name) => ProbeNames.TryGetValue(name, out var p) ? p.Label : name;
     private static string ProbeSource(string name) => ProbeNames.TryGetValue(name, out var p) ? p.Source : name;
 
-    private static string Ago(DateTime utc) => TimeFormatHelper.FormatRelativeTime(utc);
+    private string Ago(DateTime utc) => TimeFormatHelper.FormatRelativeTime(utc, DisplayTime.Zone, DisplayTime.Format);
 
     /// <summary>
     /// The transfer-failure lead line. The model and firmware are rendered from the fleet entry at
@@ -495,6 +510,36 @@
     private static IEnumerable<string> TransferFailureLines(ApAgentFleetEntry e)
         => (e.Detail ?? "").Split('\n').Skip(1);
 
+    /// <summary>
+    /// The Console is unreachable, so an empty fleet means unknown, not "no access points". The
+    /// banner above says why.
+    /// </summary>
+    private bool ConsoleDown => ConnectionService.IsInitialized && !ConnectionService.IsConnected;
+
+    protected override void OnInitialized()
+    {
+        ConnectionService.OnConnectionChanged += OnConnectionChanged;
+    }
+
+    // Any site's Console can connect after this tab loaded (a restart, an outage, an agent tunnel
+    // coming up); refresh then rather than leaving the table empty until the 30 s timer.
+    private void OnConnectionChanged()
+    {
+        _ = InvokeAsync(async () =>
+        {
+            try
+            {
+                if (!_loaded || !_deviceSshConfigured) return;
+                await RefreshFleetAsync();
+                StateHasChanged();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug(ex, "AP Telemetry refresh after a connection change failed");
+            }
+        });
+    }
+
     protected override async Task OnParametersSetAsync()
     {
         if (Active && !_loaded && !_loading)
@@ -511,6 +556,8 @@
             _siteEnabled = await ApAgents.IsSiteEnabledAsync();
             if (_deviceSshConfigured)
                 await RefreshFleetAsync();
+            if (_siteEnabled)
+                _ = EnsureInfluxAsync();
             _loaded = true;
 
             _refreshTimer ??= new System.Threading.Timer(async _ =>
@@ -549,6 +596,14 @@
         {
             Logger.LogDebug(ex, "AP Agent fleet refresh failed");
         }
+
+        // A deploy failure stops being news once that AP is running, by any route.
+        if (_messageMac != null && _fleet.FirstOrDefault(f => f.DeviceMac == _messageMac) is { } failed && IsRunning(failed))
+        {
+            _message = null;
+            _messageMac = null;
+        }
+
         QueueFastRefresh();
     }
 
@@ -561,7 +616,7 @@
     /// </summary>
     private void QueueFastRefresh(bool force = false)
     {
-        if (_fastRefreshQueued || (!force && !_fleet.Any(e => e.DeployInProgress))) return;
+        if (_fastRefreshQueued || (!force && !_fleet.Any(e => e.DeployInProgress || e.RemoveInProgress))) return;
         _fastRefreshQueued = true;
         _ = Task.Run(async () =>
         {
@@ -588,7 +643,11 @@
     {
         _message = text;
         _messageClass = cssClass;
+        _messageMac = null;
     }
+
+    /// <summary>The AP a deploy-failure message names, so it clears once that AP is running.</summary>
+    private string? _messageMac;
 
     // ---- Derived state ----
 
@@ -603,7 +662,8 @@
 
     /// <summary>Rows Deploy to All Eligible picks up. Filtered, offline, and mid-deploy APs are deliberately not eligible.</summary>
     private bool IsEligible(ApAgentFleetEntry e) =>
-        e.Enabled && IsDeployable(e) && !_busyMacs.Contains(e.DeviceMac) && !e.DeployInProgress;
+        e.Enabled && IsDeployable(e) && !_busyMacs.Contains(e.DeviceMac) && !_removingMacs.Contains(e.DeviceMac)
+        && !e.DeployInProgress && !e.RemoveInProgress;
 
     private int EligibleCount => _fleet.Count(IsEligible);
     private int RunningCount => _fleet.Count(IsRunning);
@@ -663,6 +723,9 @@
     {
         // DeployInProgress covers server-driven deploys (the pass after enabling the site,
         // supervision redeploys), so those show as Deploying without the user pressing anything.
+        if (_removingMacs.Contains(e.DeviceMac) || e.RemoveInProgress)
+            return ("", "Removing", null);
+
         if (_busyMacs.Contains(e.DeviceMac) || e.DeployInProgress)
             return ("", "Deploying", _rowProgress.TryGetValue(e.DeviceMac, out var p) ? p : null);
 
@@ -678,6 +741,7 @@
             ApAgentState.ApOffline => ("offline", "AP offline", "Deployment waits for the access point to come back."),
             ApAgentState.Wedged => ("error", "Stalled", "Answering, but its probes stopped; it is restarted in place automatically."),
             ApAgentState.Unauthorized => ("error", "Token mismatch", "The AP Agent rejected this server's token; the token is re-pushed automatically."),
+            ApAgentState.ClockSkewed => ("error", "Clock out of sync", e.Detail),
             ApAgentState.NotListening when e.LastDeployedAt != null =>
                 ("error", "Stopped", e.LastHealthyAt is { } h
                     ? $"Removed by a reboot or firmware update; last healthy {Ago(h)}"
@@ -754,14 +818,43 @@
         await OpenPanelAsync();
     }
 
+    /// <summary>
+    /// Creates the site's buckets if the shared token allows it, off the load path: an unreachable
+    /// InfluxDB can take the client's full timeout to answer, and the fleet table must not wait.
+    /// </summary>
+    private async Task EnsureInfluxAsync()
+    {
+        try
+        {
+            var ready = await InfluxSetup.EnsureAsync();
+            await InvokeAsync(() =>
+            {
+                _influxReady = ready;
+                StateHasChanged();
+            });
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "AP Telemetry InfluxDB bucket check failed");
+        }
+    }
+
     // ---- Actions ----
 
     private async Task OnSiteEnabledChangedAsync(ChangeEventArgs e)
     {
         _siteEnabled = e.Value is true;
         _message = null;
+        List<string> siteRemoval = [];
         try
         {
+            // Disabling removes the agent from every deployed AP before it returns, often in less than
+            // a fast-refresh interval, so the rows are marked up front rather than polled for.
+            if (!_siteEnabled)
+            {
+                siteRemoval = _fleet.Where(f => f.DeployedVersion != null).Select(f => f.DeviceMac).ToList();
+                foreach (var mac in siteRemoval) _removingMacs.Add(mac);
+            }
             await ApAgents.SetSiteEnabledAsync(_siteEnabled);
             // Enabling kicks a server-side deploy pass; force one fast poll so its Deploying rows
             // appear right away, and the chain keeps refreshing while work is in flight.
@@ -769,6 +862,7 @@
             {
                 await RefreshFleetAsync();
                 QueueFastRefresh(force: true);
+                _ = EnsureInfluxAsync();
             }
         }
         catch (Exception ex)
@@ -776,6 +870,14 @@
             Logger.LogWarning(ex, "Could not change the AP Agent site setting");
             _siteEnabled = !_siteEnabled;
             ShowMessage("Could not save the setting.", "danger");
+        }
+        finally
+        {
+            if (siteRemoval.Count > 0)
+            {
+                foreach (var mac in siteRemoval) _removingMacs.Remove(mac);
+                await RefreshFleetAsync();
+            }
         }
     }
 
@@ -819,7 +921,10 @@
             // An in-flight refusal is benign - the server is already deploying to this AP, and the
             // refresh below renders that work's own Deploying row instead of an error.
             if (!result.Success && !result.AlreadyInProgress)
+            {
                 ShowMessage($"Deploying to {entry.DeviceName} failed: {result.Error}", "danger");
+                _messageMac = mac;
+            }
         }
         catch (Exception ex)
         {
@@ -904,6 +1009,8 @@
     private async Task RemoveOneAsync(ApAgentFleetEntry entry)
     {
         _message = null;
+        if (!_removingMacs.Add(entry.DeviceMac)) return;
+        StateHasChanged();
         try
         {
             var result = await ApAgents.RemoveAsync(entry.DeviceMac);
@@ -921,11 +1028,16 @@
             Logger.LogWarning(ex, "AP Agent removal failed for {Mac}", entry.DeviceMac);
             ShowMessage($"Removing the AP Agent from {entry.DeviceName} failed.", "danger");
         }
+        finally
+        {
+            _removingMacs.Remove(entry.DeviceMac);
+        }
         await RefreshFleetAsync();
     }
 
     public void Dispose()
     {
+        ConnectionService.OnConnectionChanged -= OnConnectionChanged;
         _refreshTimer?.Dispose();
     }
 }

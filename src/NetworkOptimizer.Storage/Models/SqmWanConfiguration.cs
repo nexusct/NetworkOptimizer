@@ -70,8 +70,11 @@ public class SqmWanConfiguration
     /// <summary>Delay in seconds before running the first speedtest after deploy/boot. Null = use default (5s solo, staggered for dual-WAN).</summary>
     public int? BootDelaySeconds { get; set; }
 
-    /// <summary>Opt-in rate-proportional download burst (~1 ms of line time) instead of the conservative 5 KB clamp. False = conservative (default).</summary>
+    /// <summary>Rate-proportional download burst (~1 ms of line time) instead of the conservative 5 KB clamp. The column defaults to false (conservative); the Adaptive SQM page sets it on for a new WAN.</summary>
     public bool RateProportionalDownloadBurst { get; set; } = false;
+
+    /// <summary>Experimental: CAKE replaces UniFi's download HTB tree on the IFB. Upload stays HTB. Defaults to false.</summary>
+    public bool CakeDownload { get; set; } = false;
 
     /// <summary>Upload shaping strength (0-1). 0 = static nominal upload, the behavior before this setting existed.</summary>
     public double UploadCongestionSeverity { get; set; } = 0.0;

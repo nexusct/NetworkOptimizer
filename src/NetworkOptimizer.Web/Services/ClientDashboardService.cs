@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -11,6 +13,7 @@ using NetworkOptimizer.UniFi;
 using NetworkOptimizer.UniFi.Models;
 using NetworkOptimizer.Web.Models;
 using NetworkOptimizer.Web.Services.ApAgent;
+using NetworkOptimizer.Web.Services.Ssh;
 using NetworkOptimizer.WiFi;
 using NetworkOptimizer.WiFi.Models;
 
@@ -34,6 +37,13 @@ public class ClientDashboardService
     private readonly IConfiguration _configuration;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly WiredPortPresence.IWiredPortPresenceService? _portPresence;
+    private readonly GatewayNeighborTable _neighborTable;
+    private readonly IDisplayTimeZone? _displayTime;
+    private readonly Tailscale.TailscaleDirectoryRegistry? _tailscale;
+
+    // For an IPv6 source, the IPv4 address UniFi Network lists the device under. WiFiman is
+    // looked up by that address, including on the 1-second poll, which has no identity to read.
+    private readonly ConcurrentDictionary<string, string> _consoleIpFor = new();
 
     // Track last trace hash per client MAC to detect changes
     private readonly ConcurrentDictionary<string, string> _lastTraceHashes = new();
@@ -44,6 +54,8 @@ public class ClientDashboardService
 
     // Cache offline identities to avoid hitting the history API every poll
     private readonly ConcurrentDictionary<string, ClientIdentity> _offlineIdentityCache = new();
+    // The ClientDisplayNameCache generation the offline identities were named under; a rename moves it.
+    private long _namesGeneration;
 
     // Cache IP->MAC mapping after first identification so subsequent polls use GetClientAsync(mac)
     private readonly ConcurrentDictionary<string, string> _ipToMacCache = new();
@@ -80,12 +92,17 @@ public class ClientDashboardService
         IServiceScopeFactory scopeFactory,
         SiteContextService siteContext,
         MonitoringLiveStatsRegistry liveStats,
+        GatewayNeighborTable neighborTable,
         ApAgentClientLiveService? apAgentLive = null,
         ApAgentTelemetryRegistry? apAgentTelemetry = null,
         Microsoft.Extensions.Caching.Memory.IMemoryCache? cache = null,
-        WiredPortPresence.IWiredPortPresenceService? portPresence = null)
+        WiredPortPresence.IWiredPortPresenceService? portPresence = null,
+        IDisplayTimeZone? displayTime = null,
+        Tailscale.TailscaleDirectoryRegistry? tailscale = null)
     {
+        _tailscale = tailscale;
         _logger = logger;
+        _displayTime = displayTime;
         _cache = cache;
         _portPresence = portPresence;
         _siteDbFactory = siteDbFactory;
@@ -101,6 +118,7 @@ public class ClientDashboardService
         _scopeFactory = scopeFactory;
         _apAgentLive = apAgentLive;
         _apAgentTelemetry = apAgentTelemetry;
+        _neighborTable = neighborTable;
     }
 
     /// <summary>Context for the database holding this instance's site data.</summary>
@@ -135,9 +153,7 @@ public class ClientDashboardService
                     if (string.IsNullOrEmpty(h.BestIp) || !seen.Add(h.BestIp)) continue;
                     online.Add(new SelectableClient(
                         h.BestIp!,
-                        !string.IsNullOrWhiteSpace(h.DisplayName) ? h.DisplayName
-                            : !string.IsNullOrWhiteSpace(h.Name) ? h.Name
-                            : !string.IsNullOrWhiteSpace(h.Hostname) ? h.Hostname : h.BestIp!,
+                        ClientNames.For(h) ?? h.BestIp!,
                         h.IsWired,
                         h.Mac,
                         IsOnline: h.Mac != null && byPort.Contains(h.Mac)));
@@ -255,10 +271,8 @@ public class ClientDashboardService
             .Where(c => !string.IsNullOrEmpty(c.BestIp))
             .Select(c => new SelectableClient(
                 c.BestIp!,
-                displayNames.TryGetValue(c.Mac.ToLowerInvariant(), out var dn) ? dn
-                    : !string.IsNullOrWhiteSpace(c.Name) ? c.Name
-                    : c.UnifiDeviceInfoFromUcore?.Name is { Length: > 0 } ucore ? ucore
-                    : !string.IsNullOrWhiteSpace(c.Hostname) ? c.Hostname : c.BestIp!,
+                ClientNames.Choose(displayNames.GetValueOrDefault(c.Mac.ToLowerInvariant()), c.Name,
+                    c.UnifiDeviceInfoFromUcore?.Name, c.Hostname, c.IsUniFiDevice) ?? c.BestIp!,
                 c.IsWired,
                 c.Mac,
                 IsOnline: !(c.IsWired && linkDown.Contains(c.Mac))))
@@ -283,109 +297,106 @@ public class ClientDashboardService
     /// </summary>
     public async Task<ClientIdentity?> IdentifyClientAsync(string clientIp)
     {
+        var identity = await IdentifyListedClientAsync(clientIp);
+        // A LAN host that is the tailnet's exit node or subnet router says so beside its name.
+        if (identity != null && _tailscale != null)
+            identity.TailnetRouterBadge = _tailscale.Get(_siteContext.Slug).RouterAtLanAddress(identity.Ip)?.RouterBadge;
+        return identity;
+    }
+
+    private async Task<ClientIdentity?> IdentifyListedClientAsync(string clientIp)
+    {
         if (!_connectionService.IsConnected || _connectionService.Client == null)
             return null;
 
-        // Guard the direct-call path: an IPv4 client on a dual-stack socket is ::ffff:a.b.c.d,
-        // which never equals the console's plain-IPv4 BestIp. Sources normalize already; this
-        // keeps the match correct for any caller. Real IPv6 is left untouched.
-        clientIp = NetworkUtilities.NormalizeToIPv4String(clientIp) ?? clientIp;
+        // Normalize mapped IPv4 and equivalent IPv6 spellings before matching or caching.
+        // A request's textual spelling is not a separate address or a separate cache entry.
+        if (!TryParseClientIp(clientIp, out var requestedAddress))
+            return null;
+        clientIp = requestedAddress!.ToString();
+
+        var namesGeneration = ClientDisplayNameCache.Generation(_connectionService.Client);
+        if (Interlocked.Exchange(ref _namesGeneration, namesGeneration) != namesGeneration)
+            _offlineIdentityCache.Clear();
 
         try
         {
-            UniFiClientResponse? client = null;
-
-            // Fast path: if we already know the MAC, fetch just this client
+            // Only a current stat/sta address can validate the fast-path cache. Historical
+            // addresses must compete with the live lists again after DHCP reassignment.
             if (_ipToMacCache.TryGetValue(clientIp, out var knownMac))
             {
-                _logger.LogTrace("Identify {Ip}: fast path via stat/sta/{Mac}", clientIp, knownMac);
-                client = await _connectionService.Client.GetClientAsync(knownMac);
-
-                // Verify the IP still matches - if another device took this IP
-                // (DHCP reassignment), the MAC lookup returns the wrong device.
-                // Match on BestIp so fixed/reservation devices (empty live ip) still match.
-                if (client != null && client.BestIp != clientIp)
-                {
-                    _logger.LogTrace("Identify {Ip}: IP mismatch (device now at {NewIp}), invalidating cache", clientIp, client.Ip);
-                    client = null;
-                }
-
-                // If lookup failed or IP changed, invalidate and fall through to full list
-                if (client == null)
-                {
-                    _logger.LogTrace("Identify {Ip}: fast path miss, falling back to full client list", clientIp);
-                    _ipToMacCache.TryRemove(clientIp, out _);
-                }
+                var knownClient = await _connectionService.Client.GetClientAsync(knownMac);
+                if (knownClient != null && IpEquals(knownClient.Ip, clientIp))
+                    return await IdentifyLegacyClientAsync(knownClient, clientIp);
+                _ipToMacCache.TryRemove(clientIp, out _);
             }
 
-            // Slow path: fetch all clients and match by IP
-            if (client == null)
-            {
-                _logger.LogTrace("Identify {Ip}: slow path via stat/sta (all clients)", clientIp);
-                var clients = await _connectionService.Client.GetClientsAsync();
-                client = clients?.FirstOrDefault(c => c.BestIp == clientIp);
-            }
-
+            var clients = await _connectionService.Client.GetClientsAsync();
+            var client = clients.FirstOrDefault(c => IpEquals(c.Ip, clientIp));
             if (client != null)
-            {
-                _offlineIdentityCache.TryRemove(clientIp, out _);
-                _ipToMacCache[clientIp] = client.Mac;
+                return await IdentifyLegacyClientAsync(client, clientIp);
 
-                // UniFi's friendly display name is only on the v2 active-clients endpoint, not
-                // stat/sta; pull it (cached 5 min, labels only) so an unnamed device shows the
-                // same name here as in Client Stats instead of a raw MAC.
-                var displayNames = await ClientDisplayNameCache.GetAsync(_connectionService.Client);
-                displayNames.TryGetValue(client.Mac.ToLowerInvariant(), out var displayName);
-                var identity = MapClientToIdentity(client, displayName);
-
-                // The console keeps a wired client listed for minutes after its link drops. The
-                // switch's own sample says the port is down, and a down port has nobody on it.
-                if (identity.IsWired && (await LinkDownMacsAsync()).Contains(identity.Mac))
-                {
-                    identity.IsOffline = true;
-                    _offlineIdentityCache[clientIp] = identity;
-                    return identity;
-                }
-
-                // Try WiFiman endpoint for more-realtime signal data, overlay on top of stat/sta
-                await OverlayWiFiManDataAsync(identity, clientIp);
-
-                // Then the access point's own agent, where there is one. Last overlay wins because
-                // it is the only source that measured the client rather than reporting on it.
-                await OverlayApAgentDataAsync(identity);
-
-                // The AP is read off the identity, not the console record, so a client the agent
-                // followed through a roam is enriched from where it is now.
-                await EnrichWithApInfoAsync(identity, identity.ApMac);
-
-                await EnrichWithSwitchNameAsync(identity);
-
-                // The console keeps a departed WIRELESS client in its active list for minutes.
-                // Where an agent covers the access point its verdict is the fresher answer, so the
-                // page shows offline now rather than when the console catches up. Wired clients are
-                // exempt: an agent only ever lists stations, so its silence about one says nothing.
-                if (!identity.IsWired
-                    && _apAgentTelemetry?.GetFor(_siteContext.Slug)
-                        .PresenceFor(identity.ApMac, identity.Mac)
-                    == NetworkOptimizer.Core.Helpers.AgentClientPresence.Absent)
-                {
-                    identity.IsOffline = true;
-                }
-
-                return identity;
-            }
-
-            // Not in the console's active list. Before concluding offline, ask the AP Agents: on a
-            // covered access point the agent knows the client and its IP from association, seconds
-            // before the console lists it. The console's active answer is never overridden - this
-            // runs only when it had none.
+            // Preserve the AP's measured answer before consulting older console fallbacks.
             var fromAgent = await IdentifyFromApAgentAsync(clientIp);
             if (fromAgent != null)
                 return fromAgent;
 
-            // Device not in active list - check offline cache. A cached offline wired client is
-            // asked about again each time: the port can come alive while the console still has
-            // it dropped, and the first identification is not the only chance to see that.
+            List<UniFiClientDetailResponse> activeDetails;
+            try
+            {
+                activeDetails = await _connectionService.Client.GetActiveClientsAsync() ?? new();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Active client details unavailable while identifying {Ip}", clientIp);
+                activeDetails = new();
+            }
+            activeDetails = activeDetails.Where(c => !string.IsNullOrWhiteSpace(c.Mac)
+                && !string.Equals(c.Status, "offline", StringComparison.OrdinalIgnoreCase)).ToList();
+
+            // A current v2 address beats a last_ip/fixed_ip (or history) belonging to a different
+            // device. A conflicting current stat/sta address still takes precedence for that MAC.
+            var activeDetail = activeDetails.FirstOrDefault(c => IpEquals(c.Ip, clientIp)
+                && !HasConflictingCurrentIp(c.Mac, clientIp, clients, Array.Empty<UniFiClientDetailResponse>()));
+            if (activeDetail == null)
+            {
+                var activeLookup = activeDetails
+                    .Where(c => FirstUsableIp(c.Ip, c.LastIp, c.FixedIp) != null)
+                    .GroupBy(c => c.Mac, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(g => g.Key, g => FirstUsableIp(g.First().Ip, g.First().LastIp, g.First().FixedIp)!,
+                        StringComparer.OrdinalIgnoreCase);
+                client = clients.FirstOrDefault(c => ClientMatchesIp(c, clientIp, activeLookup));
+                if (client != null)
+                {
+                    var detail = activeDetails.FirstOrDefault(c => MacEquals(c.Mac, client.Mac));
+                    return await IdentifyLegacyClientAsync(client, clientIp, detail?.DisplayName);
+                }
+                activeDetail = activeDetails.FirstOrDefault(c => ClientDetailMatchesIp(c, clientIp)
+                    && !HasConflictingCurrentIp(c.Mac, clientIp, clients, Array.Empty<UniFiClientDetailResponse>()));
+            }
+
+            if (activeDetail == null && activeDetails.Count > 0)
+            {
+                var clientMac = await _neighborTable.ResolveMacAsync(clientIp);
+                if (clientMac != null)
+                    activeDetail = activeDetails.FirstOrDefault(c => MacEquals(c.Mac, clientMac));
+            }
+
+            if (activeDetail != null)
+            {
+                // Retain signal, AP and switch placement from stat/sta even when its IP was absent.
+                client = clients.FirstOrDefault(c => MacEquals(c.Mac, activeDetail.Mac));
+                if (client != null)
+                    return await IdentifyLegacyClientAsync(client, clientIp, activeDetail.DisplayName);
+                return await EnrichIdentifiedClientAsync(MapClientDetailToIdentity(activeDetail, clientIp), clientIp, activeDetail.Ip);
+            }
+
+            // Do not resurrect an old identity when either live source places that MAC elsewhere.
+            if (_offlineIdentityCache.TryGetValue(clientIp, out var oldIdentity)
+                && HasConflictingCurrentIp(oldIdentity.Mac, clientIp, clients, activeDetails))
+                _offlineIdentityCache.TryRemove(clientIp, out _);
+
+            // Device not in active list - check offline cache
             if (_offlineIdentityCache.TryGetValue(clientIp, out var cached))
             {
                 if (cached.IsOffline) await TryVouchByPortAsync(cached, clientIp);
@@ -393,17 +404,24 @@ public class ClientDashboardService
             }
 
             // Try client history API (includes offline devices)
-            var history = await _connectionService.Client.GetClientHistoryAsync(withinHours: 720);
-            var histClient = history?.FirstOrDefault(c => c.BestIp == clientIp);
+            var historyClients = await _connectionService.Client.GetClientHistoryAsync(withinHours: 720) ?? new();
+            var histClient = historyClients.FirstOrDefault(c =>
+                ClientDetailMatchesIp(c, clientIp)
+                && !HasConflictingCurrentIp(c.Mac, clientIp, clients, activeDetails));
 
             if (histClient != null)
             {
+                client = clients.FirstOrDefault(c => MacEquals(c.Mac, histClient.Mac));
+                if (client != null)
+                    return await IdentifyLegacyClientAsync(client, clientIp, histClient.DisplayName);
+
                 var offlineIdentity = new ClientIdentity
                 {
                     Mac = histClient.Mac,
                     Name = histClient.DisplayName ?? histClient.Name,
                     Hostname = histClient.Hostname,
                     Ip = clientIp,
+                    FixedIp = histClient.UseFixedIp && !string.IsNullOrEmpty(histClient.FixedIp) ? histClient.FixedIp : null,
                     IsWired = histClient.IsWired,
                     Oui = histClient.Oui,
                     IsOffline = true
@@ -440,6 +458,83 @@ public class ClientDashboardService
         }
     }
 
+    private async Task<ClientIdentity> IdentifyLegacyClientAsync(
+        UniFiClientResponse client, string requestedIp, string? displayName = null)
+    {
+        if (string.IsNullOrWhiteSpace(displayName))
+        {
+            try
+            {
+                var names = await ClientDisplayNameCache.GetAsync(_connectionService.Client!);
+                names.TryGetValue(client.Mac, out displayName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Client display name unavailable for {Mac}", client.Mac);
+            }
+        }
+        return await EnrichIdentifiedClientAsync(MapClientToIdentity(client, displayName), requestedIp, client.Ip);
+    }
+
+    /// <param name="consoleIp">The address UniFi Network lists the client under. Used for WiFiman
+    /// when <paramref name="clientIp"/> is IPv6, since WiFiman knows the client by that address.</param>
+    private async Task<ClientIdentity> EnrichIdentifiedClientAsync(ClientIdentity identity, string clientIp, string? consoleIp = null)
+    {
+        identity.Ip = clientIp;
+        _offlineIdentityCache.TryRemove(clientIp, out _);
+        _ipToMacCache[clientIp] = identity.Mac;
+
+        var wifiManIp = WiFiManIpFor(clientIp, consoleIp);
+        if (wifiManIp != clientIp)
+            _consoleIpFor[clientIp] = wifiManIp;
+
+        // The console keeps a wired client listed for minutes after its link drops. The
+        // switch's own sample says the port is down, and a down port has nobody on it.
+        if (identity.IsWired && (await LinkDownMacsAsync()).Contains(identity.Mac))
+        {
+            identity.IsOffline = true;
+            _offlineIdentityCache[clientIp] = identity;
+            return identity;
+        }
+
+        // Try WiFiman endpoint for more-realtime signal data, overlay on top of stat/sta
+        await OverlayWiFiManDataAsync(identity, wifiManIp);
+
+        // Then the access point's own agent, where there is one. Last overlay wins because
+        // it is the only source that measured the client rather than reporting on it.
+        await OverlayApAgentDataAsync(identity);
+
+        // The AP is read off the identity, not the console record, so a client the agent
+        // followed through a roam is enriched from where it is now.
+        await EnrichWithApInfoAsync(identity, identity.ApMac);
+
+        await EnrichWithSwitchNameAsync(identity);
+
+        // The console keeps a departed WIRELESS client in its active list for minutes.
+        // Where an agent covers the access point its verdict is the fresher answer, so the
+        // page shows offline now rather than when the console catches up. Wired clients are
+        // exempt: an agent only ever lists stations, so its silence about one says nothing.
+        if (!identity.IsWired
+            && _apAgentTelemetry?.GetFor(_siteContext.Slug)
+                .PresenceFor(identity.ApMac, identity.Mac)
+            == NetworkOptimizer.Core.Helpers.AgentClientPresence.Absent)
+        {
+            identity.IsOffline = true;
+        }
+
+        return identity;
+    }
+
+    /// <summary>
+    /// The address to ask WiFiman about: the client's own address, or for an IPv6 source the IPv4
+    /// address UniFi Network lists it under. IPv4 sources are returned unchanged.
+    /// </summary>
+    internal static string WiFiManIpFor(string clientIp, string? consoleIp) =>
+        GatewayNeighborTable.IsResolvable(clientIp)
+        && IPAddress.TryParse(consoleIp, out var listed) && listed.AddressFamily == AddressFamily.InterNetwork
+            ? consoleIp!
+            : clientIp;
+
     /// <summary>
     /// Builds an online identity for a client an agent-covered access point currently holds but
     /// the console does not yet list as active. Null everywhere the agent path cannot vouch, which
@@ -447,13 +542,22 @@ public class ClientDashboardService
     /// </summary>
     private async Task<ClientIdentity?> IdentifyFromApAgentAsync(string clientIp)
     {
-        var known = _apAgentTelemetry?.GetFor(_siteContext.Slug).FindClientByIp(clientIp);
+        var telemetry = _apAgentTelemetry?.GetFor(_siteContext.Slug);
+        if (telemetry == null) return null;
+
+        // Agents report stations by IPv4, so an IPv6 source is matched by its MAC instead
+        var known = telemetry.FindClientByIp(clientIp);
+        if (known == null && GatewayNeighborTable.IsResolvable(clientIp))
+        {
+            var mac = await _neighborTable.ResolveMacAsync(clientIp);
+            if (mac != null) known = telemetry.FindClientByMac(mac);
+        }
         if (known == null) return null;
 
         var identity = new ClientIdentity
         {
             Mac = known.ClientMac,
-            Name = known.Hostname,
+            Name = await KnownNameAsync(known.ClientMac) ?? known.Hostname,
             Hostname = known.Hostname,
             Ip = clientIp,
             IsWired = false,
@@ -468,6 +572,34 @@ public class ClientDashboardService
         await OverlayApAgentDataAsync(identity);
         await EnrichWithApInfoAsync(identity, identity.ApMac);
         return identity;
+    }
+
+    /// <summary>
+    /// The name UniFi Network shows for a client the console does not list yet: its cached display
+    /// name, else the name last logged for it. Null when neither has one, leaving the hostname.
+    /// </summary>
+    private async Task<string?> KnownNameAsync(string mac)
+    {
+        try
+        {
+            if (_connectionService.Client != null)
+            {
+                var names = await ClientDisplayNameCache.GetAsync(_connectionService.Client);
+                if (names.TryGetValue(mac, out var name)) return name;
+            }
+
+            await using var db = CreateSiteDb();
+            return await db.ClientSignalLogs
+                .Where(l => l.ClientMac == mac && l.DeviceName != null && l.DeviceName != "")
+                .OrderByDescending(l => l.Timestamp)
+                .Select(l => l.DeviceName)
+                .FirstOrDefaultAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "No stored name for {Mac}; using its hostname", mac);
+            return null;
+        }
     }
 
     /// <summary>
@@ -488,9 +620,11 @@ public class ClientDashboardService
             if (vpnType == null)
                 return null;
 
+            // The tailnet's own name for the device, where its device list or local status is read.
+            var peer = vpnType == HopType.Tailscale && _tailscale != null ? (await _tailscale.GetReadyAsync(_siteContext.Slug)).Peer(clientIp) : null;
             var name = vpnType switch
             {
-                HopType.Tailscale => "Tailscale Client",
+                HopType.Tailscale => peer?.Name ?? "Tailscale Client",
                 HopType.Teleport => "Teleport Client",
                 _ => "VPN Client"
             };
@@ -502,7 +636,8 @@ public class ClientDashboardService
                 Name = name,
                 Ip = clientIp,
                 IsWired = false,
-                VpnType = vpnType
+                VpnType = vpnType,
+                Tailnet = peer
             };
         }
         catch (Exception ex)
@@ -511,6 +646,7 @@ public class ClientDashboardService
             return null;
         }
     }
+
 
     /// <summary>
     /// Poll current signal quality for a client, run a trace, store the result, and return live data.
@@ -632,6 +768,7 @@ public class ClientDashboardService
             .Skip(skip)
             .Take(take)
             .ToListAsync();
+        var apNames = await CurrentDeviceNamesAsync();
 
         return logs.Select(l => new SignalHistoryEntry
         {
@@ -645,7 +782,7 @@ public class ClientDashboardService
             TxRateKbps = l.TxRateKbps,
             RxRateKbps = l.RxRateKbps,
             ApMac = l.ApMac,
-            ApName = l.ApName,
+            ApName = CurrentName(apNames, l.ApMac) ?? l.ApName,
             HopCount = l.HopCount,
             BottleneckLinkSpeedMbps = l.BottleneckLinkSpeedMbps,
             Latitude = l.Latitude,
@@ -677,6 +814,7 @@ public class ClientDashboardService
             .OrderBy(l => l.ClientMac)
             .ThenBy(l => l.Timestamp)
             .ToListAsync();
+        var apNames = await CurrentDeviceNamesAsync();
 
         // Deduplicate consecutive entries with same AP/band/channel/signal/position
         var result = new List<SignalMapPoint>();
@@ -694,7 +832,7 @@ public class ClientDashboardService
                 Band = l.Band,
                 Channel = l.Channel,
                 ApMac = l.ApMac,
-                ApName = l.ApName,
+                ApName = CurrentName(apNames, l.ApMac) ?? l.ApName,
                 ClientMac = l.ClientMac,
                 ClientIp = l.ClientIp,
                 DeviceName = l.DeviceName
@@ -789,6 +927,23 @@ public class ClientDashboardService
     }
 
     /// <summary>
+    /// Get a client's browser WAN speed tests (Client WAN Test, or Client Performance's WAN Test) by
+    /// MAC, within a time range. Kept apart from <see cref="GetSpeedResultsAsync"/>: they measure the
+    /// internet, so they join the Speed tab's results table but not its charts or map.
+    /// </summary>
+    public async Task<List<Iperf3Result>> GetWanSpeedResultsAsync(string mac, DateTime from, DateTime to)
+    {
+        await using var db = CreateSiteDb();
+        return await db.Iperf3Results
+            .Where(r => r.Direction == SpeedTestDirection.OpenSpeedTestWan
+                      && r.ClientMac == mac
+                      && r.TestTime >= from
+                      && r.TestTime <= to)
+            .OrderByDescending(r => r.TestTime)
+            .ToListAsync();
+    }
+
+    /// <summary>
     /// Get speed test results for a client by its source host/IP, within a time range.
     /// Used for VPN clients (Tailscale/Teleport/remote-user VPN), which have no UniFi MAC:
     /// their browser/iperf3 results store <c>DeviceHost</c> = the VPN IP and a null MAC,
@@ -854,16 +1009,7 @@ public class ClientDashboardService
             var localTimestamps = new HashSet<long>(
                 localEntries.Select(e => e.Timestamp.Ticks / TimeSpan.TicksPerMinute));
 
-            // Resolve AP names from device list for UniFi entries
-            Dictionary<string, string>? apNameCache = null;
-            try
-            {
-                var devices = await _connectionService.GetDiscoveredDevicesAsync();
-                apNameCache = devices
-                    .Where(d => !string.IsNullOrEmpty(d.Name))
-                    .ToDictionary(d => d.Mac.ToLowerInvariant(), d => d.Name, StringComparer.OrdinalIgnoreCase);
-            }
-            catch { /* Best-effort AP name resolution */ }
+            var apNameCache = await CurrentDeviceNamesAsync();
 
             // Add UniFi entries that don't overlap with local data
             foreach (var m in unifiMetrics)
@@ -881,9 +1027,7 @@ public class ClientDashboardService
                         _ => null
                     };
 
-                    string? apName = null;
-                    if (m.ApMac != null && apNameCache != null)
-                        apNameCache.TryGetValue(m.ApMac, out apName);
+                    var apName = CurrentName(apNameCache, m.ApMac);
 
                     localEntries.Add(new SignalHistoryEntry
                     {
@@ -912,6 +1056,31 @@ public class ClientDashboardService
 
         return localEntries;
     }
+
+    /// <summary>
+    /// Device name by MAC from the current device list, so history shows a renamed access point
+    /// by its name now. Empty when the list cannot be read; callers then keep the stored name.
+    /// </summary>
+    private async Task<IReadOnlyDictionary<string, string>> CurrentDeviceNamesAsync()
+    {
+        if (!_connectionService.IsConnected) return new Dictionary<string, string>();
+        try
+        {
+            var devices = await _connectionService.GetDiscoveredDevicesAsync();
+            return devices
+                .Where(d => !string.IsNullOrEmpty(d.Name) && !string.IsNullOrEmpty(d.Mac))
+                .GroupBy(d => d.Mac, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First().Name, StringComparer.OrdinalIgnoreCase);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Device names unavailable; history keeps its stored access point names");
+            return new Dictionary<string, string>();
+        }
+    }
+
+    private static string? CurrentName(IReadOnlyDictionary<string, string> names, string? mac) =>
+        mac != null && names.TryGetValue(mac, out var name) ? name : null;
 
     /// <summary>
     /// Get client connection events (connects, disconnects, roams) from UniFi controller.
@@ -1200,7 +1369,7 @@ public class ClientDashboardService
         {
             _lastApMacByClient.TryGetValue(mac, out var lastAp);
             var live = await _apAgentLive.PollAsync(
-                _siteContext.Slug, mac, lastAp, FollowerFor(mac), DateTime.UtcNow);
+                _siteContext.Slug, mac, lastAp, FollowerFor(mac), DateTime.UtcNow, AgentApFor(mac));
             if (live == null) return null;
 
             var update = ApAgentClientIdentityMapper.ToLiveIdentity(live.Client, live.ApMac);
@@ -1240,7 +1409,8 @@ public class ClientDashboardService
         {
             _lastApMacByClient.TryGetValue(identity.Mac, out var lastAp);
             var live = await _apAgentLive.PollAsync(
-                _siteContext.Slug, identity.Mac, lastAp ?? identity.ApMac, FollowerFor(identity.Mac), DateTime.UtcNow);
+                _siteContext.Slug, identity.Mac, lastAp ?? identity.ApMac, FollowerFor(identity.Mac), DateTime.UtcNow,
+                AgentApFor(identity.Mac));
             if (live == null) return;
 
             var update = ApAgentClientIdentityMapper.ToLiveIdentity(live.Client, live.ApMac);
@@ -1287,6 +1457,10 @@ public class ClientDashboardService
         target.HasApAgentData = true;
     }
 
+    /// <summary>The agent-covered access point the site's AP Agent membership holds this client on, or null.</summary>
+    private string? AgentApFor(string clientMac) =>
+        _apAgentTelemetry?.GetFor(_siteContext.Slug).FindClientByMac(clientMac)?.ApMac;
+
     /// <summary>This client's roam-follow state, capped so a long-lived circuit cannot grow it.</summary>
     private ApAgentRoamFollower FollowerFor(string clientMac)
     {
@@ -1317,7 +1491,8 @@ public class ClientDashboardService
         // Fetch WiFiman data only
         try
         {
-            var wifiman = await _connectionService.Client.GetWiFiManClientAsync(clientIp);
+            var wifiman = await _connectionService.Client.GetWiFiManClientAsync(
+                _consoleIpFor.TryGetValue(clientIp, out var consoleIp) ? consoleIp : clientIp);
             if (wifiman?.Signal == null)
                 return null;
 
@@ -1398,15 +1573,16 @@ public class ClientDashboardService
         return new ClientIdentity
         {
             Mac = client.Mac,
-            // Prefer UniFi's system-selected display name (v2 active-clients, e.g. a
-            // fingerprint-derived "Apple TV") over the raw stat/sta name, then the ucore device
-            // name, matching Client Stats/the map so an unnamed device never shows as a MAC.
-            Name = !string.IsNullOrEmpty(displayName) ? displayName
-                 : !string.IsNullOrEmpty(client.Name) ? client.Name
-                 : !string.IsNullOrEmpty(ucoreName) ? ucoreName : null,
+            // UniFi's display name (v2 active-clients, e.g. a fingerprint-derived "Apple TV"), then
+            // the alias, then the ucore device name, matching Client Stats and the map; a UniFi
+            // device's own app name wins unless UniFi OS passed it in hostname form.
+            Name = ClientNames.Choose(displayName, client.Name, ucoreName, client.Hostname, client.IsUniFiDevice,
+                hostnameFallback: false),
             Hostname = !string.IsNullOrEmpty(client.Hostname) ? client.Hostname : null,
-            Ip = client.Ip,
+            Ip = ResolveClientIp(client),
+            FixedIp = client.UseFixedIp && !string.IsNullOrEmpty(client.FixedIp) ? client.FixedIp : null,
             IsWired = client.IsWired,
+            IsProtectDevice = client.IsProtectDevice,
             SignalDbm = client.Signal,
             NoiseDbm = client.Noise,
             Channel = client.Channel,
@@ -1427,6 +1603,82 @@ public class ClientDashboardService
             SwitchMac = client.SwMac,
             SwitchPort = client.SwPort
         };
+    }
+
+    private static bool TryParseClientIp(string? value, out IPAddress? address)
+    {
+        if (!IPAddress.TryParse(value, out address)) return false;
+        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+        return !address.Equals(IPAddress.Any) && !address.Equals(IPAddress.IPv6Any);
+    }
+
+    private static string? FirstUsableIp(params string?[] addresses) =>
+        addresses.FirstOrDefault(value => TryParseClientIp(value, out _));
+
+    private static bool IpEquals(string? left, string? right) =>
+        TryParseClientIp(left, out var a) && TryParseClientIp(right, out var b) && a!.Equals(b);
+
+    private static bool HasConflictingCurrentIp(string mac, string requestedIp,
+        IEnumerable<UniFiClientResponse> clients, IEnumerable<UniFiClientDetailResponse> activeDetails)
+    {
+        if (!TryParseClientIp(requestedIp, out var requested)) return true;
+        return clients.Where(c => MacEquals(c.Mac, mac)).Select(c => c.Ip)
+            .Concat(activeDetails.Where(c => MacEquals(c.Mac, mac)).Select(c => c.Ip))
+            .Any(ip => TryParseClientIp(ip, out var current)
+                && current!.AddressFamily == requested!.AddressFamily && !current.Equals(requested));
+    }
+
+    internal static bool ClientDetailMatchesIp(UniFiClientDetailResponse client, string clientIp) =>
+        !string.IsNullOrWhiteSpace(client.Mac)
+        && IpEquals(FirstUsableIp(client.Ip, client.LastIp, client.FixedIp), clientIp);
+
+    internal static bool MacEquals(string? left, string? right) =>
+        !string.IsNullOrWhiteSpace(left) && !string.IsNullOrWhiteSpace(right)
+        && string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+
+    internal static ClientIdentity MapClientDetailToIdentity(
+        UniFiClientDetailResponse client,
+        string requestedIp)
+    {
+        return new ClientIdentity
+        {
+            Mac = client.Mac,
+            Name = !string.IsNullOrEmpty(client.DisplayName) ? client.DisplayName : client.Name,
+            Hostname = client.Hostname,
+            Ip = requestedIp,
+            FixedIp = client.UseFixedIp && !string.IsNullOrEmpty(client.FixedIp) ? client.FixedIp : null,
+            IsWired = client.IsWired
+                || string.Equals(client.Type, "WIRED", StringComparison.OrdinalIgnoreCase),
+            Oui = client.Oui,
+            NetworkName = client.NetworkName ?? client.LastConnectionNetworkName,
+            IsOffline = string.Equals(client.Status, "offline", StringComparison.OrdinalIgnoreCase),
+            FixedApEnabled = client.FixedApEnabled == true,
+            FixedApMac = client.FixedApMac
+        };
+    }
+
+    internal static bool ClientMatchesIp(
+        UniFiClientResponse client,
+        string clientIp,
+        IReadOnlyDictionary<string, string>? macToIpLookup = null)
+    {
+        return !string.IsNullOrWhiteSpace(client.Mac)
+            && IpEquals(ResolveClientIp(client, macToIpLookup), clientIp);
+    }
+
+    internal static string? ResolveClientIp(
+        UniFiClientResponse client,
+        IReadOnlyDictionary<string, string>? macToIpLookup = null)
+    {
+        if (TryParseClientIp(client.Ip, out _))
+            return client.Ip;
+
+        if (!string.IsNullOrEmpty(client.Mac)
+            && macToIpLookup?.TryGetValue(client.Mac, out var enrichedIp) == true
+            && TryParseClientIp(enrichedIp, out _))
+            return enrichedIp;
+
+        return FirstUsableIp(client.LastIp, client.FixedIp);
     }
 
     /// <summary>
@@ -1620,6 +1872,106 @@ public class ClientDashboardService
         }
     }
 
+    /// <summary>How far back the Throughput card reads the live samples, with a peak per window;
+    /// past it, the hourly usage rollup. A week on a busy client's live samples is about a second.</summary>
+    private static readonly TimeSpan RawThroughputHistoryReach = TimeSpan.FromDays(7);
+
+    /// <summary>The Throughput card's window for a range: roughly 120 to 170 points across it.</summary>
+    public static TimeSpan ThroughputHistoryWindow(TimeSpan span) =>
+        span <= TimeSpan.FromHours(1) ? TimeSpan.FromSeconds(30)
+        : span <= TimeSpan.FromHours(6) ? TimeSpan.FromMinutes(2)
+        : span <= TimeSpan.FromHours(24) ? TimeSpan.FromMinutes(10)
+        : TimeSpan.FromHours(1);
+
+    /// <summary>
+    /// The client's throughput over the last <paramref name="span"/>, one sample per window, for the
+    /// Throughput card's history view. Same sources and frame as <see cref="GetThroughputHistoryAsync"/>,
+    /// aggregated in the query. Past <see cref="RawThroughputHistoryReach"/> it reads the hourly rollup,
+    /// which keeps bytes alone, so those samples are hourly averages without a peak.
+    /// </summary>
+    public async Task<ThroughputHistory> GetThroughputWindowsAsync(ClientIdentity client, TimeSpan span)
+    {
+        var to = DateTime.UtcNow;
+        var from = to - span;
+        var window = ThroughputHistoryWindow(span);
+        var raw = span <= RawThroughputHistoryReach;
+        var history = new ThroughputHistory { From = from, To = to, WindowMs = window.TotalMilliseconds, HasPeaks = raw };
+        if (string.IsNullOrEmpty(client.Mac)) return history;
+        try
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            scope.ServiceProvider.GetRequiredService<SiteContextService>().OverrideSite(_siteContext.Slug);
+            var influx = scope.ServiceProvider.GetRequiredService<NetworkOptimizer.Storage.Services.MonitoringInfluxClient>();
+
+            List<string>? ifNames = null;
+            if (client.IsWired && !string.IsNullOrEmpty(client.SwitchMac) && client.SwitchPort is int port)
+                ifNames = (await PortIfNamesAsync(client.SwitchMac, port)).Where(n => !n.Contains('.')).ToList();
+
+            IReadOnlyList<NetworkOptimizer.Storage.Services.MonitoringInfluxClient.ThroughputWindowPoint> rows;
+            if (raw)
+            {
+                rows = ifNames is { Count: > 0 }
+                    ? await influx.QueryInterfaceRateWindowsAsync(client.SwitchMac!, ifNames, from, to, window)
+                    : Array.Empty<NetworkOptimizer.Storage.Services.MonitoringInfluxClient.ThroughputWindowPoint>();
+                if (rows.Count == 0)
+                    rows = await influx.QueryClientThroughputWindowsAsync(client.IsWired ? "wired_client" : "wifi_client", client.Mac, from, to, window);
+            }
+            else
+            {
+                // Bytes over the time the bucket covers: the hour in progress is not a whole hour yet.
+                var bytes = await LanUsageFromRollupAsync(influx, client, ifNames, from, to);
+                rows = bytes.Select(b =>
+                {
+                    var seconds = Math.Clamp((to - b.Time).TotalSeconds, 1, 3600);
+                    return new NetworkOptimizer.Storage.Services.MonitoringInfluxClient.ThroughputWindowPoint(
+                        b.Time, b.ToClientBytes * 8 / seconds, b.FromClientBytes * 8 / seconds, 0, 0);
+                }).ToList();
+            }
+
+            // The WAN share, bucketed on the same epoch-aligned windows. Between the first and last
+            // measured window a missing one is a covered idle client, so it reads zero, not a gap.
+            DateTime? rawFrom = null;
+            if (!raw && await influx.QueryLastClientWanRollupHourAsync() is { } lastRolled)
+                rawFrom = lastRolled.AddHours(1);
+            var wanPoints = raw
+                ? await influx.QueryClientWanUsageAsync(client.Mac, from, to, window)
+                : await MeasuredWanUsageAsync(influx, client.Mac, from, to, TimeSpan.FromHours(1), rawFrom);
+            long Key(DateTime t) => t.Ticks / window.Ticks;
+            var wan = wanPoints.GroupBy(w => Key(w.Time))
+                .ToDictionary(g => g.Key, g => (Down: g.Sum(w => w.DownBytes), Up: g.Sum(w => w.UpBytes)));
+            long? firstWan = wan.Count > 0 ? wan.Keys.Min() : null, lastWan = wan.Count > 0 ? wan.Keys.Max() : null;
+
+            foreach (var r in rows)
+            {
+                var key = Key(r.Time);
+                double? wanDown = null, wanUp = null;
+                if (wan.TryGetValue(key, out var w))
+                {
+                    // Over the part of the window the bytes cover: the raw read starts at from, and
+                    // both reads stop at now. A rolled hour is whole.
+                    var start = new DateTime(key * window.Ticks, DateTimeKind.Utc);
+                    if (raw && start < from) start = from;
+                    var end = new DateTime(key * window.Ticks, DateTimeKind.Utc) + window;
+                    if (end > to) end = to;
+                    var seconds = Math.Max(1, (end - start).TotalSeconds);
+                    wanDown = w.Down * 8 / seconds;
+                    wanUp = w.Up * 8 / seconds;
+                }
+                else if (key > firstWan && key < lastWan)
+                {
+                    wanDown = wanUp = 0;
+                }
+                history.Points.Add(new ThroughputWindowSample(r.Time, r.TxMeanBps, r.RxMeanBps,
+                    raw ? r.TxPeakBps : null, raw ? r.RxPeakBps : null, wanDown, wanUp));
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Throughput windows unavailable for {Mac}", client.Mac);
+        }
+        return history;
+    }
+
     /// <summary>
     /// The client's conntrack-measured WAN rate windows over a short span, for the live chart's
     /// WAN overlay history. Empty when the gateway feed has not covered the span.
@@ -1689,6 +2041,8 @@ public class ClientDashboardService
         var bucket = span <= TimeSpan.FromHours(2) ? TimeSpan.FromMinutes(5)
             : span <= TimeSpan.FromHours(48) ? TimeSpan.FromHours(1)
             : TimeSpan.FromDays(1);
+        // Day bars start at the viewer's midnight, the clock the chart draws in.
+        var dayZone = _displayTime?.Zone ?? TimeZoneInfo.Local;
         var usage = new ClientDataUsage { From = from, To = to, Bucket = bucket, LanIsPortTotal = client.IsWired };
         if (string.IsNullOrEmpty(client.Mac)) return usage;
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -1702,7 +2056,7 @@ public class ClientDashboardService
             if (_connectionService.IsConnected && _connectionService.Client != null)
             {
                 var rate = await _connectionService.Client.GetClientTrafficRateAsync(client.Mac, from, to);
-                usage.Wan = BucketTrafficRate(rate, bucket);
+                usage.Wan = BucketTrafficRate(rate, bucket, dayZone);
             }
         }
         catch (Exception ex)
@@ -1732,7 +2086,7 @@ public class ClientDashboardService
             if (coverage.Count > 0)
             {
                 var measured = await MeasuredWanUsageAsync(influx, client.Mac, from, to, bucket, rawFrom);
-                usage.Wan = InterleaveWanBuckets(usage.Wan, measured, coverage, bucket, to);
+                usage.Wan = InterleaveWanBuckets(usage.Wan, measured, coverage, bucket, to, dayZone);
             }
         }
         catch (Exception ex)
@@ -1761,14 +2115,12 @@ public class ClientDashboardService
             // source, and the counter scan reads the whole measurement (client_mac is a field).
             if (bucket >= TimeSpan.FromHours(1) && span <= TimeSpan.FromDays(7))
             {
-                var firstRolled = await influx.QueryFirstUsageRollupHourAsync(
-                    NetworkOptimizer.Storage.Services.MonitoringInfluxClient.RollupVersion);
-                if (firstRolled == null || firstRolled.Value > from.AddHours(1))
+                if (!await influx.UsageRollupReachesAsync(from))
                     points = await LanUsageFromCountersAsync(influx, client, ifNames, from, to, TimeSpan.FromHours(1));
             }
 
             var lan = points.Select(p => new UsageBucket(p.Time, p.ToClientBytes, p.FromClientBytes)).ToList();
-            usage.Lan = bucket >= TimeSpan.FromDays(1) ? SumToDays(lan, usage.Wan) : lan;
+            usage.Lan = bucket >= TimeSpan.FromDays(1) ? SumToDays(lan, usage.Wan, dayZone) : lan;
         }
         catch (Exception ex)
         {
@@ -1840,12 +2192,12 @@ public class ClientDashboardService
     /// Hourly buckets summed into days on the WAN series' own day edges, so the two charts line
     /// up bar for bar; <see cref="BucketStart"/> days when there is no WAN series to follow.
     /// </summary>
-    private static List<UsageBucket> SumToDays(List<UsageBucket> hourly, IReadOnlyList<UsageBucket> wanDays)
+    private static List<UsageBucket> SumToDays(List<UsageBucket> hourly, IReadOnlyList<UsageBucket> wanDays, TimeZoneInfo dayZone)
     {
         var edges = wanDays.Select(w => w.Time).OrderBy(t => t).ToList();
         DateTime EdgeFor(DateTime t)
         {
-            if (edges.Count == 0) return BucketStart(t, TimeSpan.FromDays(1));
+            if (edges.Count == 0) return BucketStart(t, TimeSpan.FromDays(1), dayZone);
             var idx = edges.FindLastIndex(e => e <= t);
             if (idx >= 0) return edges[idx];
             // Before the report's first day: the same day boundary, a day earlier.
@@ -1956,6 +2308,15 @@ public class ClientDashboardService
                     null, DpiCatalog.IconClass(u.Category, u.Application),
                     u.BytesReceived, u.BytesTransmitted, u.ActivitySeconds,
                     Note: "UniFi Network knows this application; our catalog has no name for it yet"))
+        // Two ids can share a name ("Apple" and the catalog's "Apple.com"): one row, its bytes summed. The
+        // largest row's category and icon stand; activity takes the longest, since the two overlap in time.
+        .GroupBy(r => r.Name, StringComparer.OrdinalIgnoreCase)
+        .Select(g => g.Count() == 1 ? g.First() : g.OrderByDescending(r => r.TotalBytes).First() with
+        {
+            DownloadBytes = g.Sum(r => r.DownloadBytes),
+            UploadBytes = g.Sum(r => r.UploadBytes),
+            ActivitySeconds = g.Max(r => r.ActivitySeconds),
+        })
         .OrderByDescending(r => r.TotalBytes)
         .ToList();
 
@@ -1982,9 +2343,10 @@ public class ClientDashboardService
         IReadOnlyList<NetworkOptimizer.Storage.Services.MonitoringInfluxClient.ClientWanPoint> measured,
         IReadOnlyDictionary<DateTime, long> coverageHours,
         TimeSpan bucket,
-        DateTime to)
+        DateTime to,
+        TimeZoneInfo dayZone)
     {
-        DateTime BucketOf(DateTime t) => BucketStart(t, bucket);
+        DateTime BucketOf(DateTime t) => BucketStart(t, bucket, dayZone);
 
         bool Covered(DateTime bucketStart)
         {
@@ -2045,11 +2407,11 @@ public class ClientDashboardService
         return result;
     }
 
-    public static List<UsageBucket> BucketTrafficRate(IEnumerable<UniFiTrafficRateBucket> rate, TimeSpan bucket)
+    public static List<UsageBucket> BucketTrafficRate(IEnumerable<UniFiTrafficRateBucket> rate, TimeSpan bucket, TimeZoneInfo dayZone)
     {
         return rate
             .Select(b => (Start: b.Time.AddSeconds(-b.IntervalSeconds), Bucket: b))
-            .GroupBy(x => BucketStart(x.Start, bucket), x => x.Bucket)
+            .GroupBy(x => BucketStart(x.Start, bucket, dayZone), x => x.Bucket)
             .Select(g => new UsageBucket(g.Key, g.Sum(b => b.DownloadBytes), g.Sum(b => b.UploadBytes)))
             .OrderBy(b => b.Time)
             .ToList();
@@ -2057,17 +2419,16 @@ public class ClientDashboardService
 
     /// <summary>
     /// The start of the bucket holding an instant. Sub-day buckets truncate on the UTC clock, which
-    /// every whole-hour zone shares. A day starts at local midnight in the server's zone (the clock
-    /// Firmware Rollout shows too): a UTC day drawn in a local clock lands its bars at 19:00.
+    /// every whole-hour zone shares. A day starts at midnight in <paramref name="dayZone"/>, the
+    /// viewer's clock: a UTC day drawn in a local clock lands its bars at 19:00.
     /// </summary>
-    internal static DateTime BucketStart(DateTime utc, TimeSpan bucket)
+    internal static DateTime BucketStart(DateTime utc, TimeSpan bucket, TimeZoneInfo dayZone)
     {
         if (bucket < TimeSpan.FromDays(1))
             return new DateTime(utc.Ticks - utc.Ticks % bucket.Ticks, DateTimeKind.Utc);
-        var tz = TimeZoneInfo.Local;
-        var midnight = TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(utc, DateTimeKind.Utc), tz).Date;
+        var midnight = TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(utc, DateTimeKind.Utc), dayZone).Date;
         // GetUtcOffset never throws on a skipped or repeated midnight, so one date is one key.
-        return new DateTimeOffset(midnight, tz.GetUtcOffset(midnight)).UtcDateTime;
+        return new DateTimeOffset(midnight, dayZone.GetUtcOffset(midnight)).UtcDateTime;
     }
 
     /// <summary>

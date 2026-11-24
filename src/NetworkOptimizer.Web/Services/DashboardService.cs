@@ -23,6 +23,7 @@ public class DashboardService : IDashboardService
     private readonly WiFiOptimizerService _wifiOptimizerService;
     private readonly MonitoringLiveStats _liveStats;
     private readonly Monitoring.RebootReason.DeviceRebootTracker _rebootTracker;
+    private readonly IDisplayTimeZone _displayTime;
 
     public DashboardService(
         ILogger<DashboardService> logger,
@@ -34,8 +35,10 @@ public class DashboardService : IDashboardService
         SiteContextService siteContext,
         WiFiOptimizerService wifiOptimizerService,
         MonitoringLiveStats liveStats,
-        Monitoring.RebootReason.DeviceRebootTracker rebootTracker)
+        Monitoring.RebootReason.DeviceRebootTracker rebootTracker,
+        IDisplayTimeZone displayTime)
     {
+        _displayTime = displayTime;
         _logger = logger;
         _connectionService = connectionService;
         _auditService = auditService;
@@ -200,31 +203,36 @@ public class DashboardService : IDashboardService
             data.SqmStatus = "Unknown";
         }
 
-        // Load Wi-Fi health score
+        return data;
+    }
+
+    /// <inheritdoc />
+    public async Task<DashboardWiFiHealth> GetWiFiHealthAsync()
+    {
         try
         {
             var healthScore = await _wifiOptimizerService.GetSiteHealthScoreAsync();
             if (healthScore != null)
             {
-                data.WiFiHealthScore = healthScore.OverallScore;
-                data.WiFiHealthGrade = healthScore.Grade;
-                data.WiFiHealthIssues = healthScore.Issues
-                    .Where(i => i.ShowOnOverview && !i.IsAcknowledged)
-                    .OrderByDescending(i => i.Severity)
-                    .Take(5)
-                    .ToList();
+                return new DashboardWiFiHealth(
+                    healthScore.OverallScore,
+                    healthScore.Grade,
+                    healthScore.Issues
+                        .Where(i => i.ShowOnOverview && !i.IsAcknowledged)
+                        .OrderByDescending(i => i.Severity)
+                        .Take(5)
+                        .ToList());
             }
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to load Wi-Fi health score");
         }
-
-        return data;
+        return DashboardWiFiHealth.None;
     }
 
-    private static string FormatRelativeTime(DateTime utcTime) =>
-        TimeFormatHelper.FormatRelativeTime(utcTime);
+    private string FormatRelativeTime(DateTime utcTime) =>
+        TimeFormatHelper.FormatRelativeTime(utcTime, _displayTime.Zone, _displayTime.Format);
 
     private static string FormatUptime(long? uptimeSeconds)
     {
@@ -255,11 +263,12 @@ public class DashboardData
     public string? ControllerType { get; set; }
     public string? LastError { get; set; }
     public List<DeviceInfo> Devices { get; set; } = new();
+}
 
-    // Wi-Fi health
-    public int? WiFiHealthScore { get; set; }
-    public string? WiFiHealthGrade { get; set; }
-    public List<HealthIssue> WiFiHealthIssues { get; set; } = new();
+/// <summary>The Dashboard's Wi-Fi health: the site score and its top Overview issues, or none.</summary>
+public sealed record DashboardWiFiHealth(int? Score, string? Grade, List<HealthIssue> Issues)
+{
+    public static DashboardWiFiHealth None => new(null, null, new List<HealthIssue>());
 }
 
 /// <summary>

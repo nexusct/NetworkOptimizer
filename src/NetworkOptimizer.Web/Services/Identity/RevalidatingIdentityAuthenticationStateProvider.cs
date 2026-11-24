@@ -30,6 +30,12 @@ public sealed class RevalidatingIdentityAuthenticationStateProvider
     /// </summary>
     private bool _membershipRefreshAsked;
 
+    /// <summary>
+    /// The same one-chance rule for a stale security stamp. Separate from the membership flag so one
+    /// branch's state never resets the other's.
+    /// </summary>
+    private bool _stampRefreshAsked;
+
     private readonly ILogger<RevalidatingIdentityAuthenticationStateProvider> _logger;
 
     public RevalidatingIdentityAuthenticationStateProvider(
@@ -67,6 +73,15 @@ public sealed class RevalidatingIdentityAuthenticationStateProvider
         if (!user.IsEnabled)
             return false;
 
+        // A signed-out login loses its circuits too. The cookie check refuses its HTTP requests, but a
+        // circuit opened before the sign-out holds its own principal and makes none.
+        await using (var scope = _scopeFactory.CreateAsyncScope())
+        {
+            var ended = scope.ServiceProvider.GetRequiredService<EndedSessionStore>();
+            if (await ended.IsEndedAsync(IdentityRegistration.LoginIdOf(principal)))
+                return false;
+        }
+
         // Security stamp covers credential/global-role/2FA/sign-out-everywhere revocation - but the
         // stamp on THIS PRINCIPAL is not the same question as the stamp on the browser's cookie, and
         // only the cookie decides whether the session is still good. Signing out everywhere rotates
@@ -81,9 +96,22 @@ public sealed class RevalidatingIdentityAuthenticationStateProvider
             var userStamp = await userManager.GetSecurityStampAsync(user);
             if (principalStamp != userStamp)
             {
+                // Asked once, like the membership refresh below: still stale on the next tick means the
+                // client dropped the navigation, and the circuit ends.
+                if (_stampRefreshAsked)
+                {
+                    _logger?.LogWarning(
+                        "Circuit for {User} still holds a stale security stamp after a revalidation was "
+                        + "issued; ending the session rather than asking again.",
+                        user.UserName);
+                    return false;
+                }
+
+                _stampRefreshAsked = true;
                 Revalidate();
                 return true;
             }
+            _stampRefreshAsked = false;
         }
 
         // Permissions changed since this cookie was issued. The account is still valid - only what it

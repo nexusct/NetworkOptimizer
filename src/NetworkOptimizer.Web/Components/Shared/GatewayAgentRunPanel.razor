@@ -21,7 +21,7 @@
             }
             else if (_run.Status == GatewayAgentInstallStatus.Succeeded)
             {
-                <span class="gw-run-ok">&#x2713;</span>
+                <span class="gw-run-ok"><AppIcon Name="check" /></span>
                 <span>@(_run.IsUpgrade
                     ? "Finished - the agent restarted on the new binary."
                     : "Finished - the agent is installed and should come Online within a minute or two.")</span>
@@ -30,9 +30,14 @@
             {
                 <span>Canceled. Safe to run again - the installer picks up cleanly and keeps the agent's enrollment.</span>
             }
+            else if (UntrustedCertificate)
+            {
+                <span class="gw-run-fail"><AppIcon Name="close" /></span>
+                <span>The gateway does not trust the server's certificate. If you issued it yourself, select Accept a self-signed certificate and run it again.</span>
+            }
             else
             {
-                <span class="gw-run-fail">&#x2715;</span>
+                <span class="gw-run-fail"><AppIcon Name="close" /></span>
                 @* Error first: a failure can carry both a message and an exit code (the
                    no-output guard), and the message is the one that says what to do. *@
                 <span>@(_run.Error
@@ -45,13 +50,31 @@
     </div>
 }
 
-@if (_available && ShowRunButton)
+@if (_checking && ShowRunButton)
+{
+    <div class="gw-run-action gw-run-checking">
+        <span class="spinner spinner-sm"></span>
+    </div>
+}
+else if (_available && ShowRunButton)
 {
     <div class="gw-run-action">
         <button type="button" class="btn btn-primary btn-sm" @onclick="Start">
             @(_run == null ? "Run It for Me" : "Run It Again")
         </button>
-        <span class="gw-run-hint">Runs this @(IsUpgrade ? "upgrade" : "install") command on the gateway over SSH and shows the output here.</span>
+        @* Offered only after the installer itself found the certificate untrusted, never up front:
+           --insecure turns off certificate checks for the agent's whole connection. *@
+        @if (UntrustedCertificate || _insecure)
+        {
+            <label class="checkbox-label">
+                <input type="checkbox" @bind="_insecure" />
+                <span>Accept a self-signed certificate <span class="gw-run-flag">(--insecure)</span></span>
+            </label>
+        }
+        else
+        {
+            <span class="gw-run-hint">Runs this @(IsUpgrade ? "upgrade" : "install") command on the gateway over SSH and shows the output here.</span>
+        }
     </div>
 }
 
@@ -66,6 +89,16 @@
         align-items: center;
         gap: 0.75rem;
         margin: 0.5rem 0;
+    }
+
+    /* Holds the button row's height (btn-sm) so the button does not shift the page in. */
+    .gw-run-checking {
+        min-height: 28px;
+    }
+
+    /* A narrow row wraps before the flag, never inside its double hyphen. */
+    .gw-run-flag {
+        white-space: nowrap;
     }
 
     .gw-run-hint {
@@ -84,6 +117,10 @@
         margin-bottom: 0.5rem;
         color: var(--text-secondary);
         font-size: 0.85rem;
+    }
+
+    .gw-run-status .btn {
+        flex-shrink: 0;
     }
 
     .gw-run-ok {
@@ -115,7 +152,12 @@
     [Parameter]
     public string? EnrollmentToken { get; set; }
 
+    /// <summary>Whether the install command carries --lan-speed-test (ignored for an upgrade).</summary>
+    [Parameter]
+    public bool LanSpeedTest { get; set; }
+
     private bool _available;
+    private bool _checking = true;
     private bool _startedHere;
     private GatewayAgentInstallRun? _run;
 
@@ -128,21 +170,34 @@
             && !(_run.Status == GatewayAgentInstallStatus.Succeeded && _startedHere));
     private GatewayAgentInstallRun? _subscribed;
     private string? _message;
+    private bool _insecure;
+
+    private bool UntrustedCertificate => _run?.StoppedOnUntrustedCertificate == true;
     private int _renderPending;
     private bool _disposed;
 
     protected override async Task OnInitializedAsync()
     {
         if (string.IsNullOrWhiteSpace(SiteSlug))
+        {
+            _checking = false;
             return;
+        }
 
         // A run from earlier in the process (finished, or still going after a navigation)
-        // renders immediately; the button waits for the availability gate to resolve so it
-        // never flashes in and disables.
-        _run = await GatewayInstall.GetRunAsync(SiteSlug);
-        if (_run != null)
-            Subscribe(_run);
-        _available = await GatewayInstall.IsAvailableAsync(SiteSlug);
+        // renders immediately; the button's row spins until the availability gate resolves,
+        // so the button never pops in late or flashes in and disables.
+        try
+        {
+            _run = await GatewayInstall.GetRunAsync(SiteSlug);
+            if (_run != null)
+                Subscribe(_run);
+            _available = await GatewayInstall.IsAvailableAsync(SiteSlug);
+        }
+        finally
+        {
+            _checking = false;
+        }
     }
 
     private void Start()
@@ -151,7 +206,7 @@
         var prior = _run;
         var task = IsUpgrade
             ? GatewayInstall.RunUpgradeAsync(SiteSlug, OnRunStarted)
-            : GatewayInstall.RunInstallAsync(SiteSlug, EnrollmentToken ?? "", OnRunStarted);
+            : GatewayInstall.RunInstallAsync(SiteSlug, EnrollmentToken ?? "", LanSpeedTest, _insecure, OnRunStarted);
         _ = ObserveAsync(task, prior);
     }
 

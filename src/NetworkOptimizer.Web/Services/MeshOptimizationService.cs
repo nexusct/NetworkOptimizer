@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using NetworkOptimizer.WiFi.Models;
 
 namespace NetworkOptimizer.Web.Services;
 
@@ -13,6 +14,7 @@ namespace NetworkOptimizer.Web.Services;
 public class MeshOptimizationService : IMeshOptimizationService
 {
     private readonly UniFiSshService _ssh;
+    private readonly Ssh.DeviceSshRouterRegistry _sshRouters;
     private readonly SiteContextService _siteContext;
     private readonly Licensing.LicenseStateService _licenseState;
     private readonly ILogger<MeshOptimizationService> _logger;
@@ -23,6 +25,12 @@ public class MeshOptimizationService : IMeshOptimizationService
     /// reads, stopping early once it lands on a new parent.
     /// </summary>
     private const int RoamPollAttempts = 7;
+
+    /// <summary>
+    /// An MLO backhaul roams well after the scan (22-37 s seen on a U7), past the window above,
+    /// so it gets a longer one. Non-MLO keeps <see cref="RoamPollAttempts"/>.
+    /// </summary>
+    private const int MloRoamPollAttempts = 20;
 
     /// <summary>Delay between post-scan link reads (also the initial settle after the scan).</summary>
     private static readonly TimeSpan RoamPollInterval = TimeSpan.FromSeconds(3);
@@ -35,11 +43,13 @@ public class MeshOptimizationService : IMeshOptimizationService
 
     public MeshOptimizationService(
         UniFiSshService ssh,
+        Ssh.DeviceSshRouterRegistry sshRouters,
         SiteContextService siteContext,
         Licensing.LicenseStateService licenseState,
         ILogger<MeshOptimizationService> logger)
     {
         _ssh = ssh;
+        _sshRouters = sshRouters;
         _siteContext = siteContext;
         _licenseState = licenseState;
         _logger = logger;
@@ -52,8 +62,9 @@ public class MeshOptimizationService : IMeshOptimizationService
     /// <param name="host">The AP's IP/host for SSH.</param>
     /// <param name="iface">The STA backhaul interface (e.g. "vwiresta7").</param>
     /// <param name="apName">AP display name, used only for log/message context.</param>
+    /// <param name="apMac">The AP's MAC, which the SSH router keys its credential route on.</param>
     public async Task<MeshOptimizationResult> OptimizeAsync(
-        string? host, string? iface, string? apName, CancellationToken cancellationToken = default)
+        string? host, string? iface, string? apName, string? apMac, CancellationToken cancellationToken = default)
     {
         if (!_licenseState.IsSiteOperational(_siteContext.Slug))
         {
@@ -64,13 +75,18 @@ public class MeshOptimizationService : IMeshOptimizationService
         if (string.IsNullOrWhiteSpace(host))
             return MeshOptimizationResult.NoOp(iface, "This AP has no reachable address.");
 
-        // The action runs over the shared UniFi device SSH credentials. Without them every
-        // wpa_cli call just fails with a generic error, so check up front and point the user at
-        // where to set it up.
+        // The router picks the credentials, so an Express (UX, UX7) adopted as an AP that refuses Device SSH
+        // falls back to Gateway SSH. A mesh child is always an access point.
+        var target = new Ssh.DeviceSshTarget(apMac ?? "", host, NetworkOptimizer.Core.Enums.DeviceType.AccessPoint);
+
+        // Without Device SSH every wpa_cli call fails with a generic error, so point the user at
+        // where to set it up. Checked after settling the route: an Express (UX, UX7) adopted as an AP is still
+        // a console, so it takes the console's root login (Gateway SSH) and needs no Device SSH.
+        var route = await _sshRouters.GetFor(_siteContext.Slug).SettleAsync(target, cancellationToken);
         var sshSettings = await _ssh.GetSettingsAsync();
         var sshConfigured = !string.IsNullOrEmpty(sshSettings.Username) &&
             (!string.IsNullOrEmpty(sshSettings.Password) || !string.IsNullOrEmpty(sshSettings.PrivateKeyPath));
-        if (!sshConfigured)
+        if (!sshConfigured && route == Ssh.SshCredentialRoute.DeviceCredentials)
             return MeshOptimizationResult.NoOp(iface, "Set up UniFi Device SSH in Settings to re-pair the uplink.");
 
         // UniFi does not always report a mesh child's own uplink - after a parent reboots it can
@@ -79,7 +95,7 @@ public class MeshOptimizationService : IMeshOptimizationService
         // reporting gap disable the action.
         if (string.IsNullOrWhiteSpace(iface) || !ValidStaIface.IsMatch(iface))
         {
-            iface = await DiscoverStaInterfaceAsync(host, cancellationToken);
+            iface = await DiscoverStaInterfaceAsync(target, cancellationToken);
             if (iface == null)
                 return MeshOptimizationResult.NoOp(null, "This AP isn't a wireless mesh child.");
 
@@ -97,14 +113,18 @@ public class MeshOptimizationService : IMeshOptimizationService
             $"do [ -S \"$d/{iface}\" ] && {{ printf %s \"$d\"; break; }}; done)\"";
         var wc = $"wpa_cli -p {ctrlDir} -i {iface}";
 
-        var before = await ReadLinkAsync(host, wc, cancellationToken);
+        var before = await ReadLinkAsync(target, wc, cancellationToken);
         if (before.Bssid == null)
         {
             _logger.LogDebug("[MeshOptimize] {Ap}: could not read backhaul status on {Iface}", apName, iface);
             return MeshOptimizationResult.Failed(iface, "Couldn't read the mesh backhaul status.");
         }
 
-        var (scanOk, _) = await _ssh.RunCommandAsync(host, $"{wc} scan", cancellationToken: cancellationToken);
+        var beforeMloLinks = await ReadMloLinksAsync(target, before, cancellationToken);
+        if (beforeMloLinks.Count > 0)
+            before = before with { Rssi = beforeMloLinks.Max(l => l.Rssi) };
+
+        var (scanOk, _) = await Run(target, $"{wc} scan", cancellationToken);
         if (!scanOk)
             return MeshOptimizationResult.Failed(iface, "Couldn't start the backhaul scan.");
 
@@ -113,9 +133,10 @@ public class MeshOptimizationService : IMeshOptimizationService
         // and wrongly reports "already on best", so poll the link and stop as soon as the BSSID
         // changes (or the window closes). Reads during the blip can come back empty; keep the last
         // good one.
-        (string? Bssid, int? Rssi, int? LinkSpeedMbps) after = (null, null, null);
+        var after = new LinkRead(null, null, null, null);
         var moved = false;
-        for (var attempt = 0; attempt < RoamPollAttempts; attempt++)
+        var pollAttempts = before.ApMld != null ? MloRoamPollAttempts : RoamPollAttempts;
+        for (var attempt = 0; attempt < pollAttempts; attempt++)
         {
             try
             {
@@ -126,11 +147,11 @@ public class MeshOptimizationService : IMeshOptimizationService
                 return MeshOptimizationResult.Failed(iface, "Mesh optimization was cancelled.");
             }
 
-            var read = await ReadLinkAsync(host, wc, cancellationToken);
+            var read = await ReadLinkAsync(target, wc, cancellationToken);
             if (read.Bssid == null) continue;
 
             after = read;
-            if (!string.Equals(read.Bssid, before.Bssid, StringComparison.OrdinalIgnoreCase))
+            if (IsNewParent(before, read))
             {
                 moved = true;
                 break;
@@ -152,6 +173,13 @@ public class MeshOptimizationService : IMeshOptimizationService
             };
         }
 
+        var afterMloLinks = await ReadMloLinksAsync(target, after, cancellationToken);
+        if (afterMloLinks.Count > 0)
+            after = after with { Rssi = afterMloLinks.Max(l => l.Rssi) };
+        // An MLO link with no fresh scan entry has no signal to report; non-MLO keeps "signal unknown".
+        var signal = afterMloLinks.Count > 0 ? DescribeLinks(afterMloLinks) : after.ApMld != null ? null : Describe(after.Rssi);
+        var suffix = signal != null ? $" ({signal})" : "";
+
         var result = new MeshOptimizationResult
         {
             Iface = iface,
@@ -163,50 +191,111 @@ public class MeshOptimizationService : IMeshOptimizationService
             Action = moved ? "moved" : "noop",
             Ok = true,
             Message = moved
-                ? $"Moved to a stronger parent ({Describe(after.Rssi)})."
-                : $"Already on the best parent ({Describe(after.Rssi)})."
+                ? $"Moved to a stronger parent{suffix}."
+                : $"Already on the best parent{suffix}."
         };
 
         _logger.LogInformation(
-            "[MeshOptimize] {Ap} ({Iface}): {Action} {BeforeBssid}({BeforeRssi}) -> {AfterBssid}({AfterRssi})",
-            apName, iface, result.Action, before.Bssid, before.Rssi, after.Bssid, after.Rssi);
+            "[MeshOptimize] {Ap} ({Iface}): {Action} {BeforeBssid}({BeforeRssi}) -> {AfterBssid}({AfterRssi}) mld {BeforeMld} -> {AfterMld}{Links}",
+            apName, iface, result.Action, before.Bssid, before.Rssi, after.Bssid, after.Rssi,
+            before.ApMld ?? "-", after.ApMld ?? "-", afterMloLinks.Count > 0 ? $" links {signal}" : "");
 
         return result;
     }
+
+    /// <summary>
+    /// An MLO backhaul names its parent by the AP MLD address; the link BSSID in status is one
+    /// link of that parent and can change without a roam. Non-MLO links compare BSSIDs.
+    /// </summary>
+    private static bool IsNewParent(LinkRead before, LinkRead after) =>
+        before.ApMld != null && after.ApMld != null
+            ? !string.Equals(before.ApMld, after.ApMld, StringComparison.OrdinalIgnoreCase)
+            : !string.Equals(before.Bssid, after.Bssid, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Per-link signal for an MLO backhaul, where signal_poll returns FAIL. Each link is its own
+    /// vwiresta interface with its own supplicant, so each is asked for the scan-cache entry
+    /// (<c>bss</c>) of its own BSSID. Empty for a non-MLO link, or one whose signal_poll already
+    /// reported RSSI, so that path is unchanged.
+    /// </summary>
+    private async Task<List<(RadioBand Band, int Rssi)>> ReadMloLinksAsync(
+        Ssh.DeviceSshTarget target, LinkRead link, CancellationToken cancellationToken)
+    {
+        if (link.ApMld == null || link.Rssi != null)
+            return [];
+
+        const string command =
+            "for i in $(ls /sys/class/net 2>/dev/null | grep -x 'vwiresta[0-9]*'); do " +
+            "d=\"$(for d in /var/run/wpa_supplicant/wpa_supplicant-$i /var/run/wpa_supplicant; " +
+            "do [ -S \"$d/$i\" ] && { printf %s \"$d\"; break; }; done)\"; [ -n \"$d\" ] || continue; " +
+            "b=$(wpa_cli -p \"$d\" -i $i status | sed -n 's/^bssid=//p'); echo '#bss'; " +
+            "[ -n \"$b\" ] && wpa_cli -p \"$d\" -i $i bss \"$b\"; done";
+
+        var (ok, output) = await Run(target, command, cancellationToken);
+        if (!ok || string.IsNullOrWhiteSpace(output))
+        {
+            _logger.LogDebug("[MeshOptimize] MLO link read failed (ok={Ok}, empty={Empty})", ok, string.IsNullOrWhiteSpace(output));
+            return [];
+        }
+
+        var links = new List<(RadioBand Band, int Rssi)>();
+        foreach (var block in output.Split("#bss", StringSplitOptions.RemoveEmptyEntries))
+        {
+            // The level is from the last scan, not the live link: only the link just scanned is current.
+            var mld = MatchValue(block, @"(?im)^ap_mld_addr=([0-9a-f:]{17})");
+            var freq = MatchInt(block, @"(?im)^freq=(\d+)");
+            var level = MatchInt(block, @"(?im)^level=(-?\d+)");
+            var age = MatchInt(block, @"(?im)^age=(\d+)");
+            if (string.Equals(mld, link.ApMld, StringComparison.OrdinalIgnoreCase)
+                && freq is > 0 && level is < 0 && age is <= MaxBssAgeSeconds)
+                links.Add((RadioBandExtensions.FromFrequencyMhz(freq.Value), level.Value));
+            else
+                _logger.LogDebug("[MeshOptimize] MLO link skipped: mld={Mld} freq={Freq} level={Level} age={Age} (want mld {Want})",
+                    mld ?? "-", freq, level, age, link.ApMld);
+        }
+        return links;
+    }
+
+    /// <summary>Oldest scan-cache entry still reported as a link's signal.</summary>
+    private const int MaxBssAgeSeconds = 60;
 
     /// <summary>
     /// The AP's own STA backhaul interface, read off the device. A wired AP has none, which is how
     /// this also answers "is it actually a mesh child" when UniFi will not say. Both wpa_supplicant
     /// layouts are searched, the same pair the control socket is probed in below.
     /// </summary>
-    /// <param name="host">AP address.</param>
+    /// <param name="target">The AP.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
-    private async Task<string?> DiscoverStaInterfaceAsync(string host, CancellationToken cancellationToken)
+    private async Task<string?> DiscoverStaInterfaceAsync(Ssh.DeviceSshTarget target, CancellationToken cancellationToken)
     {
-        var (ok, output) = await _ssh.RunCommandAsync(
-            host,
-            "ls /sys/class/net 2>/dev/null | grep -x 'vwiresta[0-9]*' | head -1",
-            cancellationToken: cancellationToken);
+        var (ok, output) = await Run(
+            target, "ls /sys/class/net 2>/dev/null | grep -x 'vwiresta[0-9]*' | head -1", cancellationToken);
 
         if (!ok) return null;
         var name = output?.Trim().Split('\n', '\r').FirstOrDefault()?.Trim();
         return !string.IsNullOrEmpty(name) && ValidStaIface.IsMatch(name) ? name : null;
     }
 
+    /// <summary>One read of the backhaul link. <c>ApMld</c> is set only on an MLO backhaul.</summary>
+    private sealed record LinkRead(string? Bssid, int? Rssi, int? LinkSpeedMbps, string? ApMld);
+
     /// <summary>Read the current backhaul BSSID and RSSI in a single SSH round trip.</summary>
-    private async Task<(string? Bssid, int? Rssi, int? LinkSpeedMbps)> ReadLinkAsync(
-        string host, string wc, CancellationToken cancellationToken)
+    private async Task<LinkRead> ReadLinkAsync(
+        Ssh.DeviceSshTarget target, string wc, CancellationToken cancellationToken)
     {
-        var (ok, output) = await _ssh.RunCommandAsync(
-            host, $"{wc} status; {wc} signal_poll", cancellationToken: cancellationToken);
+        var (ok, output) = await Run(target, $"{wc} status; {wc} signal_poll", cancellationToken);
         if (!ok || string.IsNullOrWhiteSpace(output))
-            return (null, null, null);
+            return new LinkRead(null, null, null, null);
 
         var bssid = MatchValue(output, @"(?im)^bssid=([0-9a-f:]{17})");
         var rssi = MatchInt(output, @"(?im)^RSSI=(-?\d+)");
         var linkSpeed = MatchInt(output, @"(?im)^LINKSPEED=(\d+)");
-        return (bssid, rssi, linkSpeed);
+        var apMld = MatchValue(output, @"(?im)^mlo_ap_mld=([0-9a-f:]{17})");
+        return new LinkRead(bssid, rssi, linkSpeed, apMld);
     }
+
+    private Task<(bool success, string output)> Run(Ssh.DeviceSshTarget target, string command, CancellationToken ct) =>
+        _sshRouters.GetFor(_siteContext.Slug).RunAsync(target, command, null, ct);
 
     private static string? MatchValue(string text, string pattern)
     {
@@ -221,6 +310,9 @@ public class MeshOptimizationService : IMeshOptimizationService
     }
 
     private static string Describe(int? rssi) => rssi.HasValue ? $"{rssi} dBm" : "signal unknown";
+
+    private static string DescribeLinks(List<(RadioBand Band, int Rssi)> links) =>
+        string.Join(", ", links.OrderByDescending(l => l.Band).Select(l => $"{l.Band.ToDisplayString()} {l.Rssi} dBm"));
 }
 
 /// <summary>Outcome of a mesh backhaul re-scan. Returned to the page; not shown raw to the user.</summary>

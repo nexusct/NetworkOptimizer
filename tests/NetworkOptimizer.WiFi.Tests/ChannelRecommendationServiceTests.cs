@@ -325,6 +325,37 @@ public class ChannelRecommendationServiceTests
     }
 
     [Fact]
+    public void BuildInterferenceGraph_SsidsOfOneNeighborRadio_CountOnce()
+    {
+        var aps = new List<AccessPointSnapshot>
+        {
+            CreateAp("aa:bb:cc:dd:ee:01", "AP-1", RadioBand.Band5GHz, 36)
+        };
+
+        ChannelScanResult Scan(params NeighborNetwork[] neighbors) => new()
+        {
+            ApMac = "aa:bb:cc:dd:ee:01",
+            Band = RadioBand.Band5GHz,
+            Neighbors = neighbors.ToList()
+        };
+
+        // One radio with three SSIDs (the last hidden), against the same radio with one SSID.
+        var three = _service.BuildInterferenceGraph(aps, RadioBand.Band5GHz, null, new List<ChannelScanResult>
+        {
+            Scan(
+                new NeighborNetwork { Bssid = "00:11:22:33:44:50", Ssid = "Main", Channel = 36, Signal = -60 },
+                new NeighborNetwork { Bssid = "02:11:22:33:44:50", Ssid = "Guest", Channel = 36, Signal = -61 },
+                new NeighborNetwork { Bssid = "06:11:22:33:44:50", Ssid = "", Channel = 36, Signal = -62 })
+        }, null);
+        var one = _service.BuildInterferenceGraph(aps, RadioBand.Band5GHz, null, new List<ChannelScanResult>
+        {
+            Scan(new NeighborNetwork { Bssid = "00:11:22:33:44:50", Ssid = "Main", Channel = 36, Signal = -60 })
+        }, null);
+
+        three.ExternalLoad[0][36].Should().BeApproximately(one.ExternalLoad[0][36], 0.0001);
+    }
+
+    [Fact]
     public void BuildInterferenceGraph_OwnNetworkNeighbors_Excluded()
     {
         var aps = new List<AccessPointSnapshot>
@@ -348,6 +379,38 @@ public class ChannelRecommendationServiceTests
         var graph = _service.BuildInterferenceGraph(aps, RadioBand.Band5GHz, null, scans, null);
 
         graph.ExternalLoad[0].Should().BeEmpty();
+    }
+
+    [Fact]
+    public void BuildInterferenceGraph_NeighborUniFiAp_CountsAndOwnMeshVap_Excluded()
+    {
+        var aps = new List<AccessPointSnapshot>
+        {
+            CreateAp("aa:bb:cc:dd:ee:01", "AP-1", RadioBand.Band5GHz, 36),
+            CreateAp("aa:bb:cc:dd:ee:10", "AP-2", RadioBand.Band5GHz, 149)
+        };
+        // A neighbor's UniFi AP (is_ubnt in the scan, not ours) and AP-2's mesh VAP, which no vap_table lists.
+        var neighborUniFi = new NeighborNetwork { Bssid = "ac:bb:cc:00:00:01", Channel = 36, Signal = -60 };
+        var ownMesh = new NeighborNetwork { Bssid = "0a:bb:cc:dd:ee:12", Ssid = "vwire-0123456789abcdef", Channel = 44, Signal = -50 };
+        var lookup = SiteBssidLookup.Build(aps);
+        lookup.Stamp(neighborUniFi);
+        lookup.Stamp(ownMesh);
+
+        var scans = new List<ChannelScanResult>
+        {
+            new()
+            {
+                ApMac = "aa:bb:cc:dd:ee:01",
+                Band = RadioBand.Band5GHz,
+                Neighbors = new() { neighborUniFi, ownMesh }
+            }
+        };
+
+        var graph = _service.BuildInterferenceGraph(aps, RadioBand.Band5GHz, null, scans, null);
+
+        graph.ExternalLoad[0].Should().ContainKey(36);
+        graph.ExternalLoad[0][36].Should().BeGreaterThan(0);
+        graph.ExternalLoad[0].Should().NotContainKey(44);
     }
 
     [Fact]
@@ -2237,6 +2300,86 @@ public class ChannelRecommendationServiceTests
         }
     }
 
+    /// <summary>
+    /// Four 2.4 GHz APs, weights as measured on a real site. The best plan rotates three of them:
+    /// A (6 -> 11) gains little itself but vacates ch6 for B (1 -> 6), whose ch1 is jammed, and B
+    /// vacates ch1 for C (6 -> 1). D holds ch11 and hears B, so B cannot escape to ch11 on its own.
+    /// </summary>
+    private InterferenceGraph EnablerGraph(double aExternalOn11)
+    {
+        var aps = new List<AccessPointSnapshot>
+        {
+            CreateAp("aa:bb:cc:dd:ee:01", "AP-A", RadioBand.Band2_4GHz, 6, width: 20),
+            CreateAp("aa:bb:cc:dd:ee:02", "AP-B", RadioBand.Band2_4GHz, 1, width: 20),
+            CreateAp("aa:bb:cc:dd:ee:03", "AP-C", RadioBand.Band2_4GHz, 6, width: 20),
+            CreateAp("aa:bb:cc:dd:ee:04", "AP-D", RadioBand.Band2_4GHz, 11, width: 20)
+        };
+        var graph = _service.BuildInterferenceGraph(aps, RadioBand.Band2_4GHz, null, null, null);
+        for (int a = 0; a < 4; a++)
+        {
+            for (int b = 0; b < 4; b++)
+            {
+                graph.InternalWeights[a, b] = 0;
+                graph.DirectionalWeights[a, b] = 0;
+            }
+            graph.DirectlyObservedChannels[a] = new() { 1, 6, 11 };
+        }
+        void Hear(int a, int b, double w)
+        {
+            graph.InternalWeights[a, b] = graph.InternalWeights[b, a] = w;
+            graph.DirectionalWeights[a, b] = graph.DirectionalWeights[b, a] = w;
+        }
+        Hear(0, 1, 0.844);
+        Hear(1, 2, 0.75);
+        Hear(2, 3, 0.719);
+        Hear(1, 3, 0.375);
+        Hear(0, 3, 0.094);
+        Hear(0, 2, 0.156);
+        graph.ExternalLoad[0] = new() { { 1, 6.0 }, { 6, 2.5 }, { 11, aExternalOn11 } };
+        graph.ExternalLoad[1] = new() { { 1, 5.0 }, { 6, 1.0 }, { 11, 3.0 } };
+        graph.ExternalLoad[2] = new() { { 1, 1.5 }, { 6, 3.0 }, { 11, 3.0 } };
+        graph.ExternalLoad[3] = new() { { 1, 3.0 }, { 6, 3.0 }, { 11, 1.0 } };
+        return graph;
+    }
+
+    [Fact]
+    public void Optimize_SmallGainMoveThatEnablesNeighbors_IsKept()
+    {
+        // A's own gain on ch11 is far under the per-AP gate. Vetoing it put B back on A's channel
+        // and the whole plan collapsed; it is kept because the plan it unlocks clears the band's bar.
+        var plan = _service.Optimize(EnablerGraph(aExternalOn11: 2.4), RadioBand.Band2_4GHz, null);
+
+        var byName = plan.Recommendations.ToDictionary(r => r.ApName);
+        byName["AP-A"].RecommendedChannel.Should().Be(11);
+        byName["AP-B"].RecommendedChannel.Should().Be(6);
+        byName["AP-C"].RecommendedChannel.Should().Be(1);
+        foreach (var rec in plan.Recommendations.Where(r => r.IsChanged))
+            rec.RecommendedScore.Should().BeLessThan(rec.CurrentScore, $"{rec.ApName} must improve, A included");
+    }
+
+    [Fact]
+    public void Optimize_SmallGainMoveThatMakesTheApWorse_IsNotKept()
+    {
+        // Same layout, but ch11 is worse for A than ch6: A is never moved for its neighbors' sake.
+        var plan = _service.Optimize(EnablerGraph(aExternalOn11: 5.0), RadioBand.Band2_4GHz, null);
+
+        plan.Recommendations.Single(r => r.ApName == "AP-A").RecommendedChannel.Should().Be(6);
+    }
+
+    [Fact]
+    public void Optimize_SmallGainMoveNothingDependsOn_IsStillVetoed()
+    {
+        // A lone AP with a slightly quieter channel: no neighbor needs it to move, so the gate holds.
+        var aps = new List<AccessPointSnapshot> { CreateAp("aa:bb:cc:dd:ee:01", "AP-A", RadioBand.Band2_4GHz, 6, width: 20) };
+        var graph = _service.BuildInterferenceGraph(aps, RadioBand.Band2_4GHz, null, null, null);
+        graph.DirectlyObservedChannels[0] = new() { 1, 6, 11 };
+        graph.ExternalLoad[0] = new() { { 1, 6.0 }, { 6, 2.5 }, { 11, 2.4 } };
+
+        var plan = _service.Optimize(graph, RadioBand.Band2_4GHz, null);
+
+        plan.Recommendations.Single().RecommendedChannel.Should().Be(6);
+    }
+
     // --- Soak-period suppression ---
 
     /// <summary>
@@ -2564,6 +2707,72 @@ public class ChannelRecommendationServiceTests
         recA.IsSoaking.Should().BeTrue();
         recB.RecommendedChannel.Should().NotBe(1,
             "no AP should be moved onto the channel another AP is soaking on");
+    }
+
+    [Fact]
+    public void Optimize_WideSoak_MatchesLeftChannelByBlock()
+    {
+        // At 160 MHz the candidate list holds one channel per block (ch100 for 100-128). A radio
+        // that left ch116 left that block, so it soaks even though 116 itself is no candidate.
+        var aps = new List<AccessPointSnapshot>
+        {
+            CreateAp("aa:bb:cc:dd:ee:01", "AP-1", RadioBand.Band5GHz, 36, width: 160, hasDfs: true)
+        };
+        var reg = StdUsRegulatory();
+        var options = new RecommendationOptions { DfsPreference = DfsPreference.IncludeWithPenalty };
+        var probe = _service.BuildInterferenceGraph(aps, RadioBand.Band5GHz, null, null, reg, options);
+        probe.Nodes[0].ValidChannels.Should().Contain(100, "the test needs the 100-128 block in play");
+        probe.Nodes[0].ValidChannels.Should().NotContain(116);
+
+        var soakInfo = new Dictionary<string, ChannelSoakInfo>
+        {
+            ["aa:bb:cc:dd:ee:01"] = new ChannelSoakInfo
+            {
+                SoakedChannels = new HashSet<int> { 116 },
+                LastChangeAt = DateTimeOffset.UtcNow.AddHours(-2),
+                SoakEndsAt = DateTimeOffset.UtcNow.AddHours(14)
+            }
+        };
+        var graph = _service.BuildInterferenceGraph(
+            aps, RadioBand.Band5GHz, null, null, reg, options, null, soakInfo);
+        var plan = _service.Optimize(graph, RadioBand.Band5GHz, reg, options);
+
+        var rec = plan.Recommendations[0];
+        rec.IsSoaking.Should().BeTrue();
+        rec.SoakSuppressedChannels.Should().Equal(116);
+        rec.RecommendedChannel.Should().Be(36);
+    }
+
+    [Fact]
+    public void Optimize_SoakingWideChannel_BlockReservedFromOtherAps()
+    {
+        // AP-A holds ch116@160 mid-soak. AP-B's candidate for that block is ch100, a different
+        // number on the same spectrum, so it must be kept off it too.
+        var aps = new List<AccessPointSnapshot>
+        {
+            CreateAp("aa:bb:cc:dd:ee:01", "AP-A", RadioBand.Band5GHz, 116, width: 160, hasDfs: true),
+            CreateAp("aa:bb:cc:dd:ee:02", "AP-B", RadioBand.Band5GHz, 36, width: 160, hasDfs: true)
+        };
+        var soakInfo = new Dictionary<string, ChannelSoakInfo>
+        {
+            ["aa:bb:cc:dd:ee:01"] = new ChannelSoakInfo
+            {
+                SoakedChannels = new HashSet<int> { 36 },
+                LastChangeAt = DateTimeOffset.UtcNow.AddHours(-2),
+                SoakEndsAt = DateTimeOffset.UtcNow.AddHours(14)
+            }
+        };
+        var reg = StdUsRegulatory();
+        var options = new RecommendationOptions { DfsPreference = DfsPreference.IncludeWithPenalty };
+        var graph = _service.BuildInterferenceGraph(
+            aps, RadioBand.Band5GHz, null, null, reg, options, null, soakInfo);
+        graph.Nodes[1].ValidChannels.Should().Contain(100, "the test needs AP-B to have the 100-128 block");
+
+        var plan = _service.Optimize(graph, RadioBand.Band5GHz, reg, options);
+
+        plan.Recommendations.First(r => r.ApName == "AP-A").IsSoaking.Should().BeTrue();
+        graph.Nodes[1].ValidChannels.Should().NotContain(100,
+            "ch100@160 is the same spectrum AP-A is holding at ch116@160");
     }
 
     [Fact]

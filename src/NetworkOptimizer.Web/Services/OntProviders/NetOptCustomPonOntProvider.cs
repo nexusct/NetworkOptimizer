@@ -62,9 +62,9 @@ public class NetOptCustomPonOntProvider : ISfpSupplementalOntProvider
         var payload = await FetchPayloadAsync(context, cancellationToken);
         if (payload == null)
             return PollResult<OntStats>.Failed(
-                $"No stats could be read from {context.ConfiguredHost ?? context.Host}.");
+                $"No stats could be read from {context.Host}.");
         var stats = MapToOntStats(payload);
-        stats.DeviceHost = context.ConfiguredHost ?? context.Host;
+        stats.DeviceHost = context.Host;
         stats.DeviceName = context.Name;
         return PollResult<OntStats>.Ok(stats);
     }
@@ -100,11 +100,11 @@ public class NetOptCustomPonOntProvider : ISfpSupplementalOntProvider
         }
         catch (HttpRequestException ex)
         {
-            return (false, HttpFailureSummary.Describe(ex, context.ConfiguredHost ?? context.Host));
+            return (false, HttpFailureSummary.Describe(ex, context.Host));
         }
         catch (TaskCanceledException ex)
         {
-            return (false, HttpFailureSummary.Describe(ex, context.ConfiguredHost ?? context.Host));
+            return (false, HttpFailureSummary.Describe(ex, context.Host));
         }
         catch (Exception ex)
         {
@@ -128,13 +128,16 @@ public class NetOptCustomPonOntProvider : ISfpSupplementalOntProvider
         {
             // Generous timeout: reference implementations gather stats on demand
             // (e.g. an SSH round-trip into the SFP stick) before responding.
-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+            using var client = new HttpClient(new SocketsHttpHandler { ConnectCallback = DeviceHttp.Via(context.Dialer) })
+            {
+                Timeout = TimeSpan.FromSeconds(15),
+            };
             var json = await client.GetStringAsync(url, cancellationToken);
 
             var payload = ParsePayload(json);
             if (payload == null)
             {
-                _logger.LogDebug("PON stats endpoint {Host} returned unparseable payload", context.ConfiguredHost ?? context.Host);
+                _logger.LogDebug("PON stats endpoint {Host} returned unparseable payload", context.Host);
                 if (throwOnError) throw new InvalidOperationException("Response was not valid PON stats JSON");
                 return null;
             }
@@ -142,7 +145,7 @@ public class NetOptCustomPonOntProvider : ISfpSupplementalOntProvider
             if (!string.IsNullOrEmpty(payload.Error))
             {
                 _logger.LogDebug("PON stats endpoint {Host} reported error: {Error} - {Message}",
-                    context.ConfiguredHost ?? context.Host, payload.Error, payload.Message);
+                    context.Host, payload.Error, payload.Message);
                 if (throwOnError)
                     throw new InvalidOperationException(
                         string.IsNullOrEmpty(payload.Message) ? payload.Error : $"{payload.Error}: {payload.Message}");
@@ -153,7 +156,7 @@ public class NetOptCustomPonOntProvider : ISfpSupplementalOntProvider
         }
         catch (Exception ex) when (!throwOnError)
         {
-            _logger.LogDebug(ex, "PON stats poll failed for {Host}", context.ConfiguredHost ?? context.Host);
+            _logger.LogDebug(ex, "PON stats poll failed for {Host}", context.Host);
             return null;
         }
         finally
@@ -197,6 +200,10 @@ public class NetOptCustomPonOntProvider : ISfpSupplementalOntProvider
         DsFecEnabled = p.GtcStatus?.DsFecEnable,
         UsFecEnabled = p.GtcStatus?.UsFecEnable,
         OnuResponseTime = p.GtcStatus?.OnuResponseTime,
+        GemPorts = p.GtcStatus?.GemPorts,
+        AesActive = p.Encryption?.AesActive,
+        GemPortsEncrypted = p.Encryption?.GemPortsEncrypted,
+        GponmgrEnc = p.Encryption?.GponmgrEnc,
         BipErrors = p.GtcCounters?.Bip,
         FecErrors = p.GtcCounters?.FecWordsUncorr,
         FecCorrectedWords = p.GtcCounters?.FecWordsCorr,
@@ -224,7 +231,54 @@ public class NetOptCustomPonOntProvider : ISfpSupplementalOntProvider
         LanRxFcsErrors = p.LanCounters?.RxFcsErr,
         LanBufferOverflow = p.LanCounters?.BufferOverflow,
         SfpUptimeS = p.SfpUptimeS,
+        OltVendorId = Clean(p.OltVendorId),
+        FirmwareVersion = Clean(p.SfpFwVersion),
+        OltModel = Clean(p.OltModel),
+        OltVersion = Clean(p.OltVersion),
+
+        // The PON insight fields. The same PonSupplementalStats fields the odi-oss provider fills,
+        // so the cards, the Connection Check and the path loss alerts read them the same way.
+        FecCorrectedBits = p.GtcCounters?.FecErrorCorr,
+        GemRxIdleFrames = p.GtcCounters?.RxGemIdleFramesTotal,
+        DsSuperframe = p.GtcCounters?.DsSuperframe,
+        UsBursts = p.GtcCounters?.UsBurstsTotal,
+        UsDbru = p.GtcCounters?.UsDbruTotal,
+        EqdBits = p.GtcStatus?.EqdBits is long eqd and >= 0 ? eqd : null,
+        BiasMa = Finite(p.Optics?.BiasMa),
+        BiasWarnHighMa = Finite(p.Optics?.BiasWarnHighMa),
+        TransceiverAlarmCount = p.Optics?.Alarms?.Count,
+        TransceiverAlarms = p.Optics?.Alarms is { Count: > 0 } alarms ? string.Join(",", alarms) : null,
+        OltLaunchPowerDbm = Finite(p.PonId?.LaunchPowerDbm) is double launch && launch is >= -30 and <= 30 ? launch : null,
+        OdnClass = p.PonId?.OdnClass is long cls and >= 0 and <= 4 ? cls : null,
+        ReachExtender = p.PonId?.ReachExtender is long re and (0 or 1) ? re : null,
+        PonIdAgeSeconds = Finite(p.PonId?.AgeS) is double age && age >= 0 ? age : null,
+        O5Seconds = Finite(p.LinkHistory?.O5Seconds),
+        NotO5Seconds = Finite(p.LinkHistory?.NotO5Seconds),
+        O5Exits = p.LinkHistory?.O5Exits,
+        LosEvents = p.LinkHistory?.LosEvents,
+        LosSeconds = Finite(p.LinkHistory?.LosSeconds),
+        LofEvents = p.LinkHistory?.LofEvents,
+        LofSeconds = Finite(p.LinkHistory?.LofSeconds),
+        OltDeactivations = p.PloamCounters?.Deactivations,
+        PloamRequestKey = p.PloamCounters?.RequestKey,
+        PloamKeySwitch = p.PloamCounters?.KeySwitch,
+        PloamRangingTime = p.PloamCounters?.RangingTime,
+        OmciUp = p.Omci?.Up is long omciUp and (0 or 1) ? omciUp : null,
+        OmciServices = p.Omci?.Services,
+        OmciRxFrames = p.Omci?.RxFrames,
+        MibDataSync = p.Omci?.MibDataSync,
+        TrafficPirBytesPerSecond = p.Omci?.PirBytesPerSecond,
+        TrafficCirBytesPerSecond = p.Omci?.CirBytesPerSecond,
+        HostLinkUp = p.Lan?.LinkUp is long up and (0 or 1) ? up : null,
+        CpuBusySeconds = Finite(p.Cpu?.BusyS),
+        CpuTotalSeconds = Finite(p.Cpu?.TotalS),
+        BootCount = p.BootCount,
+        LastResetReason = Clean(p.LastResetReason),
     };
+
+    private static string? Clean(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private static double? Finite(double? value) => value is double v && double.IsFinite(v) ? v : null;
 
     /// <summary>
     /// Standalone mapping: the standard OntStats fields this contract can serve.
@@ -242,6 +296,8 @@ public class NetOptCustomPonOntProvider : ISfpSupplementalOntProvider
         PonLinkStatus = ToPonLinkState(p.Ploam?.CurrState),
         FecErrors = p.GtcCounters?.FecWordsUncorr,
         BipErrors = p.GtcCounters?.Bip,
+        OltVendor = Clean(p.OltVendorId),
+        OltModel = Clean(p.OltModel),
         // Standalone gets the same PON detail as an attached module: same endpoint, same payload,
         // so the only difference between the two modes should be which tab it lands on.
         Pon = MapToSupplemental(p),
@@ -295,9 +351,152 @@ public class NetOptCustomPonPayload
     [JsonPropertyName("gpe_lan")]
     public GpeBridgePortSection? GpeLan { get; set; }
 
+    [JsonPropertyName("encryption")]
+    public EncryptionSection? Encryption { get; set; }
+
     /// <summary>Seconds since the ONT module booted.</summary>
     [JsonPropertyName("sfp_uptime_s")]
     public long? SfpUptimeS { get; set; }
+
+    /// <summary>OLT vendor ID as the ONT reports it (e.g. "CALX"). Decoded for display only.</summary>
+    [JsonPropertyName("olt_vendor_id")]
+    public string? OltVendorId { get; set; }
+
+    /// <summary>The ONT module's firmware version, as the module reports it.</summary>
+    [JsonPropertyName("sfp_fw_version")]
+    public string? SfpFwVersion { get; set; }
+
+    /// <summary>OLT model, from OMCI OLT-G's equipment ID (e.g. "E7").</summary>
+    [JsonPropertyName("olt_model")]
+    public string? OltModel { get; set; }
+
+    /// <summary>OLT software version, from OMCI OLT-G's version attribute.</summary>
+    [JsonPropertyName("olt_version")]
+    public string? OltVersion { get; set; }
+
+    /// <summary>The OLT's PON-ID PLOAM message (G.984.3 Annex C): launch power and ODN class, for Path Loss.</summary>
+    [JsonPropertyName("pon_id")]
+    public PonIdSection? PonId { get; set; }
+
+    /// <summary>The ONT's own clock on its activation states and alarms, for Link Downtime.</summary>
+    [JsonPropertyName("link_history")]
+    public LinkHistorySection? LinkHistory { get; set; }
+
+    /// <summary>Downstream PLOAM messages by type, for Provider Activity and Link Downtime's causes.</summary>
+    [JsonPropertyName("ploam_counters")]
+    public PloamCountersSection? PloamCounters { get; set; }
+
+    /// <summary>The OLT's management of the ONT over OMCI, for Provider Activity and the Connection Check.</summary>
+    [JsonPropertyName("omci")]
+    public OmciSection? Omci { get; set; }
+
+    /// <summary>The ONT's own processor time, for ONT CPU Load.</summary>
+    [JsonPropertyName("cpu")]
+    public CpuSection? Cpu { get; set; }
+
+    /// <summary>Boots of the ONT since its last power cycle, this one included.</summary>
+    [JsonPropertyName("boot_count")]
+    public long? BootCount { get; set; }
+
+    /// <summary>Why the ONT's previous boot ended, in the device's own word.</summary>
+    [JsonPropertyName("last_reset_reason")]
+    public string? LastResetReason { get; set; }
+
+    public class PonIdSection
+    {
+        /// <summary>Mean launch power the OLT (or a reach extender) announces, dBm.</summary>
+        [JsonPropertyName("launch_power_dbm")]
+        public double? LaunchPowerDbm { get; set; }
+
+        /// <summary>ODN class: 0 A, 1 B, 2 B+, 3 C, 4 C+.</summary>
+        [JsonPropertyName("odn_class")]
+        public long? OdnClass { get; set; }
+
+        /// <summary>1 when the announced power is a reach extender's, 0 when it is the OLT's.</summary>
+        [JsonPropertyName("reach_extender")]
+        public long? ReachExtender { get; set; }
+
+        /// <summary>Seconds since the last PON-ID message arrived.</summary>
+        [JsonPropertyName("age_s")]
+        public double? AgeS { get; set; }
+    }
+
+    public class LinkHistorySection
+    {
+        [JsonPropertyName("o5_seconds")]
+        public double? O5Seconds { get; set; }
+
+        [JsonPropertyName("not_o5_seconds")]
+        public double? NotO5Seconds { get; set; }
+
+        [JsonPropertyName("o5_exits")]
+        public long? O5Exits { get; set; }
+
+        [JsonPropertyName("los_events")]
+        public long? LosEvents { get; set; }
+
+        [JsonPropertyName("los_seconds")]
+        public double? LosSeconds { get; set; }
+
+        [JsonPropertyName("lof_events")]
+        public long? LofEvents { get; set; }
+
+        [JsonPropertyName("lof_seconds")]
+        public double? LofSeconds { get; set; }
+    }
+
+    public class PloamCountersSection
+    {
+        /// <summary>Deactivate_ONU-ID and Disable_Serial_Number received, together.</summary>
+        [JsonPropertyName("deactivations")]
+        public long? Deactivations { get; set; }
+
+        [JsonPropertyName("request_key")]
+        public long? RequestKey { get; set; }
+
+        [JsonPropertyName("key_switch")]
+        public long? KeySwitch { get; set; }
+
+        [JsonPropertyName("ranging_time")]
+        public long? RangingTime { get; set; }
+    }
+
+    public class OmciSection
+    {
+        /// <summary>1 when the ONT's OMCI stack answered, 0 when it did not.</summary>
+        [JsonPropertyName("up")]
+        public long? Up { get; set; }
+
+        /// <summary>Services (bridge connections) the OLT provisioned.</summary>
+        [JsonPropertyName("services")]
+        public long? Services { get; set; }
+
+        [JsonPropertyName("rx_frames")]
+        public long? RxFrames { get; set; }
+
+        /// <summary>The OMCI MIB data sync counter (one byte, wraps).</summary>
+        [JsonPropertyName("mib_data_sync")]
+        public long? MibDataSync { get; set; }
+
+        /// <summary>Highest peak information rate among the OLT's traffic descriptors, bytes per second.</summary>
+        [JsonPropertyName("pir_bytes_per_second")]
+        public long? PirBytesPerSecond { get; set; }
+
+        /// <summary>Highest committed information rate among the OLT's traffic descriptors, bytes per second.</summary>
+        [JsonPropertyName("cir_bytes_per_second")]
+        public long? CirBytesPerSecond { get; set; }
+    }
+
+    public class CpuSection
+    {
+        /// <summary>CPU time since boot that was not idle, seconds.</summary>
+        [JsonPropertyName("busy_s")]
+        public double? BusyS { get; set; }
+
+        /// <summary>CPU time since boot over all modes, seconds.</summary>
+        [JsonPropertyName("total_s")]
+        public double? TotalS { get; set; }
+    }
 
     /// <summary>
     /// DDM optics readings, in the same units as SFP DDM (dBm / degrees C / volts).
@@ -323,6 +522,18 @@ public class NetOptCustomPonPayload
         /// <summary>Supply voltage in volts.</summary>
         [JsonPropertyName("voltage_v")]
         public double? VoltageV { get; set; }
+
+        /// <summary>Laser bias current in mA, the ONT's own reading.</summary>
+        [JsonPropertyName("bias_ma")]
+        public double? BiasMa { get; set; }
+
+        /// <summary>The module's own high warning limit for the bias current, mA.</summary>
+        [JsonPropertyName("bias_warn_high_ma")]
+        public double? BiasWarnHighMa { get; set; }
+
+        /// <summary>The module's raised alarm and warning flags (SFF-8472), as "kind:condition" ("warning:rx_power_low"). Empty when none.</summary>
+        [JsonPropertyName("alarms")]
+        public List<string>? Alarms { get; set; }
     }
 
     public class LanSection
@@ -335,6 +546,10 @@ public class NetOptCustomPonPayload
 
         [JsonPropertyName("phy_duplex")]
         public long? PhyDuplex { get; set; }
+
+        /// <summary>1 while the ONT's host port (towards the gateway) has a link, 0 when it does not.</summary>
+        [JsonPropertyName("link_up")]
+        public long? LinkUp { get; set; }
     }
 
     public class LanCountersSection
@@ -384,6 +599,30 @@ public class NetOptCustomPonPayload
 
         [JsonPropertyName("onu_response_time")]
         public long? OnuResponseTime { get; set; }
+
+        /// <summary>GEM Port-IDs provisioned in the GTC Port-ID table, including the OMCI port.</summary>
+        [JsonPropertyName("gem_ports")]
+        public long? GemPorts { get; set; }
+
+        /// <summary>Equalization delay the OLT assigned at the last ranging, in upstream bit times.</summary>
+        [JsonPropertyName("eqd_bits")]
+        public long? EqdBits { get; set; }
+    }
+
+    /// <summary>Downstream AES state. Each field is null when its read failed on that poll.</summary>
+    public class EncryptionSection
+    {
+        /// <summary>True when any GEM port has its downstream AES decrypt bit set. The AES flag.</summary>
+        [JsonPropertyName("aes_active")]
+        public bool? AesActive { get; set; }
+
+        /// <summary>The enc: value of <c>dcli gponmgr show encryption</c>. Observed only on Calix EXOS so far.</summary>
+        [JsonPropertyName("gponmgr_enc")]
+        public long? GponmgrEnc { get; set; }
+
+        /// <summary>GEM ports with the decrypt bit set.</summary>
+        [JsonPropertyName("gem_ports_encrypted")]
+        public long? GemPortsEncrypted { get; set; }
     }
 
     public class GtcCountersSection
@@ -450,6 +689,22 @@ public class NetOptCustomPonPayload
 
         [JsonPropertyName("allocations_lost")]
         public long? AllocationsLost { get; set; }
+
+        /// <summary>Idle GEM frames received downstream: the PON's unused capacity, the same for every ONT on it.</summary>
+        [JsonPropertyName("rx_gem_idle_frames_total")]
+        public long? RxGemIdleFramesTotal { get; set; }
+
+        /// <summary>The downstream superframe counter (one per 125 us frame; 30 bits on GPON, so it wraps), read with the counters above.</summary>
+        [JsonPropertyName("ds_superframe")]
+        public long? DsSuperframe { get; set; }
+
+        /// <summary>Upstream bursts sent in the OLT's grants.</summary>
+        [JsonPropertyName("us_bursts_total")]
+        public long? UsBurstsTotal { get; set; }
+
+        /// <summary>Upstream DBRu queue reports sent.</summary>
+        [JsonPropertyName("us_dbru_total")]
+        public long? UsDbruTotal { get; set; }
     }
 
     public class GpeBridgePortSection

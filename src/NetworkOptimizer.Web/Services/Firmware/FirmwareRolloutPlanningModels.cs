@@ -55,6 +55,12 @@ public class PlannerDevice
     /// <summary>Effective device type (UniFi re-classification already applied).</summary>
     public DeviceType Type { get; init; }
 
+    /// <summary>
+    /// Disconnected from the Console at plan time, so it covers nothing while others upgrade.
+    /// Opt-in rather than "connected" so a snapshot that never set it counts the device as up.
+    /// </summary>
+    public bool Offline { get; init; }
+
     /// <summary>Whether the console offers an upgrade for this device.</summary>
     /// <remarks>Cleared during the gather when the planned channel offers nothing newer.</remarks>
     public bool Upgradable { get; set; }
@@ -151,6 +157,15 @@ public class RolloutPlanningInput
     /// <summary>Direct firmware image URL for the SSH fallback UniFi OS install.</summary>
     public string? UniFiOsDownloadUrl { get; init; }
 
+    /// <summary>Publish date of the UniFi OS build the plan targets, when the console gave one.</summary>
+    public DateTime? UniFiOsPublishedAt { get; init; }
+
+    /// <summary>True when the UniFi OS target was chosen by hand (<see cref="RolloutBuildPin"/>).</summary>
+    public bool UniFiOsPinned { get; init; }
+
+    /// <summary>True when the Network application target was chosen by hand.</summary>
+    public bool NetworkAppPinned { get; init; }
+
     /// <summary>True when the console is a self-hosted UniFi OS Server (uses the all.deb package).</summary>
     public bool IsStandaloneConsole { get; init; }
 
@@ -182,10 +197,16 @@ public class ResolvedSpacing
 
     /// <summary>
     /// Share of the site's APs that may upgrade together when real placement data backs the
-    /// coverage answer. The flat cap is a floor, so small sites are unchanged; a large site stops
-    /// being throttled to a handful at a time when the oracle can prove the set is neighbor-free.
+    /// coverage answer. A large site stops being throttled to a handful at a time when the oracle
+    /// can prove the set is neighbor-free.
     /// </summary>
     public int ApCoveragePercent { get; init; }
+
+    /// <summary>
+    /// Share of the site's APs that may upgrade together when no placement data says which ones
+    /// overlap, so a small site keeps most of its coverage up. The flat cap still bounds it.
+    /// </summary>
+    public double ApUnplacedPercent { get; init; }
 
     /// <summary>
     /// How many waves may be in flight together. A device's cool-down only holds up waves it has a
@@ -204,15 +225,16 @@ public class ResolvedSpacing
         [JsonPropertyName("maxSwitchParallelism")] public int? MaxSwitchParallelism { get; set; }
         [JsonPropertyName("maxWaveOverlap")] public int? MaxWaveOverlap { get; set; }
         [JsonPropertyName("apCoveragePercent")] public int? ApCoveragePercent { get; set; }
+        [JsonPropertyName("apUnplacedPercent")] public double? ApUnplacedPercent { get; set; }
     }
 
     public static ResolvedSpacing For(FirmwareSpacingProfile profile, string? advancedJson)
     {
-        var (apGap, swGap, gwGap, apPar, swPar, waveOverlap, apPct) = profile switch
+        var (apGap, swGap, gwGap, apPar, swPar, waveOverlap, apPct, apUnplacedPct) = profile switch
         {
-            FirmwareSpacingProfile.Conservative => (180, 300, 600, 1, 1, 2, 5),
-            FirmwareSpacingProfile.Fast => (60, 90, 120, 6, 4, 4, 20),
-            _ => (120, 180, 300, 3, 2, 3, 10),
+            FirmwareSpacingProfile.Conservative => (180, 300, 600, 1, 1, 2, 5, 20.0),
+            FirmwareSpacingProfile.Fast => (60, 90, 120, 6, 4, 4, 20, 50.0),
+            _ => (120, 180, 300, 3, 2, 3, 10, 100.0 / 3),
         };
 
         Overrides? o = null;
@@ -231,6 +253,7 @@ public class ResolvedSpacing
             MaxSwitchParallelism = Math.Max(1, o?.MaxSwitchParallelism ?? swPar),
             MaxWaveOverlap = Math.Max(1, o?.MaxWaveOverlap ?? waveOverlap),
             ApCoveragePercent = Math.Clamp(o?.ApCoveragePercent ?? apPct, 1, 100),
+            ApUnplacedPercent = Math.Clamp(o?.ApUnplacedPercent ?? apUnplacedPct, 1, 100),
         };
     }
 }
@@ -330,6 +353,15 @@ public class RolloutPlanDocument
     public List<PlanWave> Waves { get; set; } = [];
     public List<PlanMeshRepair> MeshRepairs { get; set; } = [];
 
+    /// <summary>Change Control snapshot pinned before the rollout started, for a config restore after a firmware revert.</summary>
+    public int? ConfigSnapshotId { get; set; }
+
+    /// <summary>Whether the post-upgrade config check has run, so a resume does not re-hold on the same findings.</summary>
+    public bool ConfigChecked { get; set; }
+
+    /// <summary>Whether any step was rolled back, so the page offers the pinned config snapshot.</summary>
+    public bool FirmwareReverted { get; set; }
+
     /// <summary>Whether the UniFi Network application updates first (wave 0 timeline entry).</summary>
     public bool IncludesUniFiNetworkUpdate { get; set; }
     public int UniFiNetworkUpdateSeconds { get; set; }
@@ -361,9 +393,8 @@ public class RolloutPlanDocument
     public string? ConsoleModel { get; set; }
 
     /// <summary>
-    /// The site's own timezone, as the console reports it. Times are shown in the server's zone -
-    /// one clock across every site an operator watches - and this is what the site-local reading
-    /// beside them is built from, where the two differ.
+    /// The site's own timezone, as the console reports it. Times are shown on the viewer's clock,
+    /// and this is what the site-local reading beside them is built from, where the two differ.
     /// </summary>
     public string? TimeZoneId { get; set; }
 
@@ -386,6 +417,24 @@ public class RolloutPlanDocument
     /// starts - so it has to survive a restart mid-rollout.
     /// </summary>
     public DateTime? LastWaveCommandedAt { get; set; }
+
+    /// <summary>
+    /// When the start passed its checks. The plan stays Scheduled or Announced until the console's
+    /// own phase is commanded, which can take minutes; the page shows the run from this instead.
+    /// </summary>
+    public DateTime? StartingAt { get; set; }
+
+    /// <summary>
+    /// Every AP on the site at plan time, upgrading or not. The executor holds a wave that would
+    /// take the last one still up. Empty on plans built before that check, which skip it.
+    /// </summary>
+    public List<string> SiteApMacs { get; set; } = [];
+
+    /// <summary>
+    /// When the executor started holding a wave because it would take the last AP still up.
+    /// Persisted so the timeout that skips the wave survives a restart.
+    /// </summary>
+    public DateTime? LastApHoldSince { get; set; }
 
     /// <summary>Human-readable assumptions and fallbacks used (shown in the preview).</summary>
     public List<string> Notes { get; set; } = [];
@@ -435,6 +484,12 @@ public class RolloutPlanDocument
 
     /// <summary>Progress of the UniFi OS update that runs after every device step.</summary>
     public RolloutConsoleStepState UniFiOsUpdate { get; set; } = new();
+
+    /// <summary>
+    /// The per-model channels a rollout for a hand-added device build raised, put back when the plan
+    /// ends. Empty when nothing was raised, and once restored.
+    /// </summary>
+    public List<RaisedModelChannel> RaisedModelChannels { get; set; } = [];
 
     /// <summary>Console channels this rollout has already set.</summary>
     public RolloutConsoleChannels ConsoleChannels { get; set; } = new();
@@ -503,6 +558,13 @@ public class RolloutConsoleStepState
     /// <summary>Whether the install has been commanded. The resume guard.</summary>
     public bool Triggered { get; set; }
 
+    /// <summary>
+    /// When an SSH install was sent and has not returned yet. The command blocks while the gateway
+    /// downloads the image, so this is what shows the step as upgrading in the meantime. Display
+    /// only: <see cref="Triggered"/> stays the resume guard.
+    /// </summary>
+    public DateTime? SendingAt { get; set; }
+
     /// <summary>When it was commanded, which the recovery budget runs from.</summary>
     public DateTime? TriggeredAt { get; set; }
 
@@ -523,6 +585,24 @@ public class RolloutConsoleStepState
     /// <summary>Direct download URL for the SSH fallback path, captured at plan time.</summary>
     public string? Url { get; set; }
 
+    /// <summary>Why the install did not go ahead, when it was tried and refused; shown in the report.</summary>
+    public string? Error { get; set; }
+
+    /// <summary>True when the install was started over SSH, so its log on the console says how it ended.</summary>
+    public bool ViaSsh { get; set; }
+
+    /// <summary>
+    /// Publish date of <see cref="TargetVersion"/>, captured at plan time. The console's own
+    /// pending build can be a different one when the target came from another site's console.
+    /// </summary>
+    public DateTime? PublishedAt { get; set; }
+
+    /// <summary>
+    /// True when an admin chose <see cref="TargetVersion"/> by hand. It installs over SSH by
+    /// <see cref="Url"/> only: the console's API trigger installs its own newest build.
+    /// </summary>
+    public bool Pinned { get; set; }
+
     /// <summary>
     /// When the SSH retry ran because the console took the command and never installed it.
     /// Null until then; it runs once.
@@ -540,6 +620,18 @@ public class RolloutConsoleStepState
 
     /// <summary>When the console answered again on its new version.</summary>
     public DateTime? BackAt { get; set; }
+
+    /// <summary>
+    /// UniFi OS only: first probe of the current stretch in which Network was running and UniFi OS
+    /// was not routing to it. Null whenever the last probe saw anything else.
+    /// </summary>
+    public DateTime? NetworkUnroutedSince { get; set; }
+
+    /// <summary>UniFi OS only: when the rollout restarted UniFi Network to get it routed. Runs once.</summary>
+    public DateTime? NetworkRestartedAt { get; set; }
+
+    /// <summary>UniFi OS only: when the rollout rebooted the console because a Network restart did not get it routed. Runs once.</summary>
+    public DateTime? ConsoleRebootedAt { get; set; }
 
     /// <summary>Wave this phase runs in: 0 for the application, after the last device for UniFi OS.</summary>
     public int Wave { get; set; }
@@ -563,6 +655,54 @@ public class PlanTargetImage
     /// channels on different models without the console having to be on each in turn.
     /// </summary>
     public string? Url { get; set; }
+
+    /// <summary>
+    /// True when an admin chose this build by hand. It installs by URL only: the console's own
+    /// upgrade would install its newest build instead.
+    /// </summary>
+    public bool Pinned { get; set; }
+}
+
+/// <summary>
+/// A build an admin added by hand and asked to roll out. The plan installs exactly this version,
+/// even when the console or the shared catalog offers a newer one.
+/// </summary>
+/// <param name="Kind">The surface the build is for.</param>
+/// <param name="Target">Device model or hardware platform; null for the Network application.</param>
+/// <param name="Version">The version to install.</param>
+/// <param name="Url">
+/// The image or package URL. Null only for the Network build the console itself offers, which its
+/// own update installs.
+/// </param>
+/// <param name="Models">Every device model the image is for; null means <paramref name="Target"/> alone.</param>
+/// <param name="ModelUrls">Per-model install URLs for the same image, where a model has its own; others use <paramref name="Url"/>.</param>
+public sealed record RolloutBuildPin(
+    FirmwareUrlKind Kind,
+    string? Target,
+    string Version,
+    string? Url,
+    IReadOnlyList<string>? Models = null,
+    IReadOnlyDictionary<string, string>? ModelUrls = null)
+{
+    /// <summary>The device models the pin covers.</summary>
+    public IReadOnlyList<string> DeviceModels => Models is { Count: > 0 } ? Models : Target is { Length: > 0 } t ? [t] : [];
+
+    /// <summary>The URL a device of this model installs from.</summary>
+    public string? UrlFor(string? model) =>
+        model != null && ModelUrls != null && ModelUrls.TryGetValue(model, out var url) ? url : Url;
+}
+
+/// <summary>A per-model channel entry a rollout changed, and the entry it replaced.</summary>
+public class RaisedModelChannel
+{
+    /// <summary>Model code, the key in the per-model channel settings.</summary>
+    public string Model { get; set; } = string.Empty;
+
+    /// <summary>The channel the rollout set.</summary>
+    public string Channel { get; set; } = string.Empty;
+
+    /// <summary>The entry before the rollout; null when the model had none.</summary>
+    public string? Previous { get; set; }
 }
 
 public class PlanPriorVersion
@@ -608,6 +748,16 @@ public class PlanWaveStep
     public bool IsCanary { get; set; }
     public bool HeldForCanary { get; set; }
     public bool IsMeshParticipant { get; set; }
+
+    /// <summary>Whether the device uplinked over a wireless mesh backhaul when the plan was built.</summary>
+    public bool WirelessUplink { get; set; }
+
+    /// <summary>
+    /// Normalized MAC of the device's parent when the plan was built, null when unknown. The
+    /// executor compares it with the live uplink to tell a mesh device that has re-meshed.
+    /// </summary>
+    public string? UplinkMac { get; set; }
+
     public int EstimatedDowntimeSeconds { get; set; }
     public int OfflineBudgetSeconds { get; set; }
     public int EtaOffsetSeconds { get; set; }

@@ -32,7 +32,7 @@ public class MonitoringGatedServiceTests : IDisposable
         _siteContext = new SiteContextService(new HttpContextAccessor(), paths);
 
         using var db = _factory.CreateForSite(_siteContext.Slug, _siteContext.IsDefault);
-        db.Database.Migrate();
+        db.Database.MigrateFromTemplate();
     }
 
     public void Dispose()
@@ -42,7 +42,7 @@ public class MonitoringGatedServiceTests : IDisposable
     }
 
     private MonitoringTargetService Targets() => new(
-        _factory, _siteContext, asnResolution: null!, executorFactory: null!, _audit,
+        _factory, _siteContext, asnResolution: null!, routes: null!, _audit,
         NullLogger<MonitoringTargetService>.Instance);
 
     private MonitoringSettingsService Settings() => new(_factory, _siteContext, _audit);

@@ -6,11 +6,13 @@
 @inject PullToRefreshState PullToRefreshState
 @inject SidebarState Sidebar
 @inject IJSRuntime JS
+@inject NavigationManager Navigation
+@inject IDisplayTimeZone DisplayTime
 
 <div class="app-container">
     <div class="sidebar-overlay @(sidebarOpen ? "visible" : "")" @onclick="CloseSidebar"></div>
     <div class="sidebar @(sidebarOpen ? "open" : "")">
-        <a href="/" class="sidebar-header" @onclick="CloseSidebar">
+        <a href="/" class="sidebar-header" @onclick="OnLogoClickAsync">
             <img src="images/network-optimizer-logo.png" alt="Network Optimizer" class="sidebar-logo" />
             <p class="app-subtitle"><strong>for UniFi</strong></p>
         </a>
@@ -34,7 +36,7 @@
                 <span></span>
                 <span></span>
             </button>
-            <a href="/" class="mobile-logo">
+            <a href="/" class="mobile-logo" @onclick="OnLogoClickAsync">
                 <img src="images/network-optimizer-logo.png" alt="Network Optimizer" />
             </a>
             <div class="status-indicators">
@@ -45,7 +47,7 @@
                         <span>Console Connected</span>
                     </div>
                 }
-                else
+                else if (!ConnectionService.HasNoConsole)
                 {
                     <div class="status-item status-disconnected">
                         <span class="status-icon">●</span>
@@ -60,7 +62,7 @@
                    install with authentication disabled. *@
                 <AuthorizeView>
                     <Authorized>
-                        <a href="/account/security" class="account-btn" data-tooltip="Password, two-factor authentication, and passkeys">
+                        <a href="/account/security" class="account-btn" data-tooltip="Date and time, password, two-factor authentication, and passkeys">
                             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
                                 <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z" />
                             </svg>
@@ -84,11 +86,28 @@
 
         <UpdateNotificationBanner />
         <LicenseStatusBanner />
+        <SiteAdminOnly><UciAgentBanner /></SiteAdminOnly>
+        <AgentUpdateBanner />
 
         <main class="page-content">
             <article class="content">
+                @if (_canGoBack)
+                {
+                    @* The wide-desktop Back button, floating in the gutter; PageBackButton in each
+                       page header covers every narrower width. *@
+                    <div class="page-back-float">
+                        <button type="button" class="page-back-btn" @onclick="GoBack" aria-label="Back">
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7" />
+                            </svg>
+                        </button>
+                    </div>
+                }
+                <span id="no-display-tz" data-tz="@DisplayTime.ZoneId" data-format="@DisplayTime.Format.Code" hidden></span>
                 <GateRefusalBoundary>
-                    @Body
+                    <CascadingValue Name="CanGoBack" Value="_canGoBack">
+                        @Body
+                    </CascadingValue>
                 </GateRefusalBoundary>
             </article>
         </main>
@@ -293,6 +312,41 @@
             }).observe(sidebar, { attributes: true, attributeFilter: ['class'] });
         }
         window.__setPtrRef = function(ref) { window.__ptrDotNetRef = ref; };
+        // Blazor numbers its own history entries in history.state._index (0 = the entry the app
+        // loaded on), so above 0 there is an in-app page to go back to. history.length counts
+        // pages from before the app too.
+        // Also no Back when the entry before is this same page (the logo clicked on the Dashboard): it would
+        // go nowhere. History does not expose an earlier entry's URL, so each call records this entry's, per
+        // tab, keyed by that index; ?site= is left out since multi-site stamps it in after a navigation.
+        window.__canGoBack = function() {
+            // No _index yet on the entry the app loaded on (Blazor writes it later): that entry is 0.
+            var s = history.state;
+            var index = s && typeof s._index === 'number' ? s._index : 0;
+            var u = new URL(location.href);
+            u.searchParams.delete('site');
+            var here = u.pathname + u.search;
+            var seen = {};
+            try { seen = JSON.parse(sessionStorage.getItem('no.historyUrls') || '{}'); } catch (e) { }
+            seen[index] = here;
+            try { sessionStorage.setItem('no.historyUrls', JSON.stringify(seen)); } catch (e) { }
+            return index > 0 && seen[index - 1] !== here;
+        };
+        // A full page load that keeps this tab's place in that numbering: Blazor reads _index back on
+        // start, and a reload keeps history.state. NavigateTo(forceLoad) starts a fresh entry at 0,
+        // which hid Back. replace swaps the current entry instead of adding one.
+        window.__fullLoad = function(url, replace) {
+            var s = history.state || {};
+            var i = s._index || 0;
+            if (replace) history.replaceState({ userState: s.userState, _index: i }, '', url);
+            else history.pushState({ userState: null, _index: i + 1 }, '', url);
+            location.reload();
+        };
+        // An in-app navigation from plain JS (a map double-click): Blazor adds and numbers the entry,
+        // so Back shows on the page it opens. Setting location.href instead is a full load at entry 0.
+        window.__navigate = function(url) {
+            if (window.Blazor && typeof Blazor.navigateTo === 'function') Blazor.navigateTo(url);
+            else window.__fullLoad(url, false);
+        };
         // Custom pull-to-refresh (replaces native, blocked by overscroll-behavior)
         (function() {
             if (window.innerWidth > 1024) return;
@@ -315,6 +369,8 @@
                 // The client selector's list scrolls itself. Arming here would charge the refresh
                 // while someone is scrolling the options, since the page behind it is still at top.
                 if (e.target.closest && e.target.closest('.filterable-select-dropdown')) return;
+                // A bottom sheet (Live Traffic's filters, Set location) closes on a drag down: never a refresh.
+                if (e.target.closest && e.target.closest('.lt-fpop, .lt-fpop-backdrop')) return;
                 if (container.scrollTop <= 0) {
                     startY = e.touches[0].pageY;
                     pulling = true;
@@ -392,6 +448,7 @@
 
 @code {
     private bool sidebarOpen = false;
+    private bool _canGoBack;
     private DotNetObjectReference<MainLayout>? _dotNetRef;
 
     protected override void OnInitialized()
@@ -402,7 +459,28 @@
         // "Console Disconnected" until the next navigation.
         ConnectionService.OnConnectionChanged += OnConnectionChanged;
         Sidebar.OpenRequested += OnSidebarRequested;
+        Navigation.LocationChanged += OnLocationChanged;
     }
+
+    private async void OnLocationChanged(object? sender, LocationChangedEventArgs e)
+    {
+        try
+        {
+            await InvokeAsync(RefreshCanGoBackAsync);
+        }
+        catch { /* component may be disposed */ }
+    }
+
+    private async Task RefreshCanGoBackAsync()
+    {
+        var canGoBack = await JS.InvokeAsync<bool>("__canGoBack");
+        if (canGoBack == _canGoBack)
+            return;
+        _canGoBack = canGoBack;
+        StateHasChanged();
+    }
+
+    private async Task GoBack() => await JS.InvokeVoidAsync("history.back");
 
     private void OnSidebarRequested(bool open)
     {
@@ -430,6 +508,7 @@
         {
             _dotNetRef = DotNetObjectReference.Create(this);
             await JS.InvokeVoidAsync("__setPtrRef", _dotNetRef);
+            await RefreshCanGoBackAsync();
         }
     }
 
@@ -467,10 +546,27 @@
         StateHasChanged();
     }
 
+    /// <summary>
+    /// Either logo links to the Dashboard. Already on it, the link goes nowhere, so the page scrolls
+    /// back to the top instead: .main-content scrolls on a phone, .page-content on a desktop.
+    /// </summary>
+    private async Task OnLogoClickAsync()
+    {
+        CloseSidebar();
+        if (Navigation.ToBaseRelativePath(Navigation.Uri).Split('?', '#')[0].Length != 0) return;
+        try
+        {
+            await JS.InvokeVoidAsync("eval",
+                "window.dispatchEvent(new Event('netopt:scroll-top')); ['.main-content', '.page-content'].forEach(s => document.querySelector(s)?.scrollTo({ top: 0, behavior: 'smooth' })); window.scrollTo({ top: 0, behavior: 'smooth' });");
+        }
+        catch (JSDisconnectedException) { }
+    }
+
     public void Dispose()
     {
         ConnectionService.OnConnectionChanged -= OnConnectionChanged;
         Sidebar.OpenRequested -= OnSidebarRequested;
+        Navigation.LocationChanged -= OnLocationChanged;
         _dotNetRef?.Dispose();
     }
 }

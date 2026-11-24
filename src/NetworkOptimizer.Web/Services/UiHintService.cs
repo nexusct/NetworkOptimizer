@@ -166,4 +166,18 @@ public static class UiHintKeys
     /// message in two placements, so one dismissal retires both.
     /// </summary>
     public const string ApTelemetryOffer = "ap-telemetry-offer";
+
+    /// <summary>
+    /// App-wide banner telling a site with a UniFi Cable Internet that its DOCSIS stats need the
+    /// On-Site Agent on the gateway. Site admins only (they are the ones who can act on it), and
+    /// only while no gateway agent can capture. Dismissed rather than counted down.
+    /// </summary>
+    public const string UciAgentOffer = "uci-agent-offer";
+
+    /// <summary>
+    /// Prefix for the app-wide optional On-Site Agent update banner, suffixed with the
+    /// LatestAgentVersion it announces so each release's notice is dismissed on its own. The
+    /// required-update banner has no key: it cannot be dismissed.
+    /// </summary>
+    public const string AgentUpdateAvailablePrefix = "agent-update-available:";
 }

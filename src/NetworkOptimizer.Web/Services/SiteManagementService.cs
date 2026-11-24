@@ -34,6 +34,8 @@ public class SiteManagementService : ISiteManagementService
     private readonly SiteRegistryChangeNotifier _changeNotifier;
     private readonly ILogger<SiteManagementService> _logger;
     private readonly Authorization.ISiteAccessFilter _siteAccess;
+    private readonly Gates.IAuditContext _auditContext;
+    private readonly SiteLeftoverCleanup _leftovers;
 
     public SiteManagementService(
         ISiteRepository siteRepository,
@@ -49,8 +51,12 @@ public class SiteManagementService : ISiteManagementService
         MonitoringCollectionRegistry collectionRegistry,
         SiteRegistryChangeNotifier changeNotifier,
         Authorization.ISiteAccessFilter siteAccess,
-        ILogger<SiteManagementService> logger)
+        ILogger<SiteManagementService> logger,
+        Gates.IAuditContext auditContext,
+        SiteLeftoverCleanup leftovers)
     {
+        _auditContext = auditContext;
+        _leftovers = leftovers;
         _siteAccess = siteAccess;
         _siteRepository = siteRepository;
         _siteRoles = siteRoles;
@@ -112,6 +118,8 @@ public class SiteManagementService : ISiteManagementService
         // when the license snapshot is unchanged (e.g. the main site was already covered),
         // so force subscribers to reload rather than relying on a snapshot diff.
         await _licenseState.RecomputeAsync(alwaysNotify: true);
+        // The no-console flag applies only while multi-site is on, where it can be cleared.
+        await _siteConnections.GetDefault().RefreshNoConsoleAsync();
         _siteRoles.InvalidateAll();
         _changeNotifier.NotifySitesChanged();
         _logger.LogInformation("Multi-site management {State}", enabled ? "enabled" : "disabled");
@@ -174,6 +182,32 @@ public class SiteManagementService : ISiteManagementService
         await _siteRepository.UpdateAsync(site);
         _siteRoles.InvalidateAll();
         _changeNotifier.NotifySitesChanged();
+    }
+
+    /// <summary>
+    /// Marks the default site as having no UniFi Console (the install only hosts other sites), or
+    /// clears it. Saved console settings are kept; clearing the flag reconnects with them.
+    /// </summary>
+    public async Task SetDefaultSiteHasNoConsoleAsync(bool hasNoConsole)
+    {
+        var site = await _siteRepository.GetDefaultAsync()
+            ?? throw new InvalidOperationException("The default site is not registered.");
+
+        _auditContext.SetTarget(site.Slug, site.Name);
+        if (site.HasNoConsole == hasNoConsole)
+        {
+            _auditContext.SuppressNoChange();
+            return;
+        }
+
+        site.HasNoConsole = hasNoConsole;
+        await _siteRepository.UpdateAsync(site);
+        _auditContext.SetDetails(new { HasNoConsole = hasNoConsole });
+
+        await _siteConnections.GetDefault().RefreshNoConsoleAsync();
+        _changeNotifier.NotifySitesChanged();
+        _logger.LogInformation("Default site {Slug} marked as {State}", site.Slug,
+            hasNoConsole ? "having no UniFi Console" : "having a UniFi Console");
     }
 
     /// <summary>
@@ -321,6 +355,10 @@ public class SiteManagementService : ISiteManagementService
                 site.Slug, site.Slug);
         }
 
+        // Floor plans, report PDFs and the default InfluxDB buckets live outside sites/{slug}; a site
+        // created later under the same slug would otherwise inherit them. Best effort, like the delete above.
+        await _leftovers.RemoveAsync(site.Slug);
+
         // Only now, with the registry row and the database files gone, are the passive registries
         // safe to empty. Evicting them earlier does not hold: anything that touches the slug in the
         // meantime rebuilds the entry from the site's still-present database, and DropTunnels above
@@ -329,6 +367,18 @@ public class SiteManagementService : ISiteManagementService
         // then outlived the site and was handed to the next site created under the same slug,
         // carrying the removed site's console credentials with it.
         await SweepSiteRegistriesAsync(site.Slug, loopOwners: false);
+
+        // Threat settings live in the main database under the slug, so the site's files going does
+        // not take them; a site created later under the same slug would inherit its tokens and trust.
+        try
+        {
+            await using var db = await _mainDbFactory.CreateDbContextAsync();
+            await NetworkOptimizer.Storage.Repositories.ThreatSiteSettings.RemoveForSiteAsync(db, site.Slug);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Site {Slug} was removed but its threat settings could not be cleared", site.Slug);
+        }
 
         // Free the site's license seat.
         await _licenseState.RecomputeAsync();

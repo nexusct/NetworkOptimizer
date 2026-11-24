@@ -161,7 +161,7 @@ The interactive script will:
 1. Create a privileged Debian LXC container
 2. Install Docker and Docker Compose
 3. Deploy Network Optimizer with Docker Compose
-4. Optionally deploy a [Traefik HTTPS proxy](https://github.com/Ozark-Connect/NetworkOptimizer-Proxy) with automatic Let's Encrypt certificates (requires Cloudflare DNS)
+4. Optionally deploy a [Traefik HTTPS proxy](https://github.com/Ozark-Connect/NetworkOptimizer-Proxy) with automatic Let's Encrypt certificates (the installer sets it up for Cloudflare DNS; [other providers](https://github.com/Ozark-Connect/NetworkOptimizer-Proxy#automatic-https) work after install)
 5. Configure auto-start on boot
 
 **Requirements:**
@@ -252,7 +252,7 @@ For the built-in **admin** account's initial password, check the add-on's **Log*
 
 For multi-site deployments, the recommended way to bring a remote site online is a lightweight on-site agent that dials home to your central server over a single outbound HTTPS tunnel - no inbound access, no VPN, no port-forwarding, works behind CGNAT, nothing new to deploy between sites. It proxies that site's UniFi Console, SNMP, and device SSH, hosts its probes and speed tests, and delivers the full feature set. If you already reach a site over a site-to-site VPN, you can onboard it with no agent and still get a solid floor - security audit, Wi-Fi, config, Adaptive SQM, WAN steering, and SNMP - directly; add the agent when you also want that site's monitoring and performance layer (ISP Health, path discovery, latency/loss, and speed tests).
 
-Install it with Docker, as a bare-metal systemd service, or - for monitoring-only sites - directly on the site's UniFi gateway (about 50 MB in practice, held under a memory limit as a safety backstop so it stays clear of routing). Per-site one-liners for all three are generated in the web UI under **Settings > Multi-Site > (site) > Agents > Set up agent**. See the [Agent Deployment Guide](../src/NetworkOptimizer.Agent/README.md) for the full walkthrough, all options, and reverse-proxy configuration.
+Install it with Docker, as a bare-metal systemd service, or directly on the site's UniFi gateway (monitoring, plus an optional LAN speed test) (about 50 MB in practice, held under a memory limit as a safety backstop so it stays clear of routing). Per-site one-liners for all three are generated in the web UI under **Settings > Multi-Site > (site) > Agents > Set up agent**. See the [Agent Deployment Guide](../src/NetworkOptimizer.Agent/README.md) for the full walkthrough, all options, and reverse-proxy configuration.
 
 **Licensing:** Personal use on up to 3 sites is free and never contacts a license server - nothing phones home. Running more than 3 sites requires a license key (entered under **Settings > Application > Licensing**); activating or renewing a key makes an outbound HTTPS request from the central server to `licensing.ozarkconnect.net`. If activation reports the license server as unreachable, check that your egress firewall rules allow HTTPS (443) to that hostname. Entitlements are cached and verified locally, so a license server outage never disables your sites.
 
@@ -381,7 +381,13 @@ network-optimizer             Up (healthy)
 
 ### HTTPS with Reverse Proxy
 
-Network Optimizer works behind any reverse proxy (nginx, Caddy, Traefik, SWAG, etc.) for SSL termination. Setting up the proxy itself is only half the story though - you also need to tell the app it's being proxied so it builds the correct URLs for things like speed test result reporting and canonical redirects.
+Run Network Optimizer behind a reverse proxy that terminates TLS. We don't recommend or support serving it over plain HTTP: it has admin access to your UniFi Console and network devices, and passkey sign-in and speed test locations only work over HTTPS.
+
+Any reverse proxy works (nginx, Caddy, Traefik, SWAG, etc.). Many self-hosters already run one, so the choice is yours. If you don't have one yet, [NetworkOptimizer-Proxy](https://github.com/Ozark-Connect/NetworkOptimizer-Proxy), our ready-made Traefik setup, is the recommended starting point (see [Traefik](#traefik-recommended-for-speed-testing) below).
+
+Setting up the proxy itself is only half the story though - you also need to tell the app it's being proxied so it builds the correct URLs for things like speed test result reporting and canonical redirects.
+
+If your proxy setup still won't cooperate, ask in `#install-help` on the [Network Optimizer Discord](https://discord.gg/pHrmzbBCY3) with your proxy, its config, and what you see.
 
 #### Configuring Your .env for Reverse Proxy
 
@@ -400,19 +406,21 @@ OPENSPEEDTEST_HTTPS=true
 
 If your proxy fronts the app on a port other than 443 (for example, one hostname with the app and the speed test separated by port), also set `REVERSE_PROXIED_PORT` to that port. This is supported, but host-based routing on 443 is the recommended setup: one hostname per service and no ports to remember. With local DNS on your gateway and a proxy that does DNS-01 certificates (Caddy, Traefik), there is no reason to need a non-standard port, even without exposing anything publicly.
 
+Also set `TRUSTED_PROXIES` to your proxy's address (`127.0.0.1,::1` for a proxy on the same host). Without it the app ignores forwarded headers, so the audit log and login rate limiting see every user as the proxy.
+
 See [`.env.example`](.env.example) for the full list of variables and detailed explanations of what each one does.
 
 **If the reverse proxy is on the same host**, also add:
 ```env
 BIND_LOCALHOST_ONLY=true
 ```
-This binds the app to localhost only (`127.0.0.1` and `::1`) instead of all interfaces, so only the local proxy can reach it directly. Both loopback families are bound, so a proxy dialing `localhost` reaches it whichever one the host resolves first. The On-Site Agent tunnel port (8043) is the exception: it always listens on all interfaces, because agents at other sites connect to it directly rather than through the proxy.
+This binds the app to localhost only (`127.0.0.1` and `::1`) instead of all interfaces, so only the local proxy can reach it directly. Both loopback families are bound, so a proxy dialing `localhost` reaches it whichever one the host resolves first. The On-Site Agent tunnel port (8043) is the exception: it always listens on all interfaces. Agents normally reach it through the proxy's agent tunnel route (below); connecting them to 8043 directly works, but is an unusual setup.
 
 #### Traefik (Recommended for Speed Testing)
 
 If you use the browser-based speed test (OpenSpeedTest), Traefik is the recommended reverse proxy. Most proxies negotiate HTTP/2 at the TLS level, and HTTP/2 multiplexing interferes with speed test throughput measurements. Traefik's per-router TLS options let you force HTTP/1.1 for the speed test hostname while keeping HTTP/2 for the main app - all on one port 443.
 
-See [NetworkOptimizer-Proxy](https://github.com/Ozark-Connect/NetworkOptimizer-Proxy) for a ready-to-use Docker Compose setup with automatic Let's Encrypt certificates via Cloudflare DNS-01.
+See [NetworkOptimizer-Proxy](https://github.com/Ozark-Connect/NetworkOptimizer-Proxy) for a ready-to-use Docker Compose setup with automatic Let's Encrypt certificates via DNS-01 (Cloudflare by default; other DNS providers are available through an `.env` setting).
 
 **Running multi-site or multi-WAN agents?** They dial home over a long-lived gRPC tunnel that needs its own proxy route. New installs ship it enabled; older ones don't, since `setup.sh` only copies the example config on first run. Add it with:
 
@@ -422,7 +430,7 @@ curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer-Prox
 
 The server binds the tunnel on port 8043 at startup whether or not you run agents, so enabling multi-site never needs a restart. Reach it through the proxy route above rather than exposing 8043 itself; only an enrolled agent's key opens a tunnel, but the port has no other reason to be public.
 
-**Proxmox users:** The [Proxmox LXC installer](../scripts/proxmox/README.md) can set up Traefik automatically during installation.
+**Proxmox users:** The [Proxmox LXC installer](../scripts/proxmox/README.md) can set up Traefik automatically during installation. For an existing container, [`add-https.sh`](../scripts/proxmox/README.md#adding-https-to-an-existing-install) adds the same setup and keeps your data.
 
 **Windows users:** Traefik is available as an optional feature in the MSI installer.
 
@@ -488,26 +496,36 @@ Restart Caddy:
 sudo systemctl reload caddy
 ```
 
+#### Nginx Proxy Manager and Zoraxy
+
+Both are GUI-driven, so they have their own step-by-step guides covering the app, the speed test and On-Site Agents: [Nginx Proxy Manager](../docs/NGINX-PROXY-MANAGER.md) and [Zoraxy](../docs/ZORAXY.md).
+
 ### Speed Test Server Tuning
 
 Enable BBR congestion control on any host serving the speed test over the internet. The default (CUBIC) backs off hard on the small amount of loss normal to a long path, so it under-reports throughput the link can actually deliver. BBR paces on measured bandwidth and RTT instead. On a LAN-only speed test it makes little difference.
 
-This is a host setting, not a container one. The container shares the host's network stack, so setting it on the host covers the speed test. It mainly moves the download number, since that is the direction the server sends.
+Raise the TCP buffer ceiling on the same hosts. The kernel default (6 MB receive, 4 MB send) limits a single TCP stream to about buffer / RTT: roughly 225 Mbps at 100 ms. A 32 MB ceiling removes that limit for internet-facing tests. LAN tests are not affected.
+
+These are host settings, not container ones. The speed test container takes the host's values when it starts, so restart it after a change. The speed test log prints the values in effect at startup.
 
 ```bash
-# Available? (kernel 4.9+)
+# BBR available? (kernel 4.9+)
 sysctl net.ipv4.tcp_available_congestion_control
 
-# Enable BBR with fair queueing, persisted across reboots
-cat >/etc/sysctl.d/99-bbr.conf <<'EOF'
+# Enable BBR with fair queueing and raise the TCP buffer ceiling, persisted across reboots
+cat >/etc/sysctl.d/99-speedtest.conf <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
 EOF
 sysctl --system
 
 # Verify
-sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc
+sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_rmem net.ipv4.tcp_wmem
 ```
+
+**Synology / QNAP:** DSM and QTS do not reliably keep `/etc/sysctl.d`. Run the `sysctl -w` form of the settings above as a boot-time task instead (Synology: Control Panel - Task Scheduler - Triggered Task - Boot-up, user root), then restart the speed test container. Leave out the two BBR lines if the first command does not list `bbr`.
 
 ### Firewall Configuration
 
@@ -822,8 +840,30 @@ cp ~/.local/share/NetworkOptimizer/network_optimizer.db ~/network_optimizer.db.b
 # Pull latest from main and rebuild
 cd ~/NetworkOptimizer   # wherever you cloned it
 git fetch origin && git checkout main && git pull
-dotnet publish src/NetworkOptimizer.Web -c Release -r linux-x64 --self-contained -o /opt/network-optimizer
+dotnet publish src/NetworkOptimizer.Web -c Release -r linux-x64 --self-contained -p:PublishReadyToRun=true -o /opt/network-optimizer
 chmod +x /opt/network-optimizer/NetworkOptimizer.Web
+
+# Rebuild the Go helpers, every update: a release can change one or add a new target
+VERSION=$(git describe --tags --always 2>/dev/null || echo "dev")
+VERSION="${VERSION#v}"
+TOOLS=/opt/network-optimizer/tools
+mkdir -p "$TOOLS"
+cd src/uwnspeedtest
+CGO_ENABLED=0 GOOS=linux GOARCH=$(go env GOHOSTARCH) go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/uwnspeedtest-linux-$(go env GOHOSTARCH)" .
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/uwnspeedtest-linux-arm64" .
+cd ../wansteer
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/wansteer-linux-arm64" .
+cd ../apagent
+CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/apagent-linux-arm" .
+CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/apagent-linux-mipsle" .
+CGO_ENABLED=0 GOOS=linux GOARCH=mips GOMIPS=softfloat go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o "$TOOLS/apagent-linux-mips" .
+cd ../..
 
 # Start service
 sudo systemctl start network-optimizer
@@ -831,7 +871,7 @@ sudo systemctl start network-optimizer
 
 On ARM64 hardware, publish with `-r linux-arm64` and prefix the command with `PROTOBUF_PROTOC=/usr/bin/protoc`, using the distro's protoc as described in the [Native Deployment Guide](NATIVE-DEPLOYMENT.md#build-from-source).
 
-Publishing over the install directory replaces the app files only: your `start.sh`, `tools/`, and `logs/` are left in place, and your database and credential key live outside it in `~/.local/share/NetworkOptimizer/`. If you built the optional helpers (`uwnspeedtest`, `wansteer`, `apagent`), rebuild them per the [Native Deployment Guide](NATIVE-DEPLOYMENT.md) when a release changes them.
+Publishing over the install directory replaces the app files only: your `start.sh`, `tools/`, and `logs/` are left in place, and your database and credential key live outside it in `~/.local/share/NetworkOptimizer/`. The Go helpers in `tools/` are not part of the publish, which is why the update rebuilds them. They need [Go](https://go.dev/dl/), as in the [Native Deployment Guide](NATIVE-DEPLOYMENT.md#build-the-go-helpers).
 
 ### Verify Update
 
@@ -849,7 +889,7 @@ curl -s http://localhost:8042/api/health
 
 ## Joining the Preview Channel
 
-Preview builds ship early access to features before the next release. The `:preview` tag receives every preview AND every release, so you never fall behind - when a release ships, `:preview` gets it too.
+Preview builds ship early access to features before the next release. The `:preview` tag always gets the latest features and fixes, so you never fall behind.
 
 ### Docker / Proxmox
 
@@ -923,6 +963,8 @@ docker compose pull && docker compose up -d
 ```
 
 ## Troubleshooting
+
+If nothing below fits, ask on the [Network Optimizer Discord](https://discord.gg/pHrmzbBCY3): `#install-help` for setup, `#troubleshooting` for everything after it. Confirmed bugs go to [GitHub Issues](https://github.com/Ozark-Connect/NetworkOptimizer/issues).
 
 ### Reset Admin Password
 
@@ -1054,11 +1096,12 @@ Now a leak of the data volume no longer includes the key. **Migration note:** to
 
 ### Network Access
 
-Network Optimizer stores UniFi controller credentials and SSH passwords. Limit access to the web UI:
+Network Optimizer has admin access to your UniFi Console and network devices. Before you expose it beyond your local network:
 
-- Use a reverse proxy with authentication if exposing beyond your local network
-- Consider firewall rules to restrict access to trusted IPs
-- Use HTTPS via reverse proxy (see examples above)
+- Serve it over HTTPS (see [HTTPS with Reverse Proxy](#https-with-reverse-proxy))
+- Give every person their own account, and turn on **Require MFA / passkey** for each role in **Settings > Identity**
+- Prefer passkeys. Where a password is used, make it strong and add an authenticator app. Each user sets both up on the **Security** page (the lock icon at the top)
+- Restrict access to known IPs (your sites' public addresses, for example) with an allow list in your reverse proxy or firewall, where you can
 
 ### SSH host keys
 
@@ -1079,16 +1122,19 @@ Create a dedicated **Local Access Only** account on your UniFi controller for Ne
 4. Enter a name and email for this service account
 5. Check **Admin** and **Restrict to Local Access Only**
 6. Uncheck **Use a Predefined Role** and set:
-   - **Network:** View Only
-   - **Protect:** View Only
+   - **Network:** Full (Site Admin in older versions)
+   - **Protect:** View (View Only in older versions)
    - **User & Account Management:** None
 7. Set a secure password and save
+
+Network has no role between View (View Only) and Full (Site Admin), and two features write to UniFi Network: the Wi-Fi Optimizer's on-demand RF spectrum scans and **Apply Recommended Channels**. UniFi Network 11 also withholds the SNMP Community String and SNMPv3 password from View, so SNMP monitoring needs Full (or an API key). If you won't use any of these, **Network: View** works for everything else.
 
 Use this username and password in Network Optimizer Settings.
 
 ## Support
 
-- GitHub Issues: https://github.com/Ozark-Connect/NetworkOptimizer/issues
+- Help and discussion: [Discord](https://discord.gg/pHrmzbBCY3)
+- Confirmed bugs and feature requests: https://github.com/Ozark-Connect/NetworkOptimizer/issues
 - Email: tj@ozarkconnect.net
 
 ## UniFi SSH Configuration
@@ -1216,6 +1262,8 @@ OPENSPEEDTEST_HTTPS_PORT=443        # Optional - HTTPS port if not 443
 
 See `.env.example` for full documentation on each setting.
 
+**Running the two containers separately?** If you configure each container on its own (Portainer, CasaOS, Unraid templates) instead of with the bundled compose file and its `.env`, the speed test container needs the same host settings as the app: `REVERSE_PROXIED_HOST_NAME`, `HOST_NAME`, or `HOST_IP`. Those settings tell it where to post results. Without any of them, it posts to its own hostname on port 8042.
+
 **Usage:**
 1. Open `http://your-server:3005` from any device on your network
 2. Run the speed test
@@ -1247,6 +1295,12 @@ OPENSPEEDTEST_HTTPS=true
 Blocked loading mixed active content "http://..."
 ```
 It means your speedtest is HTTPS but trying to POST results to an HTTP endpoint. Set `REVERSE_PROXIED_HOST_NAME` to fix.
+
+**If you see this error in browser console:**
+```
+Cross-Origin Request Blocked: ... http://<speedtest-host>:8042/api/public/speedtest/results ... Status code: 302
+```
+The speed test is posting results to its own hostname instead of to Network Optimizer. This happens when the speed test container has none of the host settings above, usually because it was configured separately from the app. Give it the same `REVERSE_PROXIED_HOST_NAME` (or `HOST_NAME` / `HOST_IP`) as the app, then recreate it.
 
 ### iperf3 Server Mode
 
@@ -1312,20 +1366,20 @@ Deploy an OpenSpeedTest instance to a remote server (VPS, cloud VM, etc.) to let
 **How it works:** The client's browser connects to the remote speed test server. Traffic flows: client → your WAN → internet → remote server → internet → your WAN → client. The result is posted back to Network Optimizer with a server identifier, and stored as a WAN speed test result.
 
 **Requirements:**
-- A remote server with Docker (any cloud VPS works)
-- Port 3005 (or your chosen port) open on the remote server
-- **HTTPS on the external server** (strongly recommended - see note below)
+- A remote server with Docker (any cloud VPS works), outside your network. A server behind your own WAN measures your LAN, not your internet connection.
+- Port 3005 (or your chosen port) reachable from your WAN IP. Every test comes from your network, so nothing else needs access.
+- **HTTPS in front of the speed test page** (strongly recommended - see note below). The container serves HTTP, so TLS comes from a reverse proxy, either on your network or on the remote server.
 
 **Why HTTPS?** Chrome and Edge enforce [Private Network Access](https://developer.chrome.com/blog/private-network-access-update) rules. The speed test page is served from a public IP, and the browser posts results back to Network Optimizer on your LAN (a private IP). These browsers block this unless the page origin is HTTPS (a secure context). Firefox and Safari do not currently enforce this restriction, but HTTPS is still strongly recommended.
 
 **Setup:**
 
-1. In Network Optimizer, go to **Settings → External Speed Test Server**
+1. In Network Optimizer, go to **Settings - Speed Tests - External Speed Test Servers**
 2. Enter the server name, hostname/IP, port, and scheme (HTTPS)
 3. Save - a **deploy command** will appear with everything pre-filled
 4. SSH to your remote server and run the deploy command
 
-The deploy command handles downloading files, building the container, and starting the server. The Server ID is automatically generated from the name you entered and links results back to this server.
+The deploy command handles downloading files, building the container, and starting the server. The Server ID is automatically generated from the name you entered and links results back to this server. Use the deploy command rather than the `speedtest` image from the main stack: that image has no Server ID, so its results land in Client Speed Test instead of Client WAN Test.
 
 **Interactive deploy** (if you haven't configured Settings yet, the script will walk you through it):
 ```bash
@@ -1337,11 +1391,16 @@ curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main
 curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/deploy-external-speedtest.sh | bash -s -- --update
 ```
 
-**Setting up HTTPS:** If you use [NetworkOptimizer-Proxy](https://github.com/Ozark-Connect/NetworkOptimizer-Proxy) (Traefik), the WAN speed test route is already included in `config.example.yml` - just uncomment the `speedtest-wan` router and service, update the hostname and VPS address, and you're done. The config enforces HTTP/1.1 and strips compression headers automatically.
+**Setting up HTTPS:** Put a reverse proxy with TLS in front of the container on port 3005. Either placement works:
 
-If you use a different reverse proxy, add a route for the external speed test hostname pointing to your remote server on port 3005. The reverse proxy must force HTTP/1.1 for accurate speed test results (HTTP/2 multiplexing interferes with throughput measurement).
+- **On your network.** Your local reverse proxy terminates TLS and forwards plain HTTP to the remote server. Every test runs from your network, so the remote leg needs no certificate.
+- **On the remote server.** Traefik, Caddy, nginx, or another reverse proxy on the VPS, with a Let's Encrypt certificate (certbot or the proxy's built-in ACME) or a self-signed one. A self-signed certificate works, but each browser has to accept it once before the page counts as a secure context.
 
-Then update the external server settings in Network Optimizer to use `https` scheme and port `443`.
+If you use [NetworkOptimizer-Proxy](https://github.com/Ozark-Connect/NetworkOptimizer-Proxy) (Traefik), on either side, the WAN speed test route is already included in `config.example.yml` - just uncomment the `speedtest-wan` router and service, update the hostname and server address, and you're done. The config enforces HTTP/1.1 and strips compression headers automatically.
+
+With any other reverse proxy, add a route for the external speed test hostname pointing to the container on port 3005. The reverse proxy must force HTTP/1.1 for accurate speed test results (HTTP/2 multiplexing interferes with throughput measurement).
+
+Then update the external server settings in Network Optimizer to use your proxy's hostname, `https` scheme, and port `443`. The container keeps listening on 3005.
 
 ### Disabling Optional Services
 
@@ -1372,7 +1431,7 @@ cd /opt/network-optimizer/docker/influxdb   # or wherever you deployed
 docker compose up -d
 ```
 
-InfluxDB will be available at `http://localhost:8086`. Open the UI to create an admin user and an all-access API token, then go to Network Optimizer's Monitoring page to finish setup.
+InfluxDB will be available at `http://<docker-host>:8086` (the IP or hostname of the machine running Docker). Open the UI to create an admin user and an all-access API token, then go to Network Optimizer's Monitoring page to finish setup.
 
 ### Option B: Proxmox LXC
 
@@ -1408,6 +1467,55 @@ See the [official InfluxDB 2.x install docs](https://docs.influxdata.com/influxd
 Your monitoring data sits in plain InfluxDB 2.x buckets, so you can point your own Grafana (or any InfluxDB client) at the same instance and build whatever dashboards you want. Add the instance to Grafana as a Flux data source and query the `network_monitoring` and `network_monitoring_longterm` buckets - browse the measurements there for interface counters, device health, latency, SFP optics, Wi-Fi clients, and modem / ONT signal.
 
 The schema is stable: measurement and field names only ever get added, never renamed or removed (Network Optimizer's own charts depend on them), so anything you build keeps working across upgrades.
+
+## What Live Traffic Stores
+
+Live Traffic shows which apps, protocols, destinations, and DNS lookups each client uses. Network Optimizer stores none of that detail. It exists only in memory, for as long as someone is viewing it.
+
+- **Flows and Live DNS** (On-Site Agent on the gateway): the agent reads the gateway's conntrack table, and DNS traffic, and sends per-flow and DNS detail only while a Live Traffic view is open, and for up to a minute after it closes, so coming back to the page is live immediately. The detail travels over the agent's HTTPS tunnel. The agent never writes it to its disk buffer, and it stops sending on its own when that minute runs out. Turning capture off (below) stops it immediately. The server keeps it in memory only.
+- **Flow history**: for past time ranges, and on sites without a gateway agent, Live Traffic reads UniFi Network's own flow history from the UniFi Console. Network Optimizer caches it in memory and never copies it to its own storage. UniFi Network decides how long that history is kept.
+- **Usage totals**: what Network Optimizer stores per device is aggregate usage, not per app or protocol. WAN usage comes from the gateway agent (`client_wan`), and LAN + WAN usage from Wi-Fi stats (`wifi_client`) and switch port stats (`wired_client`, `interface_counters`). None of it carries an app, protocol, destination, or TCP/UDP port. With InfluxDB configured it is kept at the monitoring buckets' retention (90 days raw and 365 days as hourly totals, by default). It feeds the Live Traffic ranking from the last hour to 30 days, and the per-device usage in Client Performance.
+
+To turn off Live Traffic flow and DNS capture for a site, clear **Enable Live Traffic flow and DNS capture** in Settings - Monitoring - **Live Traffic**. The agent then sends no flows or DNS lookups, and the Live Traffic card on Monitoring - Live View ranks clients by usage only. History keeps working from UniFi Network's flow records.
+
+If a future release keeps a history of client activity (which apps, protocols, or destinations a client used), that history will be opt-in and off by default.
+
+## Tailscale (Optional)
+
+Settings - Connection - **Tailscale** resolves Tailscale devices in Client Performance, speed test results, and Live Traffic, and shows whether each one connects directly or through a relay. Network Optimizer only reads: it never changes the tailnet. Set it per site.
+
+### Connect
+
+- **Tailscale**: in the Tailscale Admin console, go to Settings - Trust credentials, click **+ Credential**, and add an OAuth credential with the **Devices Core** scope set to **Read** (`devices:core:read`). Enter its client ID and secret. The credential's own tailnet is the one read.
+- **Headscale**: the server's URL and an API key from `headscale apikeys create`.
+
+The Tailscale API is read from the Network Optimizer server. So is a Headscale server, unless its address is private or its name resolves only inside the site: then, on a site reached through its On-Site Agent, it is read through the agent, so a Headscale server on that site's LAN works.
+
+### What you get
+
+- Tailscale devices by name, OS, and owner (or tags) in Client Performance, which also lists them in its device selector and opens each one in Live Traffic (**Open in Live Traffic**).
+- Tailscale flows in Live Traffic named by the device at the far end. Of a device's flows, the busiest reads **Direct** and the rest **Path probe** (tailscaled probes every endpoint a device has). Flows to Tailscale's relay servers are named by region, such as Tailscale DERP (Dallas), and read **DERP relay** or **STUN**.
+- How a device connects (Direct or Relayed), read off the gateway's flows. On a Tailscale speed test result it is read right after the test and labeled "(seen just after the test)".
+- Tailscale speed test results named by the device, earlier results included.
+
+The API lists only devices your tailnet owns: a device another tailnet shares with you keeps its address.
+
+### Tailscale on an On-Site Agent's host
+
+With the Tailscale connection configured, an On-Site Agent whose host also runs Tailscale (a Linux server or Raspberry Pi that is your subnet router or exit node, for example) adds what the API and the gateway's flows cannot. Nothing here runs until the connection is configured, and the card names the agent while it is in use.
+
+- The exact path for every device (direct, DERP relay with its region, or peer relay), read from that host's tailscaled rather than observed, and per-device traffic counters. A speed test run through that host records its path exactly.
+- When that host is the tailnet's subnet router or exit node, Live Traffic shows the Tailscale device behind each connection it routes instead of the host, read from the host's conntrack table. By default a router source-NATs its peers to its own LAN address, so only that host's table holds which peer it was. A node started with `--snat-subnet-routes=false`, with the gateway routing `100.64.0.0/10` to it, needs none of this: its peers keep their tailnet addresses.
+
+Requirements:
+
+- The v2.11.1-preview5 On-Site Agent or later, installed natively (`install-native.sh`), so it runs as root on the host. Network Optimizer's own container runs as a non-root user and cannot read conntrack, so on a Docker install the agent goes beside it on the same host.
+- For routed-traffic attribution, tailscaled in the host's network (`network_mode: host` for a container). Userspace networking leaves no conntrack entries.
+- tailscaled's LocalAPI socket at `/var/run/tailscale/tailscaled.sock`. When tailscaled runs in a container, set `TS_SOCKET=/var/run/tailscale/tailscaled.sock` on it and mount `/var/run/tailscale` from the host. For a root caller the socket allows changes as well as reads; the agent sends only `GET /localapi/v0/status`.
+
+An agent on macOS (built from source: see the agent README) gives the paths and counters but not routed traffic, since tailscaled on macOS does its NAT inside its own process rather than in a table the agent can read.
+
+When a site has several agents, the one whose host routes for the tailnet is used, else the first whose host runs Tailscale. An agent that connects later, as after a restart, is asked at once. Agents already asked without Tailscale are asked again every 10 minutes, so Tailscale added to a host later is picked up within that time (saving the Tailscale card checks at once).
 
 ## Next Steps
 

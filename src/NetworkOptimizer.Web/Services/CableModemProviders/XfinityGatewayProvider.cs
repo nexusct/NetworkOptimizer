@@ -9,10 +9,11 @@ namespace NetworkOptimizer.Web.Services.CableModemProviders;
 
 /// <summary>
 /// Cable modem provider for gateways sharing the Comcast-derived .jst web UI,
-/// whatever the OEM: Xfinity XB8/XB10 (Sercomm), Comcast Business CGA4332
-/// (Technicolor), Cox CGM4981 (Technicolor). Authenticates via form POST to
+/// whatever the OEM: Xfinity XB8/XB10 (Sercomm), Xfinity XB7 / CGM4331, Comcast
+/// Business CGA4332 and Cox CGM4981 (Technicolor). Authenticates via form POST to
 /// /check.jst, then scrapes DOCSIS channel tables that use a transposed layout
-/// where each row is a metric and each column is a channel.
+/// where each row is a metric and each column is a channel. Port 443 selects
+/// HTTPS; the gateways serve the same UI on both.
 ///
 /// Firmware families differ in two ways this provider absorbs rather than
 /// exposing as separate providers, because a user cannot tell them apart from
@@ -30,7 +31,13 @@ public sealed class XfinityGatewayProvider : ICableModemProvider
     public string ProviderKey => "xfinity-gateway";
 
     /// <inheritdoc/>
-    public string DisplayName => "Xfinity XB8/XB10, Comcast Business CGA4332, Cox CGM4981 (HTTP)";
+    public string DisplayName => "Xfinity XB7/XB8/XB10, Comcast Business CGA4332, Cox CGM4981 (HTTP)";
+
+    /// <inheritdoc/>
+    public CmCredentialRequirement Credentials => CmCredentialRequirement.Required;
+
+    /// <inheritdoc/>
+    public bool BlankUsernameMeansAdmin => false;
 
     /// <summary>
     /// Status page candidates in discovery order. Residential firmware first:
@@ -87,13 +94,13 @@ public sealed class XfinityGatewayProvider : ICableModemProvider
                 {
                     _logger.LogWarning(
                         "Xfinity Gateway at {Host} returned empty response (attempt {Attempt}/{Max})",
-                        context.ConfiguredHost ?? context.Host, attempt, MaxRetries);
+                        context.Host, attempt, MaxRetries);
                     if (attempt < MaxRetries)
                     {
                         await Task.Delay(RetryDelay, cancellationToken);
                         continue;
                     }
-                    return PollResult<CableModemStats>.Failed($"No stats could be read from {(context.ConfiguredHost ?? context.Host)}.");
+                    return PollResult<CableModemStats>.Failed($"No stats could be read from {context.Host}.");
                 }
 
                 var stats = ParseNetworkSetup(html, context);
@@ -115,15 +122,15 @@ public sealed class XfinityGatewayProvider : ICableModemProvider
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Error polling Xfinity Gateway {Name} at {Host}", context.Name, context.ConfiguredHost ?? context.Host);
-                return PollResult<CableModemStats>.Failed(HttpFailureSummary.Describe(ex, (context.ConfiguredHost ?? context.Host)));
+                _logger.LogWarning(ex, "Error polling Xfinity Gateway {Name} at {Host}", context.Name, context.Host);
+                return PollResult<CableModemStats>.Failed(HttpFailureSummary.Describe(ex, context.Host));
             }
         }
 
         // Every retry is spent. The last attempt's own catch returns before this,
         // so reaching here means each one came back empty rather than throwing.
         return PollResult<CableModemStats>.Failed(
-            $"No stats could be read from {context.ConfiguredHost ?? context.Host}.");
+            $"No stats could be read from {context.Host}.");
     }
 
     /// <inheritdoc/>
@@ -159,7 +166,7 @@ public sealed class XfinityGatewayProvider : ICableModemProvider
         }
         catch (Exception ex)
         {
-            return (false, HttpFailureSummary.Describe(ex, context.ConfiguredHost ?? context.Host));
+            return (false, HttpFailureSummary.Describe(ex, context.Host));
         }
     }
 
@@ -170,15 +177,16 @@ public sealed class XfinityGatewayProvider : ICableModemProvider
     /// </summary>
     private async Task<string?> FetchStatusPageAsync(CmPollContext context, CancellationToken cancellationToken)
     {
-        var port = context.Port > 0 ? context.Port : 80;
-        var portSuffix = port == 80 ? "" : $":{port}";
-        var baseUrl = $"http://{context.Host}{portSuffix}";
+        var baseUrl = BuildBaseUrl(context);
 
-        using var handler = new HttpClientHandler
+        using var handler = new SocketsHttpHandler
         {
+            ConnectCallback = DeviceHttp.Via(context.Dialer),
             CookieContainer = new CookieContainer(),
             AllowAutoRedirect = true,
             AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
+            // The gateways' certificate chains end in a self-signed root.
+            SslOptions = { RemoteCertificateValidationCallback = (_, _, _, _) => true },
         };
         using var client = new HttpClient(handler)
         {
@@ -198,7 +206,7 @@ public sealed class XfinityGatewayProvider : ICableModemProvider
         if (!loginResponse.IsSuccessStatusCode)
         {
             _logger.LogDebug("Xfinity Gateway login returned {Status} for {Host}",
-                loginResponse.StatusCode, context.ConfiguredHost ?? context.Host);
+                loginResponse.StatusCode, context.Host);
             return null;
         }
 
@@ -218,7 +226,7 @@ public sealed class XfinityGatewayProvider : ICableModemProvider
             if (!HasChannelData(html))
             {
                 _logger.LogDebug("Xfinity Gateway at {Host}: {Path} has no DOCSIS channel tables",
-                    context.ConfiguredHost ?? context.Host, path);
+                    context.Host, path);
                 continue;
             }
 
@@ -227,6 +235,21 @@ public sealed class XfinityGatewayProvider : ICableModemProvider
         }
 
         return readableButUnparsed;
+    }
+
+    /// <summary>
+    /// Origin for the configured port: 443 means HTTPS, as in the Technicolor CGA,
+    /// Sagemcom and Vodafone providers; blank means 80; any other port is HTTP.
+    /// </summary>
+    internal static string BuildBaseUrl(CmPollContext context)
+    {
+        var port = context.Port > 0 ? context.Port : 80;
+        return port switch
+        {
+            80 => $"http://{context.Host}",
+            443 => $"https://{context.Host}",
+            _ => $"http://{context.Host}:{port}",
+        };
     }
 
     /// <summary>
@@ -248,7 +271,7 @@ public sealed class XfinityGatewayProvider : ICableModemProvider
             if (!response.IsSuccessStatusCode)
             {
                 _logger.LogDebug("Xfinity Gateway at {Host}: {Path} returned {Status}",
-                    context.ConfiguredHost ?? context.Host, path, response.StatusCode);
+                    context.Host, path, response.StatusCode);
                 return null;
             }
 
@@ -259,7 +282,7 @@ public sealed class XfinityGatewayProvider : ICableModemProvider
             if (IsLoginPage(html))
             {
                 _logger.LogDebug("Xfinity Gateway at {Host}: login failed, got redirected back to login page",
-                    context.ConfiguredHost ?? context.Host);
+                    context.Host);
                 return null;
             }
 
@@ -304,7 +327,7 @@ public sealed class XfinityGatewayProvider : ICableModemProvider
 
         _discoveredPaths[key] = entry;
         _logger.LogDebug("Xfinity Gateway {Name} at {Host}: serving DOCSIS stats from {Path}",
-            context.Name, context.ConfiguredHost ?? context.Host, path);
+            context.Name, context.Host, path);
     }
 
     /// <summary>Whether a page carries a channel table this provider can read.</summary>
@@ -336,7 +359,7 @@ public sealed class XfinityGatewayProvider : ICableModemProvider
         var stats = new CableModemStats
         {
             Timestamp = DateTime.UtcNow,
-            DeviceHost = context.ConfiguredHost ?? context.Host,
+            DeviceHost = context.Host,
             DeviceName = context.Name,
             DeviceModel = ExtractProductType(doc) ?? "Xfinity Gateway",
         };
@@ -350,10 +373,41 @@ public sealed class XfinityGatewayProvider : ICableModemProvider
             ParseTransposedUpstreamTable(tables.Upstream, stats);
 
         if (tables.ErrorCodewords != null)
+        {
             MergeErrorCodewords(tables.ErrorCodewords, stats);
+            ClearPrimaryCodewordEcho(stats);
+        }
 
         return stats;
     }
+
+    /// <summary>
+    /// The firmware fills the primary (first) SC-QAM column's codewords with the
+    /// last OFDM channel's counters, seen on XB10, CGM4331, CGM4981 and CGA4332.
+    /// Left in, totals count the OFDM errors twice and pin billions of them on one
+    /// SC-QAM channel. The primary's own counters are not on the page, so they read 0.
+    /// </summary>
+    private static void ClearPrimaryCodewordEcho(CableModemStats stats)
+    {
+        if (stats.DownstreamChannels.Count == 0)
+            return;
+
+        var primary = stats.DownstreamChannels[0];
+        if (IsOfdm(primary) || (primary.Correctables == 0 && primary.Uncorrectables == 0))
+            return;
+
+        var echoed = stats.DownstreamChannels.Skip(1).Any(ch => IsOfdm(ch)
+            && ch.Correctables == primary.Correctables
+            && ch.Uncorrectables == primary.Uncorrectables);
+        if (!echoed)
+            return;
+
+        primary.Correctables = 0;
+        primary.Uncorrectables = 0;
+    }
+
+    private static bool IsOfdm(DsChannel channel) =>
+        channel.Modulation.Contains("OFDM", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Locate the three DOCSIS tables by their header text.
@@ -444,6 +498,11 @@ public sealed class XfinityGatewayProvider : ICableModemProvider
 
         for (int i = 0; i < channelIds.Count; i++)
         {
+            // Every .jst firmware seen labels the OFDMA channel's Channel Type "TDMA";
+            // only its Modulation row says OFDMA, and OFDMA detection reads ChannelType.
+            var modulation = GetAt(modulations, i);
+            var isOfdma = string.Equals(modulation, "OFDMA", StringComparison.OrdinalIgnoreCase);
+
             var channel = new UsChannel
             {
                 ChannelId = ParseInt(GetAt(channelIds, i)),
@@ -451,7 +510,7 @@ public sealed class XfinityGatewayProvider : ICableModemProvider
                 Frequency = ParseFrequencyWithUnits(GetAt(frequencies, i)),
                 SymbolRate = ParseLong(GetAt(symbolRates, i)),
                 Power = ParseDouble(GetAt(powers, i)),
-                ChannelType = GetAt(channelTypes, i) ?? GetAt(modulations, i) ?? "",
+                ChannelType = isOfdma ? "OFDMA" : GetAt(channelTypes, i) ?? modulation ?? "",
             };
 
             stats.UpstreamChannels.Add(channel);

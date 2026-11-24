@@ -11,6 +11,9 @@ namespace NetworkOptimizer.Alerts;
 /// </summary>
 public static class DefaultAlertRules
 {
+    /// <summary>The WAN speed test degradation rule's shipped name, which its first-use enable matches.</summary>
+    public const string WanSpeedDegradationRuleName = "WAN Speed Test: Degradation";
+
     public static List<AlertRule> GetDefaults() =>
     [
         // --- Security Audit rules (enabled - only needs UniFi connection) ---
@@ -83,6 +86,26 @@ public static class DefaultAlertRules
             MinSeverity = AlertSeverity.Info,
             CooldownSeconds = 60 // 1 minute - recoveries are paired with offline events
         },
+        // Answering on the network but not reporting to UniFi Network. The evaluator holds it 5
+        // minutes first, so a Network restart or inform address change never reaches this rule.
+        new AlertRule
+        {
+            Name = "Device Not Reporting",
+            IsEnabled = true,
+            EventTypePattern = "device.unmanaged",
+            Source = "device",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 1800 // 30 minutes - the evaluator fires once per episode
+        },
+        new AlertRule
+        {
+            Name = "Device Reporting Again",
+            IsEnabled = true,
+            EventTypePattern = "device.managed",
+            Source = "device",
+            MinSeverity = AlertSeverity.Info,
+            CooldownSeconds = 60 // 1 minute - paired with device.unmanaged
+        },
         // Reboot reasons are published Info for a restart someone meant (commanded, firmware
         // upgrade) and Warning for one nobody did (power loss, hang, panic, watchdog). Seeded at
         // Warning so only the latter notify; drop it to Info to be told about every restart.
@@ -129,6 +152,62 @@ public static class DefaultAlertRules
             MinSeverity = AlertSeverity.Warning,
             CooldownSeconds = 3600 // 1 hour
         },
+        // --- Threat Intelligence: a device on the site reaching a public block list (a likely infected device) ---
+        new AlertRule
+        {
+            Name = "Threat Intelligence: Public Block List Contact",
+            IsEnabled = true,
+            EventTypePattern = "threats.public_list_contact",
+            Source = "threats",
+            MinSeverity = AlertSeverity.Critical,
+            CooldownSeconds = 3600 // 1 hour per device
+        },
+        new AlertRule
+        {
+            Name = "Threat Intelligence: Public Block List Attempt",
+            IsEnabled = true,
+            EventTypePattern = "threats.public_list_attempt",
+            Source = "threats",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 3600 // 1 hour per device
+        },
+        // --- Threat Intelligence: WAN Flood Protection (one alert per flood episode, raised by the gateway agent's report) ---
+        new AlertRule
+        {
+            Name = "Threat Intelligence: WAN Flood",
+            IsEnabled = true,
+            EventTypePattern = "threats.wan_flood",
+            Source = "threats",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 1800 // 30 minutes
+        },
+        new AlertRule
+        {
+            Name = "Threat Intelligence: WAN Flood Conntrack Pressure",
+            IsEnabled = true,
+            EventTypePattern = "threats.wan_flood_conntrack",
+            Source = "threats",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 1800 // 30 minutes
+        },
+        new AlertRule
+        {
+            Name = "Threat Intelligence: WAN Flood Protection Table Full",
+            IsEnabled = true,
+            EventTypePattern = "threats.wan_flood_table_full",
+            Source = "threats",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 3600 // 1 hour
+        },
+        new AlertRule
+        {
+            Name = "Threat Intelligence: WAN Flood Protection Not Enforced",
+            IsEnabled = true,
+            EventTypePattern = "threats.wan_flood_unenforced",
+            Source = "threats",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 21600 // 6 hours
+        },
         new AlertRule
         {
             Name = "Threat Intelligence: Early-Stage Attack Chain",
@@ -148,16 +227,39 @@ public static class DefaultAlertRules
             CooldownSeconds = 3600 // 1 hour
         },
 
-        // --- WAN Speed Test (disabled - needs gateway SSH configured) ---
+        // --- WAN Speed Test (disabled until the site's first successful WAN speed test, from the
+        // server, a site agent, or the gateway; see WanSpeedAlertPublisher) ---
         new AlertRule
         {
-            Name = "WAN Speed Test: Degradation",
+            Name = WanSpeedDegradationRuleName,
             IsEnabled = false,
             EventTypePattern = "wan.speed_degradation",
             Source = "wan",
             MinSeverity = AlertSeverity.Warning,
             ThresholdPercent = 40,
             CooldownSeconds = 1800 // 30 minutes
+        },
+
+        // --- WAN link speed (enabled - needs only the console connection) ---
+        // No cooldown on either rule: a re-publish supersedes its own open alert before rules run,
+        // and shares its cooldown key, so a cooldown would drop the replacement (see Starlink below).
+        new AlertRule
+        {
+            Name = "WAN: Link Speed Degraded",
+            IsEnabled = true,
+            EventTypePattern = "wan.link_speed_degraded",
+            Source = "wan",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 0 // 5 minute sustain to open, then once per episode
+        },
+        new AlertRule
+        {
+            Name = "WAN: Link Speed Recovered",
+            IsEnabled = true,
+            EventTypePattern = "wan.link_speed_recovered",
+            Source = "wan",
+            MinSeverity = AlertSeverity.Info,
+            CooldownSeconds = 0 // 5 minute sustain to close, paired with the degraded alert
         },
 
         // --- LAN Speed Test (disabled - needs device SSH configured) ---
@@ -169,6 +271,20 @@ public static class DefaultAlertRules
             Source = "speedtest",
             MinSeverity = AlertSeverity.Warning,
             ThresholdPercent = 25,
+            CooldownSeconds = 3600 // 1 hour
+        },
+
+        // --- Client Speed Test (disabled - opt-in) ---
+        // Client and browser tests run from whatever device and network the user is on, so a drop is
+        // often the client's Wi-Fi or the moment, not the network: a high threshold keeps it to real falls.
+        new AlertRule
+        {
+            Name = "Client Speed Test: Regression",
+            IsEnabled = false,
+            EventTypePattern = "speedtest.client_regression",
+            Source = "speedtest",
+            MinSeverity = AlertSeverity.Warning,
+            ThresholdPercent = 50,
             CooldownSeconds = 3600 // 1 hour
         },
 
@@ -222,6 +338,25 @@ public static class DefaultAlertRules
             MinSeverity = AlertSeverity.Info,
             CooldownSeconds = 60 // 1 minute - restores are paired with failure events
         },
+        // Most of a site's devices not reporting at once: one alert for the console side.
+        new AlertRule
+        {
+            Name = "UniFi Network Not Hearing From Devices",
+            IsEnabled = true,
+            EventTypePattern = "console.devices_unmanaged",
+            Source = "console",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 1800 // 30 minutes - the evaluator fires once per episode
+        },
+        new AlertRule
+        {
+            Name = "UniFi Network Hearing From Devices Again",
+            IsEnabled = true,
+            EventTypePattern = "console.devices_managed",
+            Source = "console",
+            MinSeverity = AlertSeverity.Info,
+            CooldownSeconds = 60 // 1 minute - paired with console.devices_unmanaged
+        },
 
         // --- On-Site Agent (enabled by default - an offline agent takes its whole site dark) ---
         new AlertRule
@@ -241,6 +376,15 @@ public static class DefaultAlertRules
             Source = "agent",
             MinSeverity = AlertSeverity.Info,
             CooldownSeconds = 60 // 1 minute - reconnects are paired with offline events
+        },
+        new AlertRule
+        {
+            Name = "On-Site Agent: Connection Unstable",
+            IsEnabled = true,
+            EventTypePattern = "agent.unstable",
+            Source = "agent",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 1800 // 30 minutes - the monitor fires at most once a day per agent
         },
 
         // --- Monitoring (enabled by default - users opted into monitoring by configuring it) ---
@@ -364,12 +508,41 @@ public static class DefaultAlertRules
         },
         new AlertRule
         {
-            Name = "Wi-Fi: Radio Resetting",
+            Name = "Wi-Fi: 6 GHz TX Reset Counter Elevated",
             IsEnabled = true,
             EventTypePattern = "monitoring.radio_resets",
             Source = "monitoring",
             MinSeverity = AlertSeverity.Warning,
             CooldownSeconds = 21600 // 6 hours - this is a slow warning, not an incident
+        },
+
+        // --- Device health checks (enabled - only fires where a check is configured) ---
+        new AlertRule
+        {
+            Name = "Device: Health Check Failing",
+            IsEnabled = true,
+            EventTypePattern = "monitoring.health_check_failed",
+            Source = "monitoring",
+            MinSeverity = AlertSeverity.Info,
+            CooldownSeconds = 1800 // 30 minutes - the runner re-notifies on the same cadence
+        },
+        new AlertRule
+        {
+            Name = "Device: Health Check Action Taken",
+            IsEnabled = true,
+            EventTypePattern = "monitoring.health_check_action",
+            Source = "monitoring",
+            MinSeverity = AlertSeverity.Info,
+            CooldownSeconds = 60 // every action is worth telling
+        },
+        new AlertRule
+        {
+            Name = "Device: Health Check Recovered",
+            IsEnabled = true,
+            EventTypePattern = "monitoring.health_check_recovered",
+            Source = "monitoring",
+            MinSeverity = AlertSeverity.Info,
+            CooldownSeconds = 300
         },
 
         // --- Gateway health (enabled - always available when monitoring is active) ---
@@ -450,6 +623,43 @@ public static class DefaultAlertRules
             MinSeverity = AlertSeverity.Warning,
             CooldownSeconds = 3600 // 1 hour
         },
+        // From the modem's own DOCSIS event log / reinit state (modems that report them).
+        new AlertRule
+        {
+            Name = "Cable Modem: T3 Timeout",
+            IsEnabled = false,
+            EventTypePattern = "cable_modem.t3_timeout",
+            Source = "cable_modem",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 1800 // 30 minutes: T3s arrive in bursts
+        },
+        new AlertRule
+        {
+            Name = "Cable Modem: T4 Timeout",
+            IsEnabled = false,
+            EventTypePattern = "cable_modem.t4_timeout",
+            Source = "cable_modem",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 1800 // 30 minutes
+        },
+        new AlertRule
+        {
+            Name = "Cable Modem: Ranging Failure",
+            IsEnabled = false,
+            EventTypePattern = "cable_modem.ranging_failure",
+            Source = "cable_modem",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 1800 // 30 minutes
+        },
+        new AlertRule
+        {
+            Name = "Cable Modem: Reinitialized",
+            IsEnabled = false,
+            EventTypePattern = "cable_modem.reinit",
+            Source = "cable_modem",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 1800 // 30 minutes
+        },
 
         // --- External ONT (disabled until user configures an ONT) ---
         new AlertRule
@@ -510,6 +720,68 @@ public static class DefaultAlertRules
             Source = "ont",
             MinSeverity = AlertSeverity.Warning,
             CooldownSeconds = 1800 // 30 minutes
+        },
+        new AlertRule
+        {
+            // An ONT attached to an SFP module whose DDM still reads light while its own page
+            // stops answering: the module's management side hung. Enabled once an ONT is attached.
+            Name = "ONT: Management Unresponsive",
+            IsEnabled = false,
+            EventTypePattern = "ont.management_unresponsive",
+            Source = "ont",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 1800 // 30 minutes
+        },
+        new AlertRule
+        {
+            // The ONT's uptime went backwards. Opt-in: only providers that report uptime trip it.
+            Name = "ONT: Rebooted",
+            IsEnabled = false,
+            EventTypePattern = "ont.rebooted",
+            Source = "ont",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 1800 // 30 minutes
+        },
+        new AlertRule
+        {
+            // Path loss against the budget of the ODN class the OLT names. Opt-in: only ONTs
+            // whose OLT announces its launch power and class trip it.
+            Name = "ONT: Path Loss Near Class Limit",
+            IsEnabled = false,
+            EventTypePattern = "ont.path_loss_high",
+            Source = "ont",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 3600 // 1 hour
+        },
+        new AlertRule
+        {
+            // Path loss well above the level this ONT usually runs at. Opt-in, same reason.
+            Name = "ONT: Path Loss Increase",
+            IsEnabled = false,
+            EventTypePattern = "ont.path_loss_rise",
+            Source = "ont",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 3600 // 1 hour
+        },
+        new AlertRule
+        {
+            // The OLT turned downstream AES on. Only providers that report AES state trip it.
+            Name = "ONT: AES Encryption Enabled",
+            IsEnabled = false,
+            EventTypePattern = "ont.encryption_enabled",
+            Source = "ont",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 0
+        },
+        new AlertRule
+        {
+            // Downstream AES turned off: PON traffic to this ONT is unencrypted.
+            Name = "ONT: AES Encryption Disabled",
+            IsEnabled = false,
+            EventTypePattern = "ont.encryption_disabled",
+            Source = "ont",
+            MinSeverity = AlertSeverity.Error,
+            CooldownSeconds = 0
         },
 
         // --- Cellular modem (disabled until user configures a cellular modem) ---
@@ -685,6 +957,15 @@ public static class DefaultAlertRules
         },
         new AlertRule
         {
+            Name = "Firmware Rollout: Paused for Config Review",
+            IsEnabled = true,
+            EventTypePattern = "rollout.config_held",
+            Source = "rollout",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 0
+        },
+        new AlertRule
+        {
             Name = "Firmware Rollout: Device Stuck Offline",
             IsEnabled = true,
             EventTypePattern = "rollout.device_stuck_offline",
@@ -719,6 +1000,17 @@ public static class DefaultAlertRules
             Name = "Firmware Rollout: UniFi OS Update Refused",
             IsEnabled = true,
             EventTypePattern = "rollout.unifi_os_update_refused",
+            Source = "rollout",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 0
+        },
+        new AlertRule
+        {
+            // Same refusal for the UniFi Network application: the console stayed on its own channel
+            // and offers that channel's build, which the plan did not choose.
+            Name = "Firmware Rollout: Network Application Update Refused",
+            IsEnabled = true,
+            EventTypePattern = "rollout.network_app_update_refused",
             Source = "rollout",
             MinSeverity = AlertSeverity.Warning,
             CooldownSeconds = 0
@@ -795,6 +1087,135 @@ public static class DefaultAlertRules
             EventTypePattern = "rollout.visibility_restored",
             Source = "rollout",
             MinSeverity = AlertSeverity.Info,
+            CooldownSeconds = 0
+        },
+
+        // --- Change Control. Severity on the event carries the class or the audit rule's severity. ---
+        new AlertRule
+        {
+            Name = "Change Control: Security Regression",
+            IsEnabled = true,
+            EventTypePattern = "change.security_regression",
+            Source = "change_control",
+            MinSeverity = AlertSeverity.Info,
+            CooldownSeconds = 0
+        },
+        new AlertRule
+        {
+            Name = "Change Control: Management Path Change, Devices Offline",
+            IsEnabled = true,
+            EventTypePattern = "change.management_path",
+            Source = "change_control",
+            MinSeverity = AlertSeverity.Critical,
+            CooldownSeconds = 0
+        },
+        new AlertRule
+        {
+            Name = "Change Control: Unattributed Change, With Impact",
+            IsEnabled = true,
+            EventTypePattern = "change.unattributed",
+            Source = "change_control",
+            MinSeverity = AlertSeverity.Info,
+            CooldownSeconds = 0
+        },
+        new AlertRule
+        {
+            // Fires only on a site with a Baseline, so it is on by default without noise elsewhere.
+            Name = "Change Control: Drift With a Security Regression",
+            IsEnabled = true,
+            EventTypePattern = "change.drift_regression",
+            Source = "change_control",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 86400
+        },
+        new AlertRule
+        {
+            Name = "Change Control: Every Change",
+            IsEnabled = false,
+            EventTypePattern = "change.any",
+            Source = "change_control",
+            MinSeverity = AlertSeverity.Info,
+            CooldownSeconds = 0
+        },
+        new AlertRule
+        {
+            Name = "Change Control: Daily Digest",
+            IsEnabled = false,
+            EventTypePattern = "change.digest",
+            Source = "change_control",
+            MinSeverity = AlertSeverity.Info,
+            CooldownSeconds = 0
+        },
+        new AlertRule
+        {
+            Name = "Change Control: Network App Upgrade Summary",
+            IsEnabled = true,
+            EventTypePattern = "change.network_app_upgrade",
+            Source = "change_control",
+            MinSeverity = AlertSeverity.Info,
+            CooldownSeconds = 0
+        },
+        new AlertRule
+        {
+            Name = "Change Control: Plan Awaiting Approval",
+            IsEnabled = true,
+            EventTypePattern = "change.plan_awaiting_approval",
+            Source = "change_control",
+            MinSeverity = AlertSeverity.Info,
+            CooldownSeconds = 0
+        },
+        new AlertRule
+        {
+            Name = "Change Control: Plan Approved",
+            IsEnabled = true,
+            EventTypePattern = "change.plan_approved",
+            Source = "change_control",
+            MinSeverity = AlertSeverity.Info,
+            CooldownSeconds = 0
+        },
+        new AlertRule
+        {
+            Name = "Change Control: Plan Applied",
+            IsEnabled = true,
+            EventTypePattern = "change.plan_applied",
+            Source = "change_control",
+            MinSeverity = AlertSeverity.Info,
+            CooldownSeconds = 0
+        },
+        new AlertRule
+        {
+            Name = "Change Control: Plan Reverted",
+            IsEnabled = true,
+            EventTypePattern = "change.plan_reverted",
+            Source = "change_control",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 0
+        },
+        new AlertRule
+        {
+            Name = "Change Control: Plan Failed",
+            IsEnabled = true,
+            EventTypePattern = "change.plan_failed",
+            Source = "change_control",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 0
+        },
+        new AlertRule
+        {
+            Name = "Change Control: Console Settings Changed",
+            IsEnabled = true,
+            EventTypePattern = "change.console_settings",
+            Source = "change_control",
+            MinSeverity = AlertSeverity.Warning,
+            CooldownSeconds = 0
+        },
+        new AlertRule
+        {
+            Name = "Change Control: Site Health Fell After a Change",
+            IsEnabled = true,
+            EventTypePattern = "change.health_regression",
+            Source = "change_control",
+            MinSeverity = AlertSeverity.Warning,
             CooldownSeconds = 0
         }
     ];

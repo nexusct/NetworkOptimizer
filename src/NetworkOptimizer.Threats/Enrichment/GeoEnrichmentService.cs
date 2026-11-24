@@ -96,6 +96,7 @@ public class GeoEnrichmentService : IDisposable
         string? city = null;
         double? lat = null;
         double? lon = null;
+        int? accuracyKm = null;
         int? asn = null;
         string? asnOrg = null;
 
@@ -109,6 +110,7 @@ public class GeoEnrichmentService : IDisposable
                     city = cityResult?.City?.Name;
                     lat = cityResult?.Location?.Latitude;
                     lon = cityResult?.Location?.Longitude;
+                    accuracyKm = cityResult?.Location?.AccuracyRadius;
                 }
             }
             catch (Exception ex)
@@ -139,15 +141,19 @@ public class GeoEnrichmentService : IDisposable
             City = city,
             Latitude = lat,
             Longitude = lon,
+            AccuracyRadiusKm = accuracyKm,
             Asn = asn,
             AsnOrg = asnOrg
         };
     }
 
     /// <summary>
-    /// Batch-enrich threat events with geo/ASN data.
-    /// For flow events where the source IP is internal (RFC1918), enriches on the destination IP
-    /// instead, since the external endpoint is what needs geo data.
+    /// Batch-enrich threat events with geo/ASN data. The source IP is enriched into
+    /// the source fields (Asn/AsnOrg/CountryCode/...) and the destination IP is
+    /// enriched into the destination fields (DestAsn/DestAsnOrg/DestCountryCode/...).
+    /// For RFC1918 addresses the lookup returns Empty, which is the correct answer.
+    /// Keeping source and destination enrichment in separate fields prevents the
+    /// "internal source tagged with external ASN" bug in source-IP groupings.
     /// </summary>
     public void EnrichEvents(List<ThreatEvent> events)
     {
@@ -157,31 +163,36 @@ public class GeoEnrichmentService : IDisposable
         // Cache lookups per IP within the batch
         var cache = new Dictionary<string, GeoInfo>();
 
+        GeoInfo LookupCached(string? ip)
+        {
+            if (string.IsNullOrEmpty(ip)) return GeoInfo.Empty;
+            if (!cache.TryGetValue(ip, out var g))
+            {
+                g = Enrich(ip);
+                cache[ip] = g;
+            }
+            return g;
+        }
+
         foreach (var evt in events)
         {
-            // For flow events with internal source, enrich on the destination IP
-            var enrichIp = evt.SourceIp;
-            if (evt.EventSource == EventSource.TrafficFlow &&
-                !string.IsNullOrEmpty(evt.SourceIp) &&
-                IPAddress.TryParse(evt.SourceIp, out var srcIp) &&
-                NetworkUtilities.IsPrivateIpAddress(srcIp) &&
-                !string.IsNullOrEmpty(evt.DestIp))
-            {
-                enrichIp = evt.DestIp;
-            }
+            var srcGeo = LookupCached(evt.SourceIp);
+            evt.CountryCode = srcGeo.CountryCode;
+            evt.City = srcGeo.City;
+            evt.Latitude = srcGeo.Latitude;
+            evt.Longitude = srcGeo.Longitude;
+            evt.Asn = srcGeo.Asn;
+            evt.AsnOrg = srcGeo.AsnOrg;
 
-            if (!cache.TryGetValue(enrichIp, out var geo))
-            {
-                geo = Enrich(enrichIp);
-                cache[enrichIp] = geo;
-            }
+            var dstGeo = LookupCached(evt.DestIp);
+            evt.DestCountryCode = dstGeo.CountryCode;
+            evt.DestCity = dstGeo.City;
+            evt.DestLatitude = dstGeo.Latitude;
+            evt.DestLongitude = dstGeo.Longitude;
+            evt.DestAsn = dstGeo.Asn;
+            evt.DestAsnOrg = dstGeo.AsnOrg;
 
-            evt.CountryCode = geo.CountryCode;
-            evt.City = geo.City;
-            evt.Latitude = geo.Latitude;
-            evt.Longitude = geo.Longitude;
-            evt.Asn = geo.Asn;
-            evt.AsnOrg = geo.AsnOrg;
+            evt.GeoEnriched = true;
         }
     }
 
@@ -205,7 +216,8 @@ public class GeoEnrichmentService : IDisposable
     /// Download GeoLite2 databases from MaxMind using account ID and license key.
     /// Uses the current MaxMind download API with Basic auth.
     /// </summary>
-    public async Task<(bool Success, string Message)> DownloadDatabasesAsync(
+    /// <returns>Success when at least one edition loaded; Partial when another edition failed.</returns>
+    public async Task<(bool Success, bool Partial, string Message)> DownloadDatabasesAsync(
         string accountId, string licenseKey, string dataPath, HttpClient httpClient, CancellationToken cancellationToken = default)
     {
         var editions = new[] { "GeoLite2-City", "GeoLite2-ASN" };
@@ -331,11 +343,23 @@ public class GeoEnrichmentService : IDisposable
         }
 
         if (errors.Count == 0)
-            return (true, "Both databases downloaded and loaded successfully.");
-        else if (errors.Count < editions.Length)
-            return (true, $"Partial success. Errors: {string.Join("; ", errors)}");
+            return (true, false, "Both databases downloaded and loaded successfully.");
 
-        return (false, $"Download failed: {string.Join("; ", errors)}");
+        // MaxMind answers 401 for a license key that is still activating, which a retry clears.
+        var hint = errors.Any(e => e.Contains("HTTP 401", StringComparison.Ordinal))
+            ? " A new MaxMind license key can take a few minutes to activate. Try again shortly."
+            : "";
+
+        // MaxMind's error bodies end in a period of their own.
+        var detail = string.Join("; ", errors).TrimEnd().TrimEnd('.') + ".";
+
+        if (errors.Count < editions.Length)
+        {
+            var loaded = editions.Where(ed => !errors.Any(e => e.StartsWith(ed + ":", StringComparison.Ordinal)));
+            return (true, true, $"Only {string.Join(", ", loaded)} downloaded. {detail}{hint}");
+        }
+
+        return (false, false, $"Download failed: {detail}{hint}");
     }
 
     /// <summary>

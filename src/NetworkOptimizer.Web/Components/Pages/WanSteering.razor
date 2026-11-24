@@ -28,6 +28,7 @@
 <NavigationLock OnBeforeInternalNavigation="OnBeforeInternalNavigation" ConfirmExternalNavigation="@_hasUndeployedChanges" />
 
 <div class="page-header">
+    <PageBackButton />
     <h1>WAN Steering</h1>
     <p class="page-description">Load balance the traffic you choose across multiple WANs - without leaving failover mode. Route by source, destination, port, or protocol, load balance across your failover connections, and keep critical traffic on your fastest WAN. Includes health-check failover and automatic rule recovery after gateway reprovisioning.</p>
 </div>
@@ -38,7 +39,7 @@
 {
     <div class="connection-banner connection-error">
         <div class="banner-content">
-            <span class="banner-icon">!</span>
+            <span class="banner-icon"><GatewayIcon /></span>
             <div class="banner-text">
                 <strong>UniFi Connection Error</strong>
                 <span>@ConnectionService.LastError - WAN detection requires a working UniFi connection.</span>
@@ -133,6 +134,15 @@
                     </div>
                 }
             </div>
+            @if (_parsedStatus?.UnsupportedClasses.Count > 0)
+            {
+                <div class="alert alert-warning" style="margin-top: 1rem;">
+                    <strong>Some rules are not applied.</strong>
+                    This gateway's kernel has neither the xt_statistic nor the dyn_random iptables match, so rules with
+                    a Ratio below 100% are skipped: @(string.Join(", ", UnsupportedRuleNames())). Set their Ratio to 100%
+                    or disable them.
+                </div>
+            }
             @if (_showVersionWarning)
             {
                 <div class="alert alert-warning" style="margin-top: 1rem;">
@@ -394,7 +404,7 @@
         text-align: center;
         padding: 1.25rem;
         background: var(--bg-primary);
-        border-radius: 0.5rem;
+        border-radius: var(--border-radius-lg);
     }
 
     .ws-status-metrics .metric-label {
@@ -452,7 +462,7 @@
     .ws-rule-item {
         background: var(--bg-primary);
         border: 1px solid var(--bg-tertiary);
-        border-radius: 0.5rem;
+        border-radius: var(--border-radius-lg);
         padding: 0.75rem 1rem;
         margin-bottom: 0.75rem;
     }
@@ -514,7 +524,7 @@
     .ws-edit-card {
         background: var(--bg-primary);
         border: 1px solid var(--primary-color);
-        border-radius: 0.5rem;
+        border-radius: var(--border-radius-lg);
         margin-bottom: 0.75rem;
     }
 
@@ -1181,6 +1191,11 @@
         CheckBinaryVersion();
     }
 
+    /// <summary>Maps the daemon's sanitized class names back to the rule names shown on this page.</summary>
+    private IEnumerable<string> UnsupportedRuleNames() =>
+        (_parsedStatus?.UnsupportedClasses ?? []).Select(name =>
+            _rules.FirstOrDefault(r => WanSteerDeploymentService.SanitizeWanKey(r.Name) == name)?.Name ?? name);
+
     private void CheckBinaryVersion()
     {
         // Advisory only - the Deploy/Redeploy buttons are never gated on this. The service returns
@@ -1332,6 +1347,8 @@
         public Dictionary<string, ParsedWanHealth> WanHealth { get; set; } = new();
         public List<ParsedTrafficClassStatus> TrafficClasses { get; set; } = new();
         public int ActiveTrafficClassCount => TrafficClasses.Count(tc => tc.Enabled);
+        /// <summary>Enabled classes below 100% the daemon skipped: the gateway has no probability match.</summary>
+        public List<string> UnsupportedClasses { get; set; } = new();
     }
 
     private class ParsedTrafficClassStatus

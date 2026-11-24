@@ -29,17 +29,19 @@
 @inject PullToRefreshState PtrState
 @inject IspHealthService IspHealthService
 @inject NavigationManager NavigationManager
+@inject IDisplayTimeZone DisplayTime
 
 <PageTitle>WAN Speed Test - Network Optimizer</PageTitle>
 
 <div class="speedtest-container wan-speedtest">
     <div class="page-header wan-speedtest-header">
         <div class="wan-header-titles">
+            <PageBackButton />
             <h1>WAN Speed Test</h1>
             <p class="page-description">Measures your internet speed using distributed HTTP servers with multiple concurrent connections.</p>
         </div>
         @{ var ispHealth = IspHealthService.GetCachedScore(); }
-        <div class="monitoring-stat-card clickable-stat-card isp-health-tile wan-header-isp-tile @ispHealth.TileCssClass" data-tooltip="@ispHealth.TileTooltip" data-tooltip-hover-only @onclick="@(() => NavigationManager.NavigateTo($"/monitoring?tab=isp-health&wan={NetworkOptimizer.Web.Services.Monitoring.LiveWanScope.PrimaryWanToken}"))">
+        <div class="monitoring-stat-card clickable-stat-card isp-health-tile wan-header-isp-tile @ispHealth.TileCssClass" data-tooltip="@ispHealth.TileTooltip" data-tooltip-hover-only @onclick="@(() => NavigationManager.NavigateTo(NetworkOptimizer.Web.Services.Monitoring.MonitoringLinks.IspHealth(NetworkOptimizer.Web.Services.Monitoring.LiveWanScope.PrimaryWanToken)))">
             <div class="stat-value isp-tile-score">@ispHealth.TileText</div>
             <div class="stat-label">ISP Health</div>
             @if (ispHealth.Status == IspHealthStatus.Ready && ispHealth.Score.HasValue)
@@ -78,7 +80,7 @@
     @* Every control in this card is Operator-only, so a Viewer was shown a WAN selector, a Max Load
        toggle and no way to start anything. Hide the card rather than present a dead one. *@
     <SiteOperatorOnly>
-    <div class="card" id="wan-run-test">
+    <div class="card" id="wan-run-test" data-tour="wan-run-test">
         <div class="card-header">
             <h2 class="card-title">Run a Speed Test</h2>
         </div>
@@ -278,7 +280,7 @@
     @* Latest Result *@
     @if (_latestResult != null && _latestResult.Success)
     {
-        <div class="card" id="latest-result">
+        <div class="card" id="latest-result" data-tour="wan-latest-result">
             <div class="card-header">
                 <h2 class="card-title">Latest Result</h2>
             </div>
@@ -317,6 +319,7 @@
                 <button class="wan-history-tab @(_activeHistoryTab == "latency" ? "active" : "")" @onclick='() => SwitchHistoryTab("latency")'>Latency</button>
                 <button class="wan-history-tab @(_activeHistoryTab == "loaded-latency" ? "active" : "")" @onclick='() => SwitchHistoryTab("loaded-latency")'>Loaded Latency</button>
                 <button class="wan-history-tab @(_activeHistoryTab == "jitter" ? "active" : "")" @onclick='() => SwitchHistoryTab("jitter")'>Jitter</button>
+                <button class="wan-history-tab @(_activeHistoryTab == "packet-loss" ? "active" : "")" @onclick='() => SwitchHistoryTab("packet-loss")'>Packet Loss</button>
             </div>
         </div>
         <div class="card-body">
@@ -325,7 +328,7 @@
                 @* Speed Chart *@
                 @if (_activeHistoryTab == "speed")
                 {
-                    <div class="wan-chart-container">
+                    <div class="wan-chart-container chart-opens-results">
                         <ApexChart @ref="_chart" TItem="WanChartDataPoint"
                                    Options="_chartOptions"
                                    Height="@("250px")"
@@ -336,14 +339,14 @@
                                                  Items="@(IsWanVisible(wan) ? wan.DownloadData : _hiddenChartData)"
                                                  Name="@($"{wan.DisplayName} ↓")"
                                                  SeriesType="SeriesType.Area"
-                                                 XValue="e => e.Timestamp"
+                                                 XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                  YValue="e => e.Y"
                                                  OrderBy="e => e.X" />
                                 <ApexPointSeries TItem="WanChartDataPoint"
                                                  Items="@(IsWanVisible(wan) ? wan.UploadData : _hiddenChartData)"
                                                  Name="@($"{wan.DisplayName} ↑")"
                                                  SeriesType="SeriesType.Area"
-                                                 XValue="e => e.Timestamp"
+                                                 XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                  YValue="e => e.Y"
                                                  OrderBy="e => e.X" />
                             }
@@ -364,7 +367,7 @@
                                                  Items="@(IsWanVisible(wan) ? wan.LatencyData : _hiddenChartData)"
                                                  Name="@($"{wan.DisplayName}")"
                                                  SeriesType="SeriesType.Line"
-                                                 XValue="e => e.Timestamp"
+                                                 XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                  YValue="e => e.Y"
                                                  OrderBy="e => e.X" />
                             }
@@ -396,21 +399,21 @@
                                                  Items="@(IsWanVisible(wan) ? wan.LoadedLatencyBaseData : _hiddenChartData)"
                                                  Name="@($"{wan.DisplayName} Base")"
                                                  SeriesType="SeriesType.Line"
-                                                 XValue="e => e.Timestamp"
+                                                 XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                  YValue="e => e.Y"
                                                  OrderBy="e => e.X" />
                                 <ApexPointSeries TItem="WanChartDataPoint"
                                                  Items="@(IsWanVisible(wan) ? wan.LoadedLatencyDownData : _hiddenChartData)"
                                                  Name="@($"{wan.DisplayName} Loaded ↓")"
                                                  SeriesType="SeriesType.Line"
-                                                 XValue="e => e.Timestamp"
+                                                 XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                  YValue="e => e.Y"
                                                  OrderBy="e => e.X" />
                                 <ApexPointSeries TItem="WanChartDataPoint"
                                                  Items="@(IsWanVisible(wan) ? wan.LoadedLatencyUpData : _hiddenChartData)"
                                                  Name="@($"{wan.DisplayName} Loaded ↑")"
                                                  SeriesType="SeriesType.Line"
-                                                 XValue="e => e.Timestamp"
+                                                 XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                  YValue="e => e.Y"
                                                  OrderBy="e => e.X" />
                             }
@@ -431,7 +434,53 @@
                                                  Items="@(IsWanVisible(wan) ? wan.JitterData : _hiddenChartData)"
                                                  Name="@($"{wan.DisplayName}")"
                                                  SeriesType="SeriesType.Line"
-                                                 XValue="e => e.Timestamp"
+                                                 XValue="e => DisplayTime.ToChart(e.Timestamp)"
+                                                 YValue="e => e.Y"
+                                                 OrderBy="e => e.X" />
+                            }
+                        </ApexChart>
+                    </div>
+                }
+
+                @* Packet Loss Chart *@
+                @if (_activeHistoryTab == "packet-loss")
+                {
+                    <div class="wan-chart-container loaded-latency-chart-wrapper">
+                        <div class="loaded-latency-legend">
+                            <span class="loaded-latency-legend-item">
+                                <svg width="28" height="10"><line x1="0" y1="5" x2="28" y2="5" stroke="var(--text-secondary)" stroke-width="2" /></svg> Idle
+                            </span>
+                            <span class="loaded-latency-legend-item">
+                                <svg width="28" height="10"><line x1="0" y1="5" x2="28" y2="5" stroke="var(--text-secondary)" stroke-width="2" stroke-dasharray="5,3" /></svg> Loaded ↓
+                            </span>
+                            <span class="loaded-latency-legend-item">
+                                <svg width="28" height="10"><line x1="0" y1="5" x2="28" y2="5" stroke="var(--text-secondary)" stroke-width="2" stroke-dasharray="2,2" /></svg> Loaded ↑
+                            </span>
+                        </div>
+                        <ApexChart @ref="_packetLossChart" TItem="WanChartDataPoint"
+                                   Options="_packetLossChartOptions"
+                                   Height="@("250px")">
+                            @foreach (var wan in _wanSeries)
+                            {
+                                <ApexPointSeries TItem="WanChartDataPoint"
+                                                 Items="@(IsWanVisible(wan) ? wan.IdleLossData : _hiddenChartData)"
+                                                 Name="@($"{wan.DisplayName} Idle")"
+                                                 SeriesType="SeriesType.Line"
+                                                 XValue="e => DisplayTime.ToChart(e.Timestamp)"
+                                                 YValue="e => e.Y"
+                                                 OrderBy="e => e.X" />
+                                <ApexPointSeries TItem="WanChartDataPoint"
+                                                 Items="@(IsWanVisible(wan) ? wan.DownloadLossData : _hiddenChartData)"
+                                                 Name="@($"{wan.DisplayName} Loaded ↓")"
+                                                 SeriesType="SeriesType.Line"
+                                                 XValue="e => DisplayTime.ToChart(e.Timestamp)"
+                                                 YValue="e => e.Y"
+                                                 OrderBy="e => e.X" />
+                                <ApexPointSeries TItem="WanChartDataPoint"
+                                                 Items="@(IsWanVisible(wan) ? wan.UploadLossData : _hiddenChartData)"
+                                                 Name="@($"{wan.DisplayName} Loaded ↑")"
+                                                 SeriesType="SeriesType.Line"
+                                                 XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                  YValue="e => e.Y"
                                                  OrderBy="e => e.X" />
                             }
@@ -521,7 +570,7 @@
                                 <tr id="result-@result.Id"
                                     class="@(result.Success ? "history-row-clickable" : "error-row") @(isExpanded ? "history-row-expanded" : "")"
                                     @onclick="@(async () => { if (result.Success) await ToggleHistoryExpand(result.Id); })">
-                                    <td>@result.TestTime.ToLocalTime().ToString("MMM dd HH:mm")</td>
+                                    <td>@result.TestTime.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DayTime, DisplayFormat.Culture)</td>
                                     @if (_wanSeries.Count > 1)
                                     {
                                         <td>
@@ -564,7 +613,11 @@
                                         }
                                     </td>
                                     <td class="hide-mobile">
-                                        @if (result.Success)
+                                        @if (result.Success && WanTestBackgroundCheck.InvalidMessage(result) is { } invalidMessage)
+                                        {
+                                            <span class="status-badge status-warning" data-tooltip="@invalidMessage">Invalid</span>
+                                        }
+                                        else if (result.Success)
                                         {
                                             <span class="status-badge status-connected">OK</span>
                                         }
@@ -635,11 +688,11 @@
                 @if (_historyTotalPages > 1)
                 {
                     <div class="pagination" id="wan-history-pagination">
-                        <button class="btn btn-sm btn-secondary" disabled="@(_historyPage <= 1)" @onclick="() => ChangePage(-1)"><span class="pag-arrow">←</span> Prev</button>
+                        <button class="btn btn-sm btn-secondary" disabled="@(_historyPage <= 1)" @onclick="() => ChangePage(-1)"><AppIcon Name="chevron-left" /> Prev</button>
                         <span class="pagination-info">
                             Page @_historyPage of @_historyTotalPages (@_filteredHistory.Count total)
                         </span>
-                        <button class="btn btn-sm btn-secondary" disabled="@(_historyPage >= _historyTotalPages)" @onclick="() => ChangePage(1)">Next <span class="pag-arrow">→</span></button>
+                        <button class="btn btn-sm btn-secondary" disabled="@(_historyPage >= _historyTotalPages)" @onclick="() => ChangePage(1)">Next <AppIcon Name="chevron-right" /></button>
                     </div>
                 }
             }
@@ -795,6 +848,8 @@
     private ApexChartOptions<WanChartDataPoint> _loadedLatencyChartOptions = new();
     private ApexChart<WanChartDataPoint>? _jitterChart;
     private ApexChartOptions<WanChartDataPoint> _jitterChartOptions = new();
+    private ApexChart<WanChartDataPoint>? _packetLossChart;
+    private ApexChartOptions<WanChartDataPoint> _packetLossChartOptions = new();
     private List<WanSeriesInfo> _wanSeries = new();
     private List<WanChartDataPoint> _hiddenChartData = new();
 
@@ -874,6 +929,9 @@
         public List<WanChartDataPoint> LoadedLatencyDownData { get; set; } = new();
         public List<WanChartDataPoint> LoadedLatencyUpData { get; set; } = new();
         public List<WanChartDataPoint> JitterData { get; set; } = new();
+        public List<WanChartDataPoint> IdleLossData { get; set; } = new();
+        public List<WanChartDataPoint> DownloadLossData { get; set; } = new();
+        public List<WanChartDataPoint> UploadLossData { get; set; } = new();
         public bool IsSelected { get; set; }
     }
 
@@ -896,11 +954,12 @@
 
         _liveViewLinkEnabled = await Readiness.IsHistoricPlaybackAvailableAsync();
 
-        _wanScheduleBannerDismissed = await SettingsService.GetAsync("banner.wan_schedule_dismissed") != null;
+        _wanScheduleBannerDismissed = await SettingsService.GetAsync(SiteContext.Slug, "banner.wan_schedule_dismissed") != null;
         InitializeChartOptions();
         InitializeLatencyChartOptions();
         InitializeLoadedLatencyChartOptions();
         InitializeJitterChartOptions();
+        _packetLossChartOptions = CreateMsChartOptions("%", decimals: 2);
 
         // Load WAN list, gateway status, and history in parallel
         var historyTask = LoadHistory(resetPage: true);
@@ -1270,7 +1329,7 @@
     private async Task DismissWanScheduleBanner()
     {
         _wanScheduleBannerDismissed = true;
-        await SettingsService.SetAsync("banner.wan_schedule_dismissed", "true");
+        await SettingsService.SetAsync(SiteContext.Slug, "banner.wan_schedule_dismissed", "true");
     }
 
     private void InitializeChartOptions()
@@ -1296,9 +1355,7 @@
                 Type = XAxisType.Datetime,
                 Labels = new XAxisLabels
                 {
-                    Style = new AxisLabelStyle { Colors = "#9ca3af" },
-                    DatetimeUTC = false,
-                    DatetimeFormatter = new DatetimeFormatter { Hour = "HH:mm", Day = "MMM dd" }
+                    Style = new AxisLabelStyle { Colors = "#9ca3af" }
                 },
                 AxisBorder = new AxisBorder { Show = false },
                 AxisTicks = new AxisTicks { Show = false }
@@ -1331,7 +1388,7 @@
                 Theme = Mode.Dark,
                 Intersect = false,
                 Shared = true,
-                X = new TooltipX { Format = "MMM dd, HH:mm" },
+                X = new TooltipX { Format = "MMM dd, HH:mm", Formatter = ChartTimeFormat.TooltipMinutes },
                 // The shared Monitoring tooltip, via its window hook (a serialized function string
                 // cannot import the module): rows ordered as the lines sit, and a dot on every one.
                 Custom = @"function(ctx) { return window.netoptValueSortedTooltip ? window.netoptValueSortedTooltip(ctx, { format: function(v) { return (+v).toFixed(1) + ' Mbps'; }, omitSeconds: true }) : ''; }"
@@ -1352,11 +1409,13 @@
                 }
             }
         };
+        ChartTimeFormat.ApplyTimeAxis(_chartOptions.Xaxis.Labels, DisplayTime);
     }
 
-    private ApexChartOptions<WanChartDataPoint> CreateMsChartOptions(string unit)
+    private ApexChartOptions<WanChartDataPoint> CreateMsChartOptions(string unit, int decimals = 1)
     {
-        return new ApexChartOptions<WanChartDataPoint>
+        var suffix = unit == "%" ? "%" : " " + unit;
+        var options = new ApexChartOptions<WanChartDataPoint>
         {
             Chart = new Chart
             {
@@ -1377,9 +1436,7 @@
                 Type = XAxisType.Datetime,
                 Labels = new XAxisLabels
                 {
-                    Style = new AxisLabelStyle { Colors = "#9ca3af" },
-                    DatetimeUTC = false,
-                    DatetimeFormatter = new DatetimeFormatter { Hour = "HH:mm", Day = "MMM dd" }
+                    Style = new AxisLabelStyle { Colors = "#9ca3af" }
                 },
                 AxisBorder = new AxisBorder { Show = false },
                 AxisTicks = new AxisTicks { Show = false }
@@ -1392,7 +1449,7 @@
                     Labels = new YAxisLabels
                     {
                         Style = new AxisLabelStyle { Colors = "#9ca3af" },
-                        Formatter = @"function(val) { return val != null ? val.toFixed(1) + ' " + unit + @"' : ''; }"
+                        Formatter = @"function(val) { return val != null ? val.toFixed(" + decimals + @") + '" + suffix + @"' : ''; }"
                     }
                 }
             },
@@ -1412,8 +1469,8 @@
                 Theme = Mode.Dark,
                 Intersect = false,
                 Shared = true,
-                X = new TooltipX { Format = "MMM dd, HH:mm" },
-                Custom = @"function(ctx) { return window.netoptValueSortedTooltip ? window.netoptValueSortedTooltip(ctx, { format: function(v) { return (+v).toFixed(1) + ' " + unit + @"'; }, omitSeconds: true }) : ''; }"
+                X = new TooltipX { Format = "MMM dd, HH:mm", Formatter = ChartTimeFormat.TooltipMinutes },
+                Custom = @"function(ctx) { return window.netoptValueSortedTooltip ? window.netoptValueSortedTooltip(ctx, { format: function(v) { return (+v).toFixed(" + decimals + @") + '" + suffix + @"'; }, omitSeconds: true }) : ''; }"
             },
             Markers = new Markers
             {
@@ -1421,6 +1478,8 @@
                 Hover = new MarkersHover { SizeOffset = 5 }
             }
         };
+        ChartTimeFormat.ApplyTimeAxis(options.Xaxis.Labels, DisplayTime);
+        return options;
     }
 
     private void InitializeLatencyChartOptions()
@@ -1495,6 +1554,21 @@
             _loadedLatencyChartOptions.Stroke.DashArray = dashArray;
     }
 
+    private void UpdatePacketLossChartOptions()
+    {
+        // 3 series per WAN: idle (solid), loaded down (dashed), loaded up (dotted)
+        var colors = new List<string>();
+        var dashArray = new List<int>();
+        foreach (var wan in _wanSeries)
+        {
+            colors.AddRange([wan.Color, wan.Color, wan.Color]);
+            dashArray.AddRange([0, 5, 2]);
+        }
+        _packetLossChartOptions.Colors = colors;
+        if (_packetLossChartOptions.Stroke != null)
+            _packetLossChartOptions.Stroke.DashArray = dashArray;
+    }
+
     private void UpdateJitterChartOptions()
     {
         var colors = _wanSeries.Select(w => w.Color).ToList();
@@ -1543,6 +1617,7 @@
         UpdateLatencyChartOptions();
         UpdateLoadedLatencyChartOptions();
         UpdateJitterChartOptions();
+        UpdatePacketLossChartOptions();
     }
 
     private List<Iperf3Result> GetTimeFilteredResults()
@@ -1767,13 +1842,44 @@
             wan.JitterData = shouldDownsample
                 ? DownsampleLttb(CollapseClusters(jitterRaw), MaxChartPoints)
                 : jitterRaw;
+
+            // Packet loss chart data (idle + loaded down + loaded up). Like loaded latency, only
+            // results carrying all three, so the shared tooltip lines up; older results have none.
+            var lossResults = wanResults
+                .Where(r => r.IdleLossPercent.HasValue && r.DownloadLossPercent.HasValue && r.UploadLossPercent.HasValue)
+                .ToList();
+            var idleLossRaw = lossResults
+                .Select(r => new WanChartDataPoint(r.TestTime, r.IdleLossPercent!.Value, r.Id))
+                .ToList();
+            var downLossRaw = lossResults
+                .Select(r => new WanChartDataPoint(r.TestTime, r.DownloadLossPercent!.Value, r.Id))
+                .ToList();
+            var upLossRaw = lossResults
+                .Select(r => new WanChartDataPoint(r.TestTime, r.UploadLossPercent!.Value, r.Id))
+                .ToList();
+
+            if (shouldDownsample)
+            {
+                var idleDownsampled = DownsampleLttb(CollapseClusters(idleLossRaw), MaxChartPoints);
+                var keptLossIds = idleDownsampled.Select(d => d.ResultId).ToHashSet();
+                wan.IdleLossData = idleDownsampled;
+                wan.DownloadLossData = downLossRaw.Where(p => keptLossIds.Contains(p.ResultId)).ToList();
+                wan.UploadLossData = upLossRaw.Where(p => keptLossIds.Contains(p.ResultId)).ToList();
+            }
+            else
+            {
+                wan.IdleLossData = idleLossRaw;
+                wan.DownloadLossData = downLossRaw;
+                wan.UploadLossData = upLossRaw;
+            }
         }
 
         // One span for every chart on the page, so a hidden WAN's stand-in series fits all of them.
         var allSeries = _wanSeries.SelectMany(w => new[]
         {
             w.DownloadData, w.UploadData, w.LatencyData,
-            w.LoadedLatencyBaseData, w.LoadedLatencyDownData, w.LoadedLatencyUpData, w.JitterData
+            w.LoadedLatencyBaseData, w.LoadedLatencyDownData, w.LoadedLatencyUpData, w.JitterData,
+            w.IdleLossData, w.DownloadLossData, w.UploadLossData
         }).ToList();
         PadToCommonSpan(allSeries);
         _hiddenChartData = allSeries.FirstOrDefault(s => s.Count > 0) is { } spanned
@@ -1945,9 +2051,10 @@
         if (_scrollToLinkedResultId is { } linkedId)
         {
             _scrollToLinkedResultId = null;
-            // Tinted rather than ringed: an offset ring around a table row collides with the rows
-            // either side. Ringed at all because a link brought the reader here.
-            try { await JS.InvokeVoidAsync("noHighlightRow", $"result-{linkedId}"); }
+            // The row sits inside the history card, so the card's own scroll below would pull the page back up to it.
+            _scrollToHistoryPending = false;
+            // The chart above the table renders after this, so noLandOnRow holds the row in place while it does.
+            try { await JS.InvokeVoidAsync("noLandOnRow", $"result-{linkedId}"); }
             catch { /* helper not loaded - the row is still open, which is the point */ }
         }
 
@@ -1956,6 +2063,8 @@
         // The chart renders asynchronously behind this and the card grows as it does, so a scroll
         // fired the instant the element exists lands on a position that then moves under it.
         await Task.Delay(350);
+        // A linked result opened meanwhile: its row is the landing, and it sits inside this card.
+        if (_linkedResultOpened) return;
         try { await JS.InvokeVoidAsync("noHighlightTarget", "speed-history-card"); }
         catch { /* helper not loaded - the filter still applied, which is the point */ }
     }
@@ -2015,6 +2124,7 @@
                 "latency" => _latencyChart,
                 "loaded-latency" => _loadedLatencyChart,
                 "jitter" => _jitterChart,
+                "packet-loss" => _packetLossChart,
                 _ => _chart
             };
             if (activeChart != null)
@@ -2035,11 +2145,28 @@
 
     private async Task OnChartClicked(SelectedData<WanChartDataPoint> data)
     {
-        if (data?.DataPoint?.Items?.FirstOrDefault() is WanChartDataPoint { IsGap: false } point)
+        if (data?.DataPoint?.Items?.FirstOrDefault() is { } point && ResultAt(point) is { } resultId)
         {
-            await ScrollToResult(point.ResultId);
+            await ScrollToResult(resultId);
         }
     }
+
+    /// <summary>
+    /// The result behind a clicked point. A shared tooltip reports the series nearest the pointer in two
+    /// dimensions, so at the span's edge it can name another series' padding gap at the same x: the result
+    /// is then the real point at that x.
+    /// </summary>
+    private int? ResultAt(WanChartDataPoint point) => !point.IsGap
+        ? point.ResultId
+        : _wanSeries.Where(IsWanVisible)
+            .SelectMany(w => new[]
+            {
+                w.DownloadData, w.UploadData, w.LatencyData,
+                w.LoadedLatencyBaseData, w.LoadedLatencyDownData, w.LoadedLatencyUpData, w.JitterData,
+                w.IdleLossData, w.DownloadLossData, w.UploadLossData
+            })
+            .SelectMany(list => list)
+            .FirstOrDefault(p => !p.IsGap && p.X == point.X)?.ResultId;
 
     private async Task ScrollToResult(int resultId)
     {

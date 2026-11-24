@@ -22,6 +22,10 @@
 @inject MonitoringReadinessService Readiness
 @inject SiteSpeedTestTargetResolver SiteTarget
 @inject IApMapAdminService ApMapAdmin
+@inject IDisplayTimeZone DisplayTime
+@inject ITailscaleDirectory Tailscale
+@inject IClientIcons ClientIcons
+@inject IAuthorizationService Authz
 
 @* Uses unified Iperf3Result model with Direction field to distinguish test sources *@
 
@@ -59,7 +63,7 @@
             else if (agentOnGateway)
             {
                 <div class="alert alert-info">
-                    <strong>Agent on Gateway:</strong> This site's Agent runs on the UniFi Gateway itself, which doesn't host the LAN speed test. To enable client speed tests here, deploy a Docker or bare-metal Agent on a separate box at the site (<a href="@($"/settings?tab=multisite&configure={SiteContext.Slug}")">Settings &gt; Multi-Site</a>).
+                    <strong>Agent on Gateway:</strong> This site's Agent runs on the UniFi Gateway itself, without the LAN speed test. To enable client speed tests here, re-run the gateway installer with <code>--lan-speed-test</code>, or deploy a Docker or bare-metal Agent on a separate box at the site (<a href="@($"/settings?tab=multisite&configure={SiteContext.Slug}")">Settings &gt; Multi-Site</a>).
                 </div>
             }
             else if (agentSiteOffline)
@@ -96,8 +100,8 @@
                         <div class="url-copy-row">
                             <input type="text" class="url-display" value="@openSpeedTestUrl" readonly />
                             <button type="button" class="btn-icon" title="Copy URL" onclick="copyFromInput(this)">
-                                <span class="copy-icon">📋</span>
-                                <span class="copy-check" style="display:none;">✓</span>
+                                <span class="copy-icon"><AppIcon Name="copy" /></span>
+                                <span class="copy-check" style="display:none;"><AppIcon Name="check" /></span>
                             </button>
                         </div>
                         <p class="form-help browser-tip">
@@ -280,16 +284,17 @@
                                 <tr id="result-@result.Id"
                                     class="history-row-clickable @(isExpanded ? "history-row-expanded" : "")"
                                     @onclick="@(async () => await ToggleHistoryExpand(result.Id))">
-                                    <td>@result.TestTime.ToLocalTime().ToString("MMM dd HH:mm")</td>
+                                    <td>@result.TestTime.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DayTime, DisplayFormat.Culture)</td>
                                     <td>
                                         @{
                                             var isLan = result.IsLocalLanClient();
                                             var isDeviceFiltered = string.Equals(deviceFilter, result.DeviceHost, StringComparison.OrdinalIgnoreCase);
                                         }
-                                        @if (!string.IsNullOrEmpty(result.DeviceName))
+                                        <ResultClientIcon Host="@result.DeviceHost" Mac="@result.ClientMac" Tailnet="_tailnet" Icons="_clientIcons" />
+                                        @if (DeviceNameOf(result) is { } deviceName)
                                         {
-                                            <span>@result.DeviceName</span>
-                                            <button class="device-filter-btn @(isDeviceFiltered ? "active" : "")" @onclick="() => ToggleDeviceFilter(result.DeviceHost, result.DeviceName ?? result.DeviceHost)" @onclick:stopPropagation data-tooltip="@(isDeviceFiltered ? "Clear device filter" : "Filter to this device")" data-tooltip-hover-only>
+                                            <span>@deviceName</span>
+                                            <button class="device-filter-btn @(isDeviceFiltered ? "active" : "")" @onclick="() => ToggleDeviceFilter(result.DeviceHost, deviceName)" @onclick:stopPropagation data-tooltip="@(isDeviceFiltered ? "Clear device filter" : "Filter to this device")" data-tooltip-hover-only>
                                                 <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
                                             </button>
                                             @if (isLan)
@@ -323,7 +328,10 @@
                                         }
                                         @if (vpnType != null)
                                         {
-                                            <span class="badge badge-vpn-@vpnType.ToLowerInvariant()">@vpnType</span>
+                                            var offerTailscale = vpnType == "Tailscale" && !_tailnet.Connected;
+                                            <span class="badge badge-vpn-@vpnType.ToLowerInvariant()"
+                                                  data-app-tailscale="@(offerTailscale ? vpnType : null)"
+                                                  data-tailscale-link="@(offerTailscale && _canSetUpTailscale ? "/settings?tab=connection#tailscale" : null)">@vpnType</span>
                                         }
                                         <span class="badge @GetSourceBadgeClass(result.Direction)">
                                             @GetSourceLabel(result.Direction)
@@ -385,9 +393,9 @@
                 @if (historyTotalPages > 1)
                 {
                     <div class="pagination" id="history-pagination">
-                        <button class="btn btn-sm btn-secondary" disabled="@(historyPage <= 1)" @onclick="() => ChangePage(-1)"><span class="pag-arrow">←</span> Prev</button>
+                        <button class="btn btn-sm btn-secondary" disabled="@(historyPage <= 1)" @onclick="() => ChangePage(-1)"><AppIcon Name="chevron-left" /> Prev</button>
                         <span class="pagination-info">Page @historyPage of @historyTotalPages (@filteredHistory.Count@(string.IsNullOrEmpty(historySearchFilter) && string.IsNullOrEmpty(deviceFilter) ? " total" : $" of {testHistory.Count}"))</span>
-                        <button class="btn btn-sm btn-secondary" disabled="@(historyPage >= historyTotalPages)" @onclick="() => ChangePage(1)">Next <span class="pag-arrow">→</span></button>
+                        <button class="btn btn-sm btn-secondary" disabled="@(historyPage >= historyTotalPages)" @onclick="() => ChangePage(1)">Next <AppIcon Name="chevron-right" /></button>
                     </div>
                 }
             }
@@ -475,9 +483,10 @@
     }
 
     .test-option {
-        background: var(--bg-tertiary);
+        background: var(--bg-inset);
         border-radius: var(--border-radius);
         padding: 1.25rem;
+        box-shadow: inset 0 0 0 1px var(--border-color);
     }
 
     .form-help.install-help {
@@ -487,7 +496,7 @@
     .install-help code {
         background: var(--bg-primary);
         padding: 0.125rem 0.375rem;
-        border-radius: 0.25rem;
+        border-radius: var(--border-radius);
         font-size: 0.8125rem;
     }
 
@@ -547,7 +556,7 @@
         background: transparent;
         border: none;
         outline: none;
-        font-family: monospace;
+        font-family: var(--font-mono);
         width: 100%;
     }
 
@@ -572,7 +581,7 @@
     .badge {
         display: inline-block;
         padding: 0.25rem 0.5rem;
-        border-radius: 4px;
+        border-radius: var(--border-radius);
         font-size: 0.75rem;
         font-weight: 500;
     }
@@ -859,8 +868,12 @@
 
     private bool _liveViewLinkEnabled;
 
+    /// <summary>The site's client icons, for the results table. Empty until loaded.</summary>
+    private ClientIconMap _clientIcons = ClientIconMap.Empty;
+
     protected override async Task OnInitializedAsync()
     {
+        _ = ClientIcons.LoadIntoAsync(map => InvokeAsync(() => { _clientIcons = map; StateHasChanged(); }));
         PtrState.RefreshCallback = () => LoadHistory();
         PtrState.NotifyStateChanged = StateHasChanged;
 
@@ -868,6 +881,9 @@
 
         // Load networks for VPN detection
         _networks = await ConnectionService.GetNetworksAsync();
+        _tailnet = await Tailscale.GetPeersAsync();
+        if (AuthState != null)
+            _canSetUpTailscale = (await Authz.AuthorizeAsync((await AuthState).User, SiteContext.Slug, Policies.SiteAdmin)).Succeeded;
 
         // Load configuration
         iperf3ServerEnabled = Configuration.GetValue("Iperf3Server:Enabled", false);
@@ -975,13 +991,9 @@
     {
         if (_scrollToLinkedResultId is not { } linkedId) return;
         _scrollToLinkedResultId = null;
-        // The history table renders behind this and the cards above it grow as their charts and
-        // map arrive, so a scroll fired the instant the row exists lands on a position that then
-        // moves out from under it - the same wait WAN Speed Test takes for the same reason.
-        await Task.Delay(350);
-        // Tinted rather than ringed: an offset ring around a table row collides with the rows
-        // either side. Ringed at all because a link brought the reader here.
-        try { await JS.InvokeVoidAsync("noHighlightRow", $"result-{linkedId}"); }
+        // The cards above the table grow as their charts and map arrive, so noLandOnRow holds the
+        // row in place while they settle; a single scroll lands short of it.
+        try { await JS.InvokeVoidAsync("noLandOnRow", $"result-{linkedId}"); }
         catch { /* helper not loaded - the row is still open, which is the point */ }
     }
 
@@ -1058,93 +1070,21 @@
         };
     }
 
-    /// <summary>
-    /// Detects VPN/WAN type based on client IP and known network subnets.
-    /// Returns "Tailscale", "VPN", "Teleport", "WAN", or null for LAN.
-    /// </summary>
-    // TODO: Consider unifying with SpeedTestMap.DetectVpnType (different signature - this takes Iperf3Result and checks PathAnalysis, that takes IP string directly)
-    private string? DetectVpnType(Iperf3Result result)
-    {
-        var clientIp = result.DeviceHost;
-        if (string.IsNullOrEmpty(clientIp) || !System.Net.IPAddress.TryParse(clientIp, out _))
-            return null;
+    /// <summary>Source label for a result: Tailscale, VPN, Teleport, WAN, or null for the LAN.</summary>
+    private string? DetectVpnType(Iperf3Result result) =>
+        SpeedTestClientSource.Detect(result.DeviceHost, _networks, result.ClientMac, _tailnet.IsPeer);
 
-        // Check for Tailscale CGNAT range: 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
-        // Always check this regardless of path validity
-        if (clientIp.StartsWith("100."))
-        {
-            var parts = clientIp.Split('.');
-            if (parts.Length >= 2 && int.TryParse(parts[1], out int secondOctet))
-            {
-                if (secondOctet >= 64 && secondOctet <= 127)
-                    return "Tailscale";
-            }
-        }
+    /// <summary>The site's tailnet, which names a Tailscale result that has no device name of its own.</summary>
+    private TailnetSnapshot _tailnet = TailnetSnapshot.Empty;
 
-        // Check for VPN-purpose networks (even if path is valid - gateway devices on VPN networks)
-        if (_networks != null)
-        {
-            var matchingNetwork = _networks.FirstOrDefault(n => NetworkUtilities.IsIpInSubnet(clientIp, n.IpSubnet));
+    /// <summary>A Site Admin here: the Tailscale badge's setup card links to its Settings card.</summary>
+    private bool _canSetUpTailscale;
 
-            // If in a UniFi VPN network, label as VPN
-            if (matchingNetwork?.Purpose == "remote-user-vpn")
-                return "VPN";
+    [CascadingParameter] private Task<Microsoft.AspNetCore.Components.Authorization.AuthenticationState>? AuthState { get; set; }
 
-            // If 192.168.x.x not in any known network, label as Teleport
-            // (Even if path is valid - the device may exist but the IP range is external/VPN)
-            // Only check if we have networks loaded (otherwise we can't distinguish)
-            if (clientIp.StartsWith("192.168.") && matchingNetwork == null && _networks.Count > 0)
-                return "Teleport";
-
-            // If not in any known network and not a private IP range, it's WAN (public internet)
-            if (matchingNetwork == null && !IsPrivateIp(clientIp))
-                return "WAN";
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Checks if an IP address is in a private range (RFC 1918 or CGNAT).
-    /// </summary>
-    private static bool IsPrivateIp(string ipAddress)
-    {
-        // An IPv4 client captured on a dual-stack socket can be stored as ::ffff:a.b.c.d;
-        // unwrap so the prefix checks below apply and a LAN client isn't mislabeled WAN.
-        ipAddress = NetworkUtilities.NormalizeToIPv4String(ipAddress) ?? ipAddress;
-
-        // 10.0.0.0/8
-        if (ipAddress.StartsWith("10."))
-            return true;
-
-        // 172.16.0.0/12 (172.16.x.x - 172.31.x.x)
-        if (ipAddress.StartsWith("172."))
-        {
-            var parts = ipAddress.Split('.');
-            if (parts.Length >= 2 && int.TryParse(parts[1], out int secondOctet))
-            {
-                if (secondOctet >= 16 && secondOctet <= 31)
-                    return true;
-            }
-        }
-
-        // 192.168.0.0/16
-        if (ipAddress.StartsWith("192.168."))
-            return true;
-
-        // 100.64.0.0/10 (CGNAT)
-        if (ipAddress.StartsWith("100."))
-        {
-            var parts = ipAddress.Split('.');
-            if (parts.Length >= 2 && int.TryParse(parts[1], out int secondOctet))
-            {
-                if (secondOctet >= 64 && secondOctet <= 127)
-                    return true;
-            }
-        }
-
-        return false;
-    }
+    /// <summary>The result's device name, else its tailnet name; null when it has neither.</summary>
+    private string? DeviceNameOf(Iperf3Result result) =>
+        !string.IsNullOrEmpty(result.DeviceName) ? result.DeviceName : _tailnet.NameFor(result.DeviceHost);
 
     private async Task ChangePage(int delta)
     {

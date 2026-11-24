@@ -1038,6 +1038,36 @@ public class FirewallRuleParserTests
         rule.Index.Should().Be(1);
     }
 
+    [Theory]
+    [InlineData("IPV4")]
+    [InlineData("IPV6")]
+    [InlineData("BOTH")]
+    public void ParseFirewallPolicy_IpVersion_IsParsed(string ipVersion)
+    {
+        var json = JsonDocument.Parse($@"{{
+            ""_id"": ""policy-ipv"",
+            ""action"": ""BLOCK"",
+            ""ip_version"": ""{ipVersion}""
+        }}").RootElement;
+
+        var rule = _parser.ParseFirewallPolicy(json);
+
+        rule!.IpVersion.Should().Be(ipVersion);
+    }
+
+    [Fact]
+    public void ParseFirewallPolicy_NoIpVersion_LeavesIpVersionNull()
+    {
+        var json = JsonDocument.Parse(@"{
+            ""_id"": ""policy-no-ipv"",
+            ""action"": ""BLOCK""
+        }").RootElement;
+
+        var rule = _parser.ParseFirewallPolicy(json);
+
+        rule!.IpVersion.Should().BeNull();
+    }
+
     [Fact]
     public void ParseFirewallPolicy_MissingId_GeneratesId()
     {
@@ -3071,4 +3101,18 @@ public class FirewallRuleParserTests
     }
 
     #endregion
+
+    [Theory]
+    [InlineData(@"""schedule"": { ""mode"": ""ALWAYS"" },", "ALWAYS", true)]
+    [InlineData(@"""schedule"": { ""mode"": ""CUSTOM"" },", "CUSTOM", false)]
+    [InlineData("", null, true)]
+    public void ParseFirewallPolicy_ReadsTheScheduleMode(string schedule, string? mode, bool always)
+    {
+        var json = JsonDocument.Parse("{ \"_id\": \"p1\", \"action\": \"ALLOW\", " + schedule + " \"enabled\": true }").RootElement;
+
+        var rule = _parser.ParseFirewallPolicy(json)!;
+
+        rule.ScheduleMode.Should().Be(mode);
+        rule.IsAlwaysOn.Should().Be(always);
+    }
 }

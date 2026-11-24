@@ -257,12 +257,12 @@ type NeighborsPayload struct {
 
 func (s *State) neighborsPayload(r *http.Request) (any, error) {
 	table, _ := s.telemetry()
-	vaps := make([]string, 0, 8)
-	for _, v := range table.Vaps() {
-		vaps = append(vaps, v.Name)
-	}
+	vaps := table.ControlVapNames()
 
-	reports := neighborReports(r.Context(), vaps)
+	s.mu.RLock()
+	dir := s.probes.HostapdDir
+	s.mu.RUnlock()
+	reports := neighborReports(r.Context(), vaps, dir)
 	return NeighborsPayload{
 		Ap:          table.Ap(),
 		Count:       len(reports),
@@ -283,10 +283,7 @@ func (s *State) bssTransitionPayload(r *http.Request) (any, error) {
 	req.Mac = r.PathValue("mac")
 
 	table, _ := s.telemetry()
-	vaps := make([]string, 0, 8)
-	for _, v := range table.Vaps() {
-		vaps = append(vaps, v.Name)
-	}
+	vaps := table.ControlVapNames()
 
 	result, err := sendRoam(r.Context(), table, vaps, req)
 	if err != nil {

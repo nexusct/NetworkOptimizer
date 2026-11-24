@@ -1034,6 +1034,10 @@ public class UniFiProductDatabaseTests
     [InlineData("USW-Pro-XG-8-PoE")]
     [InlineData("USW-Pro-Max-16")]
     [InlineData("USW-Pro-Max-16-PoE")]
+    [InlineData("USW-Pro-Max-24")]
+    [InlineData("USW-Pro-Max-24-PoE")]
+    [InlineData("USW-Pro-Max-48")]
+    [InlineData("USW-Pro-Max-48-PoE")]
     public void CanRunIperf3_IndustrialAndProMax_ReturnsFalse(string productName)
     {
         // Act
@@ -1041,6 +1045,21 @@ public class UniFiProductDatabaseTests
 
         // Assert
         result.Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("USLP48P", null)]
+    [InlineData(null, "USWPRO48POE")]
+    [InlineData(null, "US48PRO")]
+    public void CanRunIperf3_ProGen1_48PoE_AllModelCodes_ReturnFalse(string? model, string? shortname)
+    {
+        // Act
+        var byName = UniFiProductDatabase.CanRunIperf3("USW-Pro-48-PoE");
+        var byModel = UniFiProductDatabase.CanRunIperf3(model, shortname);
+
+        // Assert
+        byName.Should().BeFalse();
+        byModel.Should().BeFalse();
     }
 
     [Theory]
@@ -1122,10 +1141,32 @@ public class UniFiProductDatabaseTests
     }
 
     [Theory]
+    [InlineData("USWDA23", null)]
+    [InlineData("USWDA24", null)]
+    [InlineData(null, "UPS23")]
+    [InlineData(null, "UPSTOWERUS")]
+    [InlineData("UP1", null)]
+    [InlineData("UP6", null)]
+    [InlineData("USMINI", null)]
+    public void HasSsh_DevicesWithoutSshDaemon_ReturnFalse(string? model, string? shortname)
+    {
+        UniFiProductDatabase.HasSsh(model, shortname).Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("UDMPRO")]
+    [InlineData("US24PRO")]
+    [InlineData(null)]
+    public void HasSsh_OtherDevices_ReturnTrue(string? model)
+    {
+        UniFiProductDatabase.HasSsh(model, null).Should().BeTrue();
+    }
+
+    [Theory]
     [InlineData("UDM-Pro")]
     [InlineData("UDM-SE")]
     [InlineData("USW-Pro-24")]
-    [InlineData("USW-Pro-48-PoE")]
+    [InlineData("USW-Pro-24-PoE")]
     [InlineData("U6-Pro")]
     [InlineData("U7-Pro")]
     public void CanRunIperf3_SupportedDevices_ReturnsTrue(string productName)
@@ -1190,6 +1231,25 @@ public class UniFiProductDatabaseTests
 
         // Assert
         result.Should().BeTrue();  // Unknown device defaults to true
+    }
+
+    #endregion
+
+    #region IsCellularGateway Tests
+
+    [Theory]
+    [InlineData("UDMA6B9", "UDR5G", true)]
+    [InlineData("UDMA6B9", null, true)]
+    [InlineData(null, "UDR5G", true)]
+    [InlineData("UDR", null, false)]
+    [InlineData("UMBBE630", null, false)]   // U5G-Max is a modem, not a gateway
+    [InlineData(null, null, false)]
+    public void IsCellularGateway_OnlyTheUdr5GMax(string? model, string? shortname, bool expected)
+    {
+        UniFiProductDatabase.IsCellularGateway(model, shortname).Should().Be(expected);
+        if (expected)
+            UniFiProductDatabase.IsCellularModem(model, shortname, "udm").Should().BeFalse(
+                "a cellular gateway must not also be listed as a modem polled with device SSH");
     }
 
     #endregion
@@ -1442,6 +1502,15 @@ public class UniFiProductDatabaseTests
     #region GetDefaultQmiDevicePath Tests
 
     [Theory]
+    [InlineData("UDR-5G-Max")]
+    [InlineData("UDMA6B9")]
+    [InlineData("UDR5G")]
+    public void GetDefaultQmiDevicePath_Udr5GMax_ReturnsMhiPipe(string model)
+    {
+        UniFiProductDatabase.GetDefaultQmiDevicePath(model).Should().Be("/dev/mhi_0308_02.01.00_pipe_12");
+    }
+
+    [Theory]
     [InlineData(null)]
     [InlineData("")]
     public void GetDefaultQmiDevicePath_NullOrEmpty_ReturnsDefaultPath(string? model)
@@ -1499,9 +1568,6 @@ public class UniFiProductDatabaseTests
     [InlineData("U5GMAX")]
     [InlineData("U5G-Max")]
     [InlineData("U5G-Max-Outdoor")]
-    [InlineData("UDMA6B9")]      // UDR-5G-Max model code
-    [InlineData("UDR5G")]        // UDR-5G-Max legacy SKU
-    [InlineData("UDR-5G-Max")]   // UDR-5G-Max product name
     public void GetDefaultQmiDevicePath_5gModems_ReturnsWwan0Qmi0(string model)
     {
         // Act

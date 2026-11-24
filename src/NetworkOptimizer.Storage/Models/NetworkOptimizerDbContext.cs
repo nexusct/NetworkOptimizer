@@ -1,4 +1,4 @@
-﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using NetworkOptimizer.Alerts.Models;
 using NetworkOptimizer.Threats.Models;
@@ -62,6 +62,8 @@ public class NetworkOptimizerDbContext : DbContext
     public DbSet<ThreatPattern> ThreatPatterns { get; set; }
     public DbSet<CrowdSecReputation> CrowdSecReputations { get; set; }
     public DbSet<ThreatNoiseFilter> ThreatNoiseFilters { get; set; }
+    public DbSet<ThreatBlock> ThreatBlocks { get; set; }
+    public DbSet<WanFloodIncident> WanFloodIncidents { get; set; }
     public DbSet<ScheduledTask> ScheduledTasks { get; set; }
     public DbSet<WanDataUsageConfig> WanDataUsageConfigs { get; set; }
     public DbSet<WanDataUsageSnapshot> WanDataUsageSnapshots { get; set; }
@@ -74,6 +76,9 @@ public class NetworkOptimizerDbContext : DbContext
     public DbSet<WanDiscoveryContext> WanDiscoveryContexts { get; set; }
     public DbSet<InterfaceNameMap> InterfaceNameMaps { get; set; }
     public DbSet<UpstreamDiscovery> UpstreamDiscoveries { get; set; }
+    public DbSet<PathEpisode> PathEpisodes { get; set; }
+    public DbSet<PathEpisodeTarget> PathEpisodeTargets { get; set; }
+    public DbSet<PathEpisodeTrace> PathEpisodeTraces { get; set; }
     public DbSet<MonitoredSfp> MonitoredSfps { get; set; }
     public DbSet<OuiVendor> OuiVendors { get; set; }
     public DbSet<CmConfiguration> CmConfigurations { get; set; }
@@ -81,8 +86,10 @@ public class NetworkOptimizerDbContext : DbContext
     public DbSet<StarlinkConfiguration> StarlinkConfigurations { get; set; }
     public DbSet<MonitoringInterface> MonitoringInterfaces { get; set; }
     public DbSet<CustomOidConfiguration> CustomOidConfigurations { get; set; }
+    public DbSet<HealthCheckDefinition> HealthCheckDefinitions { get; set; }
     public DbSet<ApAgentDeployment> ApAgentDeployments { get; set; }
     public DbSet<ApAgentEventCursor> ApAgentEventCursors { get; set; }
+    public DbSet<DeviceSshRoute> DeviceSshRoutes { get; set; }
     public DbSet<ApRoamRecord> ApRoamRecords { get; set; }
     public DbSet<ApRadioHealthSample> ApRadioHealthSamples { get; set; }
     public DbSet<ApChannelOutcome> ApChannelOutcomes { get; set; }
@@ -115,6 +122,38 @@ public class NetworkOptimizerDbContext : DbContext
 
     /// <inheritdoc cref="SharedFirmwareBuilds"/>
     public DbSet<SharedNetworkAppBuild> SharedNetworkAppBuilds { get; set; }
+
+    /// <inheritdoc cref="SharedNetworkAppPackage"/>
+    public DbSet<SharedNetworkAppPackage> SharedNetworkAppPackages { get; set; }
+
+    /// <inheritdoc cref="SharedFirmwareBuilds"/>
+    public DbSet<SharedUniFiOsBuild> SharedUniFiOsBuilds { get; set; }
+
+    // Change Control (per site, except templates which live in the main database)
+    public DbSet<ConfigSnapshot> ConfigSnapshots { get; set; }
+    public DbSet<ConfigSnapshotBlob> ConfigSnapshotBlobs { get; set; }
+    public DbSet<ConfigChange> ConfigChanges { get; set; }
+    public DbSet<ConfigChangeObject> ConfigChangeObjects { get; set; }
+    public DbSet<ConfigWriteJournalEntry> ConfigWriteJournal { get; set; }
+    public DbSet<ChangeDetectionGap> ChangeDetectionGaps { get; set; }
+    public DbSet<ConfigPlan> ConfigPlans { get; set; }
+    public DbSet<ChangeControlSettings> ChangeControlSettings { get; set; }
+    public DbSet<ChangeDetectionState> ChangeDetectionStates { get; set; }
+    public DbSet<ConsoleBackupRecord> ConsoleBackups { get; set; }
+    public DbSet<AttentionDismissal> AttentionDismissals { get; set; }
+    public DbSet<SiteHealthHour> SiteHealthHours { get; set; }
+
+    /// <summary>Instance-wide config templates. Meaningful only in the MAIN database.</summary>
+    public DbSet<ConfigTemplate> ConfigTemplates { get; set; }
+
+    // Live Traffic
+    public DbSet<CustomAppDefinition> CustomAppDefinitions { get; set; }
+
+    /// <summary>Instance-wide trace hop locations set by hand. Meaningful only in the MAIN database.</summary>
+    public DbSet<HopLocationOverride> HopLocationOverrides { get; set; }
+
+    /// <summary>Places traces gave hop addresses, per site that saw them (<see cref="LearnedHopLocation"/>). Meaningful only in the MAIN database.</summary>
+    public DbSet<LearnedHopLocation> LearnedHopLocations { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -228,6 +267,12 @@ public class NetworkOptimizerDbContext : DbContext
         modelBuilder.Entity<ApAgentEventCursor>(entity =>
         {
             entity.ToTable("ApAgentEventCursors");
+            entity.HasIndex(e => e.DeviceMac).IsUnique();
+        });
+
+        modelBuilder.Entity<DeviceSshRoute>(entity =>
+        {
+            entity.ToTable("DeviceSshRoutes");
             entity.HasIndex(e => e.DeviceMac).IsUnique();
         });
 
@@ -437,6 +482,44 @@ public class NetworkOptimizerDbContext : DbContext
             entity.Property(e => e.Role).HasConversion<int>();
         });
 
+        // Path Localization episodes. MonitoringTargetId is a loose reference like UpstreamDiscovery's:
+        // an episode outlives the target it traced, and is pruned on its own retention.
+        modelBuilder.Entity<PathEpisode>(entity =>
+        {
+            entity.ToTable("PathEpisodes");
+            entity.Property(e => e.WanInterface).HasMaxLength(50);
+            entity.Property(e => e.Scope).HasMaxLength(16);
+            entity.Property(e => e.Disposition).HasMaxLength(16);
+            entity.Property(e => e.BottleneckHopIp).HasMaxLength(64);
+            entity.Property(e => e.BottleneckLabel).HasMaxLength(1000);
+            entity.Property(e => e.Summary).HasMaxLength(2000);
+            entity.Property(e => e.ReturnPathFinding).HasConversion<int>();
+            entity.HasIndex(e => e.OpenedAt);
+            entity.HasMany(e => e.Targets).WithOne(t => t.Episode!).HasForeignKey(t => t.EpisodeId).OnDelete(DeleteBehavior.Cascade);
+            entity.HasMany(e => e.Traces).WithOne(t => t.Episode!).HasForeignKey(t => t.EpisodeId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<PathEpisodeTarget>(entity =>
+        {
+            entity.ToTable("PathEpisodeTargets");
+            entity.Property(e => e.Role).HasConversion<int>();
+            entity.Property(e => e.Scope).HasMaxLength(16);
+            entity.Property(e => e.Disposition).HasMaxLength(16);
+            entity.Property(e => e.BottleneckHopIp).HasMaxLength(64);
+            entity.Property(e => e.BottleneckLabel).HasMaxLength(1000);
+            entity.HasIndex(e => new { e.EpisodeId, e.MonitoringTargetId, e.Role }).IsUnique();
+        });
+
+        modelBuilder.Entity<PathEpisodeTrace>(entity =>
+        {
+            entity.ToTable("PathEpisodeTraces");
+            entity.Property(e => e.Kind).HasConversion<int>();
+            entity.Property(e => e.Vantage).HasMaxLength(32);
+            entity.Property(e => e.SourceInterface).HasMaxLength(50);
+            entity.Property(e => e.ResolvedAddress).HasMaxLength(64);
+            entity.HasIndex(e => e.EpisodeId);
+        });
+
         // MonitoredSfp configuration
         modelBuilder.Entity<MonitoredSfp>(entity =>
         {
@@ -598,6 +681,34 @@ public class NetworkOptimizerDbContext : DbContext
         modelBuilder.Entity<ThreatNoiseFilter>(entity =>
         {
             entity.ToTable("ThreatNoiseFilters");
+            entity.Property(e => e.Category).HasConversion<int>();
+            entity.HasIndex(e => new { e.Category, e.Enabled });
+            entity.HasIndex(e => new { e.Category, e.SourceIp });
+        });
+
+        // ThreatBlock configuration (Automatic Blocking)
+        modelBuilder.Entity<ThreatBlock>(entity =>
+        {
+            entity.ToTable("ThreatBlocks");
+            entity.Property(e => e.SourceIp).HasMaxLength(64);
+            entity.Property(e => e.Reason).HasMaxLength(256);
+            entity.Property(e => e.ReleasedBy).HasMaxLength(256);
+            entity.Property(e => e.Trigger).HasConversion<int>();
+            entity.HasIndex(e => e.ExpiresAt);
+            entity.HasIndex(e => new { e.SourceIp, e.CreatedAt });
+        });
+
+        // WanFloodIncident configuration (WAN Flood Protection)
+        modelBuilder.Entity<WanFloodIncident>(entity =>
+        {
+            entity.ToTable("WanFloodIncidents");
+            entity.Property(e => e.IncidentId).HasMaxLength(36);
+            entity.Property(e => e.Wan).HasMaxLength(128);
+            entity.Property(e => e.Kind).HasMaxLength(16);
+            entity.Property(e => e.Delivery).HasMaxLength(16);
+            entity.Property(e => e.Mode).HasMaxLength(16);
+            entity.HasIndex(e => e.IncidentId).IsUnique();
+            entity.HasIndex(e => e.StartedAt);
         });
 
         // ScheduledTask configuration
@@ -643,6 +754,13 @@ public class NetworkOptimizerDbContext : DbContext
             entity.ToTable("CustomOidConfigurations");
             entity.HasIndex(e => e.DeviceMac);
             entity.HasIndex(e => new { e.DeviceMac, e.Oid }).IsUnique();
+        });
+
+        modelBuilder.Entity<HealthCheckDefinition>(entity =>
+        {
+            entity.ToTable("HealthCheckDefinitions");
+            entity.HasIndex(e => e.DeviceMac);
+            entity.HasIndex(e => new { e.DeviceMac, e.FieldName }).IsUnique();
         });
 
         // ApChannelOutcome configuration (channel recommendation outcome memory)
@@ -724,7 +842,121 @@ public class NetworkOptimizerDbContext : DbContext
         modelBuilder.Entity<SharedNetworkAppBuild>(entity =>
         {
             entity.ToTable("SharedNetworkAppBuilds");
-            entity.HasKey(e => new { e.Channel, e.Version });
+            entity.HasKey(e => new { e.Platform, e.Channel, e.Version });
+        });
+
+        modelBuilder.Entity<SharedNetworkAppPackage>(entity =>
+        {
+            entity.ToTable("SharedNetworkAppPackages");
+            entity.HasKey(e => new { e.Platform, e.Version });
+        });
+
+        modelBuilder.Entity<SharedUniFiOsBuild>(entity =>
+        {
+            entity.ToTable("SharedUniFiOsBuilds");
+            entity.HasKey(e => new { e.Platform, e.Channel, e.Version });
+        });
+
+        // Change Control
+        modelBuilder.Entity<ConfigSnapshot>(entity =>
+        {
+            entity.ToTable("ConfigSnapshots");
+            entity.HasIndex(e => e.TakenAt);
+            entity.Property(e => e.Trigger).HasConversion<int>();
+        });
+
+        modelBuilder.Entity<ConfigSnapshotBlob>(entity =>
+        {
+            entity.ToTable("ConfigSnapshotBlobs");
+            entity.HasKey(e => new { e.SnapshotId, e.Collection });
+            entity.HasIndex(e => e.Hash);
+            entity.HasOne<ConfigSnapshot>()
+                .WithMany()
+                .HasForeignKey(e => e.SnapshotId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<ConfigChange>(entity =>
+        {
+            entity.ToTable("ConfigChanges");
+            entity.HasIndex(e => e.OccurredAt);
+            entity.HasIndex(e => e.SnapshotId);
+            entity.Property(e => e.Kind).HasConversion<int>();
+            entity.Property(e => e.ActorKind).HasConversion<int>();
+        });
+
+        modelBuilder.Entity<ConfigChangeObject>(entity =>
+        {
+            entity.ToTable("ConfigChangeObjects");
+            entity.HasIndex(e => e.ChangeId);
+            entity.HasIndex(e => new { e.Collection, e.ObjectId });
+            entity.Property(e => e.Action).HasConversion<int>();
+            entity.HasOne<ConfigChange>()
+                .WithMany()
+                .HasForeignKey(e => e.ChangeId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<ConfigWriteJournalEntry>(entity =>
+        {
+            entity.ToTable("ConfigWriteJournal");
+            entity.HasIndex(e => e.At);
+        });
+
+        modelBuilder.Entity<ChangeDetectionGap>(entity =>
+        {
+            entity.ToTable("ChangeDetectionGaps");
+            entity.HasIndex(e => e.StartedAt);
+        });
+
+        modelBuilder.Entity<SiteHealthHour>(entity =>
+        {
+            entity.ToTable("SiteHealthHours");
+            entity.HasIndex(e => e.HourStart).IsUnique();
+        });
+
+        modelBuilder.Entity<ConfigPlan>(entity =>
+        {
+            entity.ToTable("ConfigPlans");
+            entity.HasIndex(e => e.Status);
+            entity.HasIndex(e => e.CreatedAt);
+            entity.Property(e => e.Kind).HasConversion<int>();
+            entity.Property(e => e.Status).HasConversion<int>();
+        });
+
+        modelBuilder.Entity<ChangeControlSettings>(entity => entity.ToTable("ChangeControlSettings"));
+        modelBuilder.Entity<ChangeDetectionState>(entity => entity.ToTable("ChangeDetectionStates"));
+
+        modelBuilder.Entity<ConsoleBackupRecord>(entity =>
+        {
+            entity.ToTable("ConsoleBackups");
+            entity.HasIndex(e => e.FileName).IsUnique();
+        });
+
+        modelBuilder.Entity<AttentionDismissal>(entity =>
+        {
+            entity.ToTable("AttentionDismissals");
+            entity.HasIndex(e => e.ItemKey).IsUnique();
+        });
+
+        modelBuilder.Entity<ConfigTemplate>(entity => entity.ToTable("ConfigTemplates"));
+
+        modelBuilder.Entity<CustomAppDefinition>(entity =>
+        {
+            entity.ToTable("CustomAppDefinitions");
+            entity.HasIndex(e => e.SortOrder);
+        });
+
+        modelBuilder.Entity<HopLocationOverride>(entity =>
+        {
+            entity.ToTable("HopLocationOverrides");
+            entity.HasIndex(e => e.Address).IsUnique();
+        });
+
+        modelBuilder.Entity<LearnedHopLocation>(entity =>
+        {
+            entity.ToTable("LearnedHopLocations");
+            entity.HasIndex(e => new { e.SiteSlug, e.Address }).IsUnique();
         });
     }
 }

@@ -14,22 +14,38 @@ namespace NetworkOptimizer.Web.Services;
 public static class AppVersionInfo
 {
     /// <summary>
-    /// The MINIMUM agent version carrying current agent behavior: the release in
-    /// which the agent (or anything it links - AgentProtocol, Monitoring, Core)
-    /// last changed in a way agents execute. Bumped MANUALLY as part of the
-    /// release procedure; releases without agent-relevant changes leave it alone.
-    /// Never set it past that release - the Multi-Site agent list shows an
-    /// "Update agent" callout for enrolled agents reporting an older version
-    /// than this, and over-bumping nags agents into pointless upgrades. A
-    /// prerelease tag counts as a release here: the agent last changed in
-    /// v2.8.0-preview8 (the SNMP poller keeps cached interface names over a
-    /// failed naming walk), and IsOlderThan ranks a release above its own
-    /// prereleases, so "2.8.0" would nag every preview8 agent running
-    /// byte-identical code - while a stable "2.8.0" agent still satisfies this
-    /// gate. It stays here through GA unless agent-relevant code changes again
-    /// (checked by the placeholder PRs #1189/#1190).
+    /// The MINIMUM agent version every agent should run: the release whose agent
+    /// change is worth nagging the whole fleet about. Bumped MANUALLY as part of
+    /// the release procedure, and only for such a change. Never set it past that
+    /// release - the Multi-Site agent list shows an "Agent needs update" warning
+    /// for enrolled agents reporting an older version than this, and
+    /// over-bumping nags agents into pointless upgrades. A prerelease tag counts
+    /// as a release here: IsOlderThan ranks a release above its own prereleases,
+    /// so "2.8.0" would nag every preview8 agent running byte-identical code -
+    /// while a stable "2.8.0" agent still satisfies this gate.
     /// </summary>
-    public const string LatestAgentVersion = "2.8.0-preview8";
+    public const string RequiredAgentVersion = "2.8.0-preview8";
+
+    /// <summary>
+    /// The newest agent release: the last release in which the agent (or anything
+    /// it links - AgentProtocol, Monitoring, Core) changed in a way agents execute.
+    /// Bumped MANUALLY with every such release. An agent older than this but not
+    /// older than <see cref="RequiredAgentVersion"/> is offered the upgrade
+    /// without a warning, which is how an optional agent feature (UniFi Cable
+    /// Internet capture) reaches the sites that want it without nagging the rest.
+    /// Never lower than <see cref="RequiredAgentVersion"/>.
+    /// </summary>
+    public const string LatestAgentVersion = "2.11.6";
+
+    /// <summary>
+    /// The newest netopt-waf release (NetworkOptimizer-Proxy, waf/VERSION). Bumped MANUALLY when a
+    /// netopt-waf release ships; a site's WAF reporting an older version, or none, is offered the update
+    /// on the Web Application Firewall page. The WAF releases on its own schedule, not NO's.
+    /// </summary>
+    public const string LatestWafVersion = "1.0.4";
+
+    /// <summary>Where a netopt-waf update is explained, per install type.</summary>
+    public const string WafUpdateUrl = "https://github.com/Ozark-Connect/NetworkOptimizer-Proxy#updating";
 
     /// <summary>Full informational version (e.g. "1.4.2" or "0.0.0-alpha.0.12").</summary>
     public static string Informational { get; }
@@ -40,6 +56,16 @@ public static class AppVersionInfo
     /// <summary>True when this is an untagged source build rather than a published release.</summary>
     public static bool IsSourceBuild => ReleaseVersion is null;
 
+    /// <summary>
+    /// The release agents should install from (e.g. "v2.9.1-preview1"), passed to the installers as
+    /// --release; null leaves them on their default, the latest stable release. Set only for a
+    /// prerelease build: GitHub's "latest" skips prereleases, so a preview server would otherwise
+    /// hand out a stable agent. A stable server is the latest release (or older, where the latest
+    /// agent is still right). A 0.0.0 source build or a height build has no release of its own, so it
+    /// pins to <see cref="LatestAgentVersion"/> only when that is a prerelease (a release/X.Y line).
+    /// </summary>
+    public static string? AgentReleaseTag { get; }
+
     static AppVersionInfo()
     {
         var info = typeof(AppVersionInfo).Assembly
@@ -47,5 +73,52 @@ public static class AppVersionInfo
         Informational = info ?? "";
         var baseVersion = info is not null ? Regex.Match(info, @"^\d+\.\d+\.\d+").Value : "";
         ReleaseVersion = baseVersion.Length > 0 && !baseVersion.StartsWith("0.0.0") ? baseVersion : null;
+        AgentReleaseTag = PrereleaseTagOf(info) ?? SourceBuildTagOf(info, LatestAgentVersion);
     }
+
+    /// <summary>
+    /// An agent version as the UI names it: in full on a server that pins a prerelease agent
+    /// ("2.9.0-preview8"), where that is the build the upgrade installs, and as X.Y.Z otherwise
+    /// ("2.9.0"), where the preview it last changed in is not a release the reader would recognise.
+    /// </summary>
+    public static string AgentVersionForDisplay(string version) => AgentVersionForDisplay(version, AgentReleaseTag != null);
+
+    internal static string AgentVersionForDisplay(string version, bool previewInstall) =>
+        (previewInstall
+            ? NetworkOptimizer.Core.Helpers.VersionUtilities.TrimLeadingV(NetworkOptimizer.Core.Helpers.VersionUtilities.StripBuildMetadata(version))
+            : NetworkOptimizer.Core.Helpers.VersionUtilities.CoreVersion(version)) ?? version;
+
+    /// <summary>
+    /// "v" + the version when it is exactly a prerelease tag ("2.9.1-preview1", build metadata
+    /// allowed); null for a stable version, a 0.0.0 source build, or a build commits past a tag,
+    /// whose prerelease carries a dotted height ("2.9.1-preview1.3") and has no release of its own.
+    /// </summary>
+    internal static string? PrereleaseTagOf(string? informational)
+    {
+        var match = Regex.Match(informational ?? "", @"^(\d+\.\d+\.\d+-[0-9A-Za-z]+)(\+.*)?$");
+        return match.Success && !match.Groups[1].Value.StartsWith("0.0.0") ? "v" + match.Groups[1].Value : null;
+    }
+
+    /// <summary>
+    /// For a build with no release of its own: the tag of <paramref name="latestAgentVersion"/> when it
+    /// is a prerelease, so a server built from release/X.Y offers that line's agent. Null otherwise.
+    /// That is a 0.0.0 build (no tags in reach) or a height build, commits past a tag with a dotted
+    /// prerelease ("2.11.0-preview3.12"). Without the height case, a native build from a full clone
+    /// installs the stable agent while the banner compares against the preview, so it never clears.
+    /// A height build whose X.Y.Z is past the prerelease's ("2.11.6-alpha.0.2" against
+    /// "2.11.5-preview3") sits past that prerelease's stable tag, so it keeps the default.
+    /// </summary>
+    internal static string? SourceBuildTagOf(string? informational, string latestAgentVersion)
+    {
+        if (informational?.StartsWith("0.0.0") == true)
+            return PrereleaseTagOf(latestAgentVersion);
+        if (!IsHeightBuild(informational))
+            return null;
+        var build = Version.TryParse(NetworkOptimizer.Core.Helpers.VersionUtilities.CoreVersion(informational), out var b) ? b : null;
+        var latest = Version.TryParse(NetworkOptimizer.Core.Helpers.VersionUtilities.CoreVersion(latestAgentVersion), out var l) ? l : null;
+        return build is not null && latest is not null && latest < build ? null : PrereleaseTagOf(latestAgentVersion);
+    }
+
+    private static bool IsHeightBuild(string? informational) =>
+        Regex.IsMatch(informational ?? "", @"^\d+\.\d+\.\d+-[0-9A-Za-z]+(\.[0-9A-Za-z]+)+(\+.*)?$");
 }

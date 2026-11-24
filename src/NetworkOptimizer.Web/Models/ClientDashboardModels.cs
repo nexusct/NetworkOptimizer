@@ -44,6 +44,25 @@ public record ThroughputSample(
     DateTime Time, double? DownloadBps, double? UploadBps,
     double? WanDownloadBps = null, double? WanUploadBps = null);
 
+/// <summary>One window of a client's throughput history, from the client's point of view: the mean,
+/// the peak (null where the source keeps none), and the measured WAN share (null where unmeasured).</summary>
+public record ThroughputWindowSample(
+    DateTime Time, double DownloadBps, double UploadBps,
+    double? PeakDownloadBps, double? PeakUploadBps,
+    double? WanDownloadBps, double? WanUploadBps);
+
+/// <summary>A client's throughput over a past range, one sample per window.</summary>
+public sealed class ThroughputHistory
+{
+    public DateTime From { get; init; }
+    public DateTime To { get; init; }
+    /// <summary>Window length in milliseconds, for the chart's time formatting.</summary>
+    public double WindowMs { get; init; }
+    /// <summary>False when the range reads the hourly rollup, which keeps averages only.</summary>
+    public bool HasPeaks { get; init; }
+    public List<ThroughputWindowSample> Points { get; set; } = new();
+}
+
 /// <summary>Bytes a client moved in one bucket, as its download and upload.</summary>
 public record UsageBucket(DateTime Time, long DownloadBytes, long UploadBytes);
 
@@ -89,7 +108,14 @@ public class ClientIdentity
     public string? Name { get; set; }
     public string? Hostname { get; set; }
     public string? Ip { get; set; }
+
+    /// <summary>The client's reserved address (UniFi Network's Fixed IP), or null when it has none.</summary>
+    public string? FixedIp { get; set; }
+
     public bool IsWired { get; set; }
+
+    /// <summary>A UniFi Protect device: UniFi Protect owns its name, so the page offers no rename.</summary>
+    public bool IsProtectDevice { get; set; }
 
     // Wi-Fi signal
     public int? SignalDbm { get; set; }
@@ -149,6 +175,15 @@ public class ClientIdentity
 
     /// <summary>True when this is a VPN-sourced client (renders the simplified dashboard view)</summary>
     public bool IsVpn => VpnType != null;
+
+    /// <summary>The tailnet device behind a Tailscale client, when the site reads its tailnet; null otherwise.</summary>
+    public NetworkOptimizer.Web.Services.Tailscale.TailnetPeer? Tailnet { get; set; }
+
+    /// <summary>
+    /// For a LAN client: "Tailscale exit node" or "Tailscale subnet router" when the site's tailnet
+    /// has a router at its address. A label on the host, not on its traffic.
+    /// </summary>
+    public string? TailnetRouterBadge { get; set; }
 
     /// <summary>Best display name (Name > Hostname > MAC)</summary>
     public string DisplayName => !string.IsNullOrEmpty(Name) ? Name

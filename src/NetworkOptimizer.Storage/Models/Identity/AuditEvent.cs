@@ -98,6 +98,7 @@ public static class AuditActions
     public const string PasswordReset = "auth.password.reset";
     public const string BreakGlassUsed = "auth.break_glass.used";
     public const string FederatedLoginRejected = "auth.federated.rejected";
+    // Nothing writes this since the legacy session bridge was removed; kept so stored events keep their name.
     public const string BridgeExchange = "auth.bridge.exchanged";
 
     // Identity admin
@@ -136,6 +137,34 @@ public static class AuditActions
     public const string AlertRuleChanged = "alert_rule.changed";
     public const string MonitoringSetupChanged = "monitoring_setup.changed";
 
+    // Threat Intelligence - Automatic Blocking
+    /// <summary>A source was blocked on the gateway, WAF, or Cloudflare. Usually the system actor.</summary>
+    public const string ThreatSourceBlocked = "threat_block.added";
+    /// <summary>A block ended: released by a user, or expired (system actor).</summary>
+    public const string ThreatSourceUnblocked = "threat_block.released";
+    /// <summary>A blocking target was set up (console objects or a Cloudflare list created).</summary>
+    public const string ThreatBlockingTargetSetUp = "threat_block.target.set_up";
+    /// <summary>A blocking target's console objects were removed.</summary>
+    public const string ThreatBlockingTargetRemoved = "threat_block.target.removed";
+
+    // Threat Intelligence - WAN Flood Protection
+    /// <summary>The gateway agent dropped a flood source or port, or limited a port. System actor.</summary>
+    public const string WanFloodDropApplied = "wan_flood.drop.applied";
+    /// <summary>A drop or limit ended at its time to live. System actor.</summary>
+    public const string WanFloodDropExpired = "wan_flood.drop.expired";
+    /// <summary>A user ended a drop or limit early.</summary>
+    public const string WanFloodDropReleased = "wan_flood.drop.released";
+    /// <summary>The gateway agent put back rules a provision removed. System actor.</summary>
+    public const string WanFloodRulesReapplied = "wan_flood.rules.reapplied";
+    /// <summary>A per-source table filled and its rules were removed, or were restored. System actor.</summary>
+    public const string WanFloodTableFull = "wan_flood.table_full";
+
+    // Device health checks
+    public const string HealthCheckChanged = "health_check.changed";
+    public const string HealthCheckTested = "health_check.tested";
+    /// <summary>A health check ran its remedy on a device (restart, kill, reboot). System actor.</summary>
+    public const string HealthCheckRemedyRun = "health_check.remedy.run";
+
     /// <summary>A cellular modem's radio was power-cycled to force a fresh tower selection.</summary>
     public const string CellularRadioReset = "cellular_radio.reset";
     public const string DbRestored = "db.restored";
@@ -154,7 +183,13 @@ public static class AuditActions
     public const string FirmwareRolloutResumed = "firmware_rollout.resumed";
     public const string FirmwareRolloutAborted = "firmware_rollout.aborted";
     public const string FirmwareRolloutPostponed = "firmware_rollout.postponed";
+    public const string FirmwareRolloutRescheduled = "firmware_rollout.rescheduled";
+    public const string FirmwareRolloutSoakEnded = "firmware_rollout.soak_ended";
+    public const string FirmwareRolloutUniFiAutoUpdateDisabled = "firmware_rollout.unifi_auto_update.disabled";
     public const string FirmwareRolloutRollback = "firmware_rollout.rollback";
+    /// <summary>A rollout restarted UniFi Network or rebooted the console because UniFi OS did not route to Network. System actor.</summary>
+    public const string FirmwareRolloutNetworkRecovery = "firmware_rollout.network_recovery";
+    public const string FirmwareSharedBuildAdded = "firmware_rollout.shared_build.added";
 
     // AP Agent (the telemetry agent deployed onto an access point, not the on-site Agent)
     public const string ApAgentDeployed = "ap_agent.deployed";
@@ -169,7 +204,20 @@ public static class AuditActions
     public const string WiFiIssueAcknowledged = "wifi.issue.acknowledged";
     public const string WiFiIssueRestored = "wifi.issue.restored";
     public const string WiFiRadioKept = "wifi.radio.kept";
+
+    // ISP Health: the operator's answers to its findings
+    public const string IspFindingAcknowledged = "isp.finding.acknowledged";
+    public const string IspFindingRestored = "isp.finding.restored";
     public const string WiFiRadioReleased = "wifi.radio.released";
+
+    /// <summary>Recommended channels were written to access points in UniFi Network.</summary>
+    public const string WiFiChannelPlanApplied = "wifi.channel_plan.applied";
+
+    /// <summary>A client's alias was set or cleared in UniFi Network.</summary>
+    public const string ClientRenamed = "client.renamed";
+
+    /// <summary>A client's fixed IP (DHCP reservation) was set or removed in UniFi Network.</summary>
+    public const string ClientFixedIpChanged = "client.fixed_ip.changed";
 
     // Console support file
     public const string SupportFileGenerated = "support_file.generated";
@@ -179,8 +227,41 @@ public static class AuditActions
     public const string AgentEnrolled = "agent.enrolled";
     public const string AgentRemoved = "agent.removed";
     public const string AgentGatewayInstallRun = "agent.gateway_install.run";
+    public const string AgentGatewayInstallCanceled = "agent.gateway_install.canceled";
 
     // Meta
+    public const string ChangeControlSnapshotTaken = "change_control.snapshot.taken";
+    public const string ChangeControlSnapshotPinned = "change_control.snapshot.pinned";
+    public const string ChangeControlSnapshotUnpinned = "change_control.snapshot.unpinned";
+    public const string ChangeControlYamlDownloaded = "change_control.yaml.downloaded";
+    public const string ChangeControlSecretsExported = "change_control.secrets.exported";
+    public const string ChangeControlSecretRevealed = "change_control.secret.revealed";
+    public const string ChangeControlPlanSaved = "change_control.plan.saved";
+    public const string ChangeControlPlanSubmitted = "change_control.plan.submitted";
+    public const string ChangeControlPlanApproved = "change_control.plan.approved";
+    public const string ChangeControlPlanApplied = "change_control.plan.applied";
+    public const string ChangeControlPlanReverted = "change_control.plan.reverted";
+    public const string ChangeControlPlanCancelled = "change_control.plan.cancelled";
+    public const string ChangeControlLockoutOverridden = "change_control.lockout.overridden";
+    /// <summary>Network Optimizer ran set-inform over SSH on a device still offline after a re-address.</summary>
+    public const string ChangeControlDeviceInformSet = "change_control.device.inform_set";
+    public const string ChangeControlBaselineSet = "change_control.baseline.set";
+    public const string ChangeControlSettingsChanged = "change_control.settings.changed";
+    public const string ChangeControlDevicesAdopted = "change_control.devices.adopted";
+    /// <summary>Clients reconnected (wireless rejoin, PoE port power-cycle) after a re-address.</summary>
+    public const string ChangeControlClientsReconnected = "change_control.clients.reconnected";
+    public const string ChangeControlDeviceForgotten = "change_control.device.forgotten";
+    public const string ChangeControlTemplateSaved = "change_control.template.saved";
+    public const string ChangeControlTemplateDeleted = "change_control.template.deleted";
+    public const string HopLocationSet = "network_tools.hop_location.set";
+    public const string HopLocationCleared = "network_tools.hop_location.cleared";
+    public const string ChangeControlConsoleBackupDownloaded = "change_control.console_backup.downloaded";
+    public const string ChangeControlAttentionDismissed = "change_control.attention.dismissed";
+    public const string ChangeControlAttentionRestored = "change_control.attention.restored";
+    public const string ChangeControlChangeRecomputed = "change_control.change.recomputed";
+    public const string LiveTrafficCustomAppSaved = "live_traffic.custom_app.saved";
+    public const string LiveTrafficCustomAppMoved = "live_traffic.custom_app.moved";
+    public const string LiveTrafficCustomAppDeleted = "live_traffic.custom_app.deleted";
     public const string MigrationPerformed = "audit.migration";
     public const string Pruned = "audit.pruned";
 }

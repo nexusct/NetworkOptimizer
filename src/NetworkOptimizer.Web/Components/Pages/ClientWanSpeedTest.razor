@@ -19,6 +19,8 @@
 @inject NavigationManager NavigationManager
 @inject IJSRuntime JS
 @inject PullToRefreshState PtrState
+@inject IDisplayTimeZone DisplayTime
+@inject IClientIcons ClientIcons
 
 <PageTitle>Client WAN Speed Test - Network Optimizer</PageTitle>
 
@@ -41,7 +43,7 @@
         <div class="card">
             <div class="card-body">
                 <div class="empty-state">
-                    <span class="empty-icon">🌐</span>
+                    <span class="empty-icon"><AppIcon Name="globe" /></span>
                     <h3>External Speed Test Server Not Configured</h3>
                     <p>@(_canConfigure ? "To use Client WAN Speed Tests, configure an external OpenSpeedTest server in Settings." : "Client WAN Speed Tests need an external OpenSpeedTest server, which a site administrator configures.")</p>
                     <a href="/settings#external-speedtest-settings" class="btn btn-primary">Configure External Server</a>
@@ -88,9 +90,10 @@
                         {
                             <div class="alert alert-info">
                                 <strong>Agent on Gateway:</strong> This site's Agent runs on the UniFi Gateway itself,
-                                which doesn't host the speed-test pages that relay client WAN results back to this
-                                server. To enable client WAN tests here, deploy a Docker or bare-metal Agent on a
-                                separate box at the site (<a href="@($"/settings?tab=multisite&configure={SiteContext.Slug}")">Settings &gt; Multi-Site</a>).
+                                without the speed-test pages that relay client WAN results back to this server. To
+                                enable client WAN tests here, re-run the gateway installer with
+                                <code>--lan-speed-test</code>, or deploy a Docker or bare-metal Agent on a separate box
+                                at the site (<a href="@($"/settings?tab=multisite&configure={SiteContext.Slug}")">Settings &gt; Multi-Site</a>).
                             </div>
                         }
                         else if (AgentRequiredButOffline)
@@ -115,8 +118,8 @@
                             <div class="url-copy-row">
                                 <input type="text" class="url-display" value="@ExternalShareUrl" readonly />
                                 <button type="button" class="btn-icon" title="Copy URL" onclick="copyFromInput(this)">
-                                    <span class="copy-icon">📋</span>
-                                    <span class="copy-check" style="display:none;">✓</span>
+                                    <span class="copy-icon"><AppIcon Name="copy" /></span>
+                                    <span class="copy-check" style="display:none;"><AppIcon Name="check" /></span>
                                 </button>
                             </div>
                             <p class="form-help browser-tip">
@@ -168,7 +171,7 @@
                     @* Speed Chart *@
                     @if (_activeTab == "speed")
                     {
-                        <div class="wan-chart-container">
+                        <div class="wan-chart-container chart-opens-results">
                             <ApexChart @ref="_speedChart" TItem="ChartPoint"
                                        Options="_speedChartOptions"
                                        Height="@("250px")"
@@ -179,14 +182,14 @@
                                                      Items="@(IsSeriesVisible(series) ? series.DownloadData : _hiddenChartData)"
                                                      Name="@($"{series.DisplayName} ↓")"
                                                      SeriesType="SeriesType.Area"
-                                                     XValue="e => e.Timestamp"
+                                                     XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                      YValue="e => e.Y"
                                                      OrderBy="e => e.X" />
                                     <ApexPointSeries TItem="ChartPoint"
                                                      Items="@(IsSeriesVisible(series) ? series.UploadData : _hiddenChartData)"
                                                      Name="@($"{series.DisplayName} ↑")"
                                                      SeriesType="SeriesType.Area"
-                                                     XValue="e => e.Timestamp"
+                                                     XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                      YValue="e => e.Y"
                                                      OrderBy="e => e.X" />
                                 }
@@ -207,7 +210,7 @@
                                                      Items="@(IsSeriesVisible(series) ? series.LatencyData : _hiddenChartData)"
                                                      Name="@series.DisplayName"
                                                      SeriesType="SeriesType.Line"
-                                                     XValue="e => e.Timestamp"
+                                                     XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                      YValue="e => e.Y"
                                                      OrderBy="e => e.X" />
                                 }
@@ -228,7 +231,7 @@
                                                      Items="@(IsSeriesVisible(series) ? series.JitterData : _hiddenChartData)"
                                                      Name="@series.DisplayName"
                                                      SeriesType="SeriesType.Line"
-                                                     XValue="e => e.Timestamp"
+                                                     XValue="e => DisplayTime.ToChart(e.Timestamp)"
                                                      YValue="e => e.Y"
                                                      OrderBy="e => e.X" />
                                 }
@@ -304,11 +307,12 @@
                                     <tr id="result-@result.Id"
                                         class="history-row-clickable @(isExpanded ? "history-row-expanded" : "")"
                                         @onclick="@(() => ToggleExpand(result.Id))">
-                                        <td>@result.TestTime.ToLocalTime().ToString("MMM dd HH:mm")</td>
+                                        <td>@result.TestTime.ToLocalTime(DisplayTime).ToString(DisplayTime.Format.DayTime, DisplayFormat.Culture)</td>
                                         <td>
                                             @{
                                                 var isDeviceFiltered = string.Equals(_deviceFilter, result.DeviceHost, StringComparison.OrdinalIgnoreCase);
                                             }
+                                            <ResultClientIcon Host="@result.DeviceHost" Mac="@result.ClientMac" Icons="_clientIcons" />
                                             @if (!string.IsNullOrEmpty(result.DeviceName))
                                             {
                                                 <span>@result.DeviceName</span>
@@ -403,12 +407,12 @@
                     @if (_totalPages > 1)
                     {
                         <div class="pagination">
-                            <button class="btn btn-sm btn-secondary" disabled="@(_page <= 1)" @onclick="() => ChangePage(-1)"><span class="pag-arrow">←</span> Prev</button>
+                            <button class="btn btn-sm btn-secondary" disabled="@(_page <= 1)" @onclick="() => ChangePage(-1)"><AppIcon Name="chevron-left" /> Prev</button>
                             @{
                                 var hasFilter = !string.IsNullOrEmpty(_deviceFilter) || !string.IsNullOrEmpty(_serverFilter);
                             }
                             <span class="pagination-info">Page @_page of @_totalPages (@_filteredResults.Count@(hasFilter ? $" of {_results.Count}" : " total"))</span>
-                            <button class="btn btn-sm btn-secondary" disabled="@(_page >= _totalPages)" @onclick="() => ChangePage(1)">Next <span class="pag-arrow">→</span></button>
+                            <button class="btn btn-sm btn-secondary" disabled="@(_page >= _totalPages)" @onclick="() => ChangePage(1)">Next <AppIcon Name="chevron-right" /></button>
                         </div>
                     }
                 }
@@ -440,6 +444,9 @@
                     <p class="form-help">
                         <strong>Note:</strong> This tests your internet (WAN) speed, not your LAN speed.
                         Use the <a href="/client-speedtest">Client Speed Test</a> page to test LAN speed.
+                    </p>
+                    <p class="form-help">
+                        <strong>Setup:</strong> Deploy the server on a host outside your network with the Deploy commands in Settings - Speed Tests.
                     </p>
                 </div>
             </div>
@@ -479,9 +486,10 @@
     }
 
     .test-option {
-        background: var(--bg-tertiary);
+        background: var(--bg-inset);
         border-radius: var(--border-radius);
         padding: 1.25rem;
+        box-shadow: inset 0 0 0 1px var(--border-color);
     }
 
     .test-option-header {
@@ -541,7 +549,7 @@
         background: transparent;
         border: none;
         outline: none;
-        font-family: monospace;
+        font-family: var(--font-mono);
         width: 100%;
     }
 
@@ -680,41 +688,15 @@
 
     private List<ExternalSpeedTestServer> _servers = new();
 
-    // On an agent-backed site the test starts at the on-site agent's /wan/ router,
-    // whose interstitial forwards to the external server: the agent becomes the
-    // page's referrer, so results post back through it with the real client LAN IP
-    // and the site slug stamped on the trusted agent->server hop - no ?site= in
-    // any user-facing URL. Direct/default sites link the external server directly.
+    // Routing and attribution rules: ClientWanTestLink, shared with Client Performance's WAN Test.
     private SiteSpeedTestTargetResolver.Result? _siteTarget;
 
-    // Site attribution for WAN results comes ONLY from the agent relay, so a
-    // non-default site with no live agent target must not offer a test link at
-    // all - the bare external URL would silently record against the default site.
-    // A not-yet-resolved target (null) counts as offline for the same reason.
-    private bool AgentRequiredButOffline =>
-        !SiteContext.IsDefault && _siteTarget is null or { UsesAgent: false };
+    private bool AgentRequiredButOffline => ClientWanTestLink.AgentRequiredButOffline(SiteContext.IsDefault, _siteTarget);
 
-    // The agent runs on the gateway itself (monitoring-only): no speed-test
-    // listener exists at the site, so there is no relay page to link at all.
-    private bool AgentOnGateway => _siteTarget is { AgentOnGateway: true };
+    private bool AgentOnGateway => ClientWanTestLink.AgentOnGateway(_siteTarget);
 
-    private string ExternalBaseUrl
-    {
-        get
-        {
-            if (_siteTarget is { UsesAgent: true, BaseUrl: not null } target)
-            {
-                var isDefaultServer = _selectedServer == null || _selectedServer.IsDefault;
-                return isDefaultServer
-                    ? $"{target.BaseUrl}/wan/"
-                    : $"{target.BaseUrl}/wan/{_selectedServer!.ServerId}/";
-            }
-            return _selectedServer?.Url ?? "";
-        }
-    }
-
-    private string ExternalRunUrl => $"{ExternalBaseUrl}?Run";
-    private string ExternalShareUrl => ExternalBaseUrl;
+    private string ExternalRunUrl => ClientWanTestLink.RunUrl(_siteTarget, _selectedServer);
+    private string ExternalShareUrl => ClientWanTestLink.BaseUrl(_siteTarget, _selectedServer);
 
     private ExternalSpeedTestServer? _selectedServer;
     private int _selectedServerId;
@@ -829,8 +811,12 @@
 
     private bool _liveViewLinkEnabled;
 
+    /// <summary>The site's client icons, for the results table. Empty until loaded.</summary>
+    private ClientIconMap _clientIcons = ClientIconMap.Empty;
+
     protected override async Task OnInitializedAsync()
     {
+        _ = ClientIcons.LoadIntoAsync(map => InvokeAsync(() => { _clientIcons = map; StateHasChanged(); }));
         _canConfigure = AuthState is null
             || (await Authz.AuthorizeAsync((await AuthState).User, SiteContext.Slug, Policies.SiteAdmin)).Succeeded;
 
@@ -842,7 +828,7 @@
         InitializeChartOptions();
 
         _servers = await SettingsService.GetExternalSpeedTestServersAsync();
-        _selectedServer = _servers.FirstOrDefault(s => s.IsDefault) ?? _servers.FirstOrDefault();
+        _selectedServer = ClientWanTestLink.DefaultServer(_servers);
         _selectedServerId = _selectedServer?.Id ?? 0;
         _siteTarget = await SiteTarget.ResolveAsync();
 
@@ -985,9 +971,7 @@
                 Type = XAxisType.Datetime,
                 Labels = new XAxisLabels
                 {
-                    Style = new AxisLabelStyle { Colors = "#9ca3af" },
-                    DatetimeUTC = false,
-                    DatetimeFormatter = new DatetimeFormatter { Hour = "HH:mm", Day = "MMM dd" }
+                    Style = new AxisLabelStyle { Colors = "#9ca3af" }
                 },
                 AxisBorder = new AxisBorder { Show = false },
                 AxisTicks = new AxisTicks { Show = false }
@@ -1012,7 +996,7 @@
                 Theme = Mode.Dark,
                 Intersect = false,
                 Shared = true,
-                X = new TooltipX { Format = "MMM dd, HH:mm" },
+                X = new TooltipX { Format = "MMM dd, HH:mm", Formatter = ChartTimeFormat.TooltipMinutes },
                 // The shared Monitoring tooltip, via its window hook (a serialized function string
                 // cannot import the module): rows ordered as the lines sit, and a dot on every one.
                 Custom = @"function(ctx) { return window.netoptValueSortedTooltip ? window.netoptValueSortedTooltip(ctx, { format: function(v) { return (+v).toFixed(1) + ' Mbps'; }, omitSeconds: true }) : ''; }"
@@ -1024,6 +1008,7 @@
                 Gradient = new FillGradient { ShadeIntensity = 0.3, OpacityFrom = 0.4, OpacityTo = 0.05 }
             }
         };
+        ChartTimeFormat.ApplyTimeAxis(_speedChartOptions.Xaxis.Labels, DisplayTime);
 
         _latencyChartOptions = CreateMsChartOptions("ms");
         _jitterChartOptions = CreateMsChartOptions("ms");
@@ -1031,7 +1016,7 @@
 
     private ApexChartOptions<ChartPoint> CreateMsChartOptions(string unit)
     {
-        return new ApexChartOptions<ChartPoint>
+        var options = new ApexChartOptions<ChartPoint>
         {
             Chart = new Chart
             {
@@ -1047,9 +1032,7 @@
                 Type = XAxisType.Datetime,
                 Labels = new XAxisLabels
                 {
-                    Style = new AxisLabelStyle { Colors = "#9ca3af" },
-                    DatetimeUTC = false,
-                    DatetimeFormatter = new DatetimeFormatter { Hour = "HH:mm", Day = "MMM dd" }
+                    Style = new AxisLabelStyle { Colors = "#9ca3af" }
                 },
                 AxisBorder = new AxisBorder { Show = false },
                 AxisTicks = new AxisTicks { Show = false }
@@ -1074,11 +1057,13 @@
                 Theme = Mode.Dark,
                 Intersect = false,
                 Shared = true,
-                X = new TooltipX { Format = "MMM dd, HH:mm" },
+                X = new TooltipX { Format = "MMM dd, HH:mm", Formatter = ChartTimeFormat.TooltipMinutes },
                 Custom = @"function(ctx) { return window.netoptValueSortedTooltip ? window.netoptValueSortedTooltip(ctx, { format: function(v) { return (+v).toFixed(1) + ' " + unit + @"'; }, omitSeconds: true }) : ''; }"
             },
             Markers = new Markers { Size = 0, Hover = new MarkersHover { SizeOffset = 5 } }
         };
+        ChartTimeFormat.ApplyTimeAxis(options.Xaxis.Labels, DisplayTime);
+        return options;
     }
 
     private void TransformChartData()
@@ -1310,9 +1295,21 @@
 
     private async Task OnChartClicked(SelectedData<ChartPoint> data)
     {
-        if (data?.DataPoint?.Items?.FirstOrDefault() is ChartPoint { IsGap: false } point)
-            await ScrollToResult(point.ResultId);
+        if (data?.DataPoint?.Items?.FirstOrDefault() is { } point && ResultAt(point) is { } resultId)
+            await ScrollToResult(resultId);
     }
+
+    /// <summary>
+    /// The result behind a clicked point. A shared tooltip reports the series nearest the pointer in two
+    /// dimensions, so at the span's edge it can name another series' padding gap at the same x: the result
+    /// is then the real point at that x.
+    /// </summary>
+    private int? ResultAt(ChartPoint point) => !point.IsGap
+        ? point.ResultId
+        : _chartSeries.Where(IsSeriesVisible)
+            .SelectMany(s => new[] { s.DownloadData, s.UploadData, s.LatencyData, s.JitterData })
+            .SelectMany(list => list)
+            .FirstOrDefault(p => !p.IsGap && p.X == point.X)?.ResultId;
 
     private async Task ScrollToResult(int resultId)
     {

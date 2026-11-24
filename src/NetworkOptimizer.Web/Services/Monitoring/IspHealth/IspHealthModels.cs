@@ -161,6 +161,19 @@ public class IspAsnHealth
     public int CongestionEventCount { get; init; }
 }
 
+/// <summary>The access floor's own readings, shown above the ISP hops on the ISP Network card.</summary>
+public class AccessFloorHealth
+{
+    /// <summary>Winsorized mean RTT of the floor, as the hop rows show theirs.</summary>
+    public double? RttMs { get; init; }
+
+    /// <summary>The floor's jitter at the scoring percentile, as the hop rows show theirs.</summary>
+    public double? JitterMs { get; init; }
+
+    /// <summary>Access hops the floor is taken across.</summary>
+    public int HopCount { get; init; }
+}
+
 /// <summary>One monitored ISP-network target, broken out on the ISP Network card.</summary>
 public class IspTargetHealth
 {
@@ -214,7 +227,7 @@ public class IspTargetHealth
     /// <summary>RTT beyond this ASN's nearest hop (0 for the nearest). Drives the soft reach ceiling.</summary>
     public double? ReachDeltaMs { get; init; }
 
-    /// <summary>True for the first clean hop, the target the access layer idle latency comes from.</summary>
+    /// <summary>True for the lowest-median access hop, the access floor's fallback where too few hops report.</summary>
     public bool IsGradedHop { get; init; }
 
     /// <summary>
@@ -250,6 +263,16 @@ public class IspHealthIssue
     /// the per-event "that was me" exclusion on the finding itself. Empty for non-outage findings.
     /// </summary>
     public List<DateTime> OutageStarts { get; init; } = new();
+
+    /// <summary>The Path Localization episode behind this finding, so its link opens that episode's hop table.</summary>
+    public int? EpisodeId { get; init; }
+
+    /// <summary>
+    /// Set on a finding a Site Admin may acknowledge: identifies it by what it is, so a finding that
+    /// changes character (another target, another reading, a confirmed hop) arrives with a new key and
+    /// shows again. Null for findings that cannot be acknowledged.
+    /// </summary>
+    public string? AckKey { get; init; }
 }
 
 /// <summary>
@@ -367,6 +390,10 @@ public class CongestionEvent
     /// (used for a dead-end hop whose confirmed sibling proves the network is really degrading).</summary>
     public bool ConfirmedBySibling { get; set; }
 
+    /// <summary>True when this hop rose well above a line-wide load floor and was judged against that
+    /// floor: its downstream rose too, but only by the floor, never literally "clean".</summary>
+    public bool AboveLoadFloor { get; set; }
+
     /// <summary>Localizer confidence 0-100; lowest for <see cref="CongestionDisposition.Unverifiable"/> / <see cref="CongestionScope.Unlocalized"/>.</summary>
     public int Confidence { get; set; } = 50;
 
@@ -397,6 +424,12 @@ public class PathShiftEvent
 
     /// <summary>Number of targets showing a correlated step at the same boundary.</summary>
     public int CorrelatedTargetCount { get; init; } = 1;
+
+    /// <summary>
+    /// Smaller than a lone series may report (<see cref="IspHealthOptions.StepMinDeltaMs"/>):
+    /// kept only when another series steps the same way at the same boundary.
+    /// </summary>
+    public bool NeedsCorroboration { get; set; }
 
     /// <summary>Every target behind this event, so a reader can filter it against a chart line.</summary>
     public List<string> TargetIds { get; init; } = new();
@@ -544,6 +577,28 @@ public class OutageEvent
     public bool Acknowledged { get; set; }
 }
 
+/// <summary>
+/// A Path Localization episode the score counts: congestion on routes into two or more destination
+/// networks while the access layer and a control stayed clean, which points at the ISP's upstream.
+/// </summary>
+public class PathCongestionEpisode
+{
+    public int EpisodeId { get; init; }
+    public DateTime Start { get; init; }
+    /// <summary>The episode's close, or the window end while it is still open.</summary>
+    public DateTime End { get; init; }
+    /// <summary>Distinct ASNs among the degraded destinations.</summary>
+    public int DegradedAsns { get; init; }
+    /// <summary>Distinct ASNs among every monitored destination on the WAN, the degraded ones included.</summary>
+    public int DestinationAsns { get; init; }
+    public double PeakLossPct { get; init; }
+    public double RttRiseMs { get; init; }
+    /// <summary>Time-of-day usage weight, as outages carry it. Set by the service.</summary>
+    public double UsageWeight { get; set; } = 1.0;
+    /// <summary>Points this episode took off the overall score. Set by the scorer.</summary>
+    public int ScorePenaltyPoints { get; set; }
+}
+
 /// <summary>One network tier's behavior during an outage, for the recovery-shape display.</summary>
 public class OutageTierState
 {
@@ -612,10 +667,18 @@ public class IspHealthReport
     public List<IspAsnHealth> TransitAsns { get; init; } = new();
     public List<IspAsnHealth> IspAsns { get; init; } = new();
     public List<IspTargetHealth> IspTargets { get; init; } = new();
+
+    /// <summary>The access floor the Access Layer idle latency is measured from; null with fewer than two access hops.</summary>
+    public AccessFloorHealth? AccessFloor { get; init; }
+
     public List<IspHealthIssue> Issues { get; init; } = new();
     public List<CongestionEvent> CongestionEvents { get; init; } = new();
     public List<PathShiftEvent> PathShifts { get; init; } = new();
     public List<OutageEvent> Outages { get; init; } = new();
+    /// <summary>Path congestion episodes the score counted, each with its points.</summary>
+    public List<PathCongestionEpisode> PathCongestion { get; init; } = new();
+    /// <summary>Points path congestion took off Transit Health (the dimension, not the overall score).</summary>
+    public int PathCongestionTransitPoints { get; init; }
 
     /// <summary>Monitored address per target id, so an event on a hop with no network can still name it.</summary>
     public IReadOnlyDictionary<string, string> TargetAddresses { get; init; } = new Dictionary<string, string>();
@@ -703,6 +766,14 @@ public class AsnSeries
     public List<LatencySample> Samples { get; init; } = new();
 
     /// <summary>
+    /// Each member's own samples, on a cluster of more than one target (empty otherwise).
+    /// Members sitting at different RTTs make the merged <see cref="Samples"/> straddle two
+    /// levels, which hides a step every member took; step detection reads them one by one to
+    /// corroborate a small step elsewhere.
+    /// </summary>
+    public Dictionary<string, List<LatencySample>> SamplesByTarget { get; init; } = new();
+
+    /// <summary>
     /// Mean RTT across the ASN's full nearest cluster, for the Networks on Your Path
     /// card. On the ISP grading series this is wider than Samples (which is the single
     /// graded hop); on transit it equals the graded cluster. Display only.
@@ -739,6 +810,12 @@ public class AsnSeries
     /// <summary>True for an internet/CDN destination series (DB TargetType InternetService).
     /// Carried onto path-shift events so correlation can prefer an on-path hop as the label.</summary>
     public bool IsDestination { get; init; }
+
+    /// <summary>
+    /// True for the gateway's WAN-side L2 neighbor (found in its ARP table, not on a trace). Every
+    /// packet out this WAN crosses it, so its absent ancestry does not mean nothing routes through it.
+    /// </summary>
+    public bool IsL2Neighbor { get; init; }
 }
 
 /// <summary>
@@ -763,17 +840,19 @@ public class IspHealthInputs
     public DateTime WindowStart { get; init; }
     public DateTime WindowEnd { get; init; }
 
-    /// <summary>Series of the first clean ISP hop (lowest-median enabled AccessIsp target).</summary>
+    /// <summary>
+    /// The access floor (<see cref="AccessFloor"/>): the lowest RTT across the access hops at each
+    /// timestamp, or the lowest-median hop's own series where too few hops report.
+    /// </summary>
     public List<LatencySample> FirstHopSeries { get; init; } = new();
 
-    /// <summary>TargetId of the first clean hop, for marking it in the breakout.</summary>
+    /// <summary>TargetId of the lowest-median AccessIsp hop, the floor's fallback.</summary>
     public string? FirstHopTargetId { get; init; }
 
     /// <summary>
-    /// One series per public AccessIsp hop (RFC1918 / CPE-LAN-side excluded). Loaded
-    /// latency takes the worst loaded delta across these, because access congestion can
-    /// surface on any access hop (e.g. the OLT), not just the nearest one, and a given
-    /// hop may miss a brief spike depending on probe timing.
+    /// One series per enabled AccessIsp hop. Loaded latency votes across these at each instant,
+    /// because access congestion can surface on any access hop (e.g. the OLT), not just the
+    /// nearest one, and a given hop may miss a brief spike depending on probe timing.
     /// </summary>
     public List<List<LatencySample>> AccessHopSeries { get; init; } = new();
 
@@ -874,6 +953,9 @@ public class IspHealthInputs
     /// <summary>Pre-detected internet-unreachable outages in the window.</summary>
     public List<OutageEvent> Outages { get; init; } = new();
 
+    /// <summary>Path Localization episodes in the window that span two or more destination networks.</summary>
+    public List<PathCongestionEpisode> PathCongestion { get; init; } = new();
+
     /// <summary>
     /// True when Upstream Discovery has persisted hop-ancestor data for this WAN. When false
     /// (never discovered, or pre-ancestor data), the jitter absolve gate falls open for
@@ -906,7 +988,21 @@ public record SpeedTestSample(
     double UploadMbps,
     double? PingMs = null,
     double? DownloadLatencyMs = null,
-    double? UploadLatencyMs = null);
+    double? UploadLatencyMs = null,
+    SpeedTestLoss? IdleLoss = null,
+    SpeedTestLoss? DownloadLoss = null,
+    SpeedTestLoss? UploadLoss = null);
+
+/// <summary>One phase's packet loss from a WAN speed test: the rate and the probes behind it.</summary>
+public record SpeedTestLoss(double Percent, int Probes)
+{
+    /// <summary>Null unless both columns were recorded (binaries before loss probing write neither).</summary>
+    public static SpeedTestLoss? From(double? percent, int? probes) =>
+        percent.HasValue && probes is > 0 ? new SpeedTestLoss(percent.Value, probes.Value) : null;
+
+    /// <summary>Lost probes, recovered from the stored rate.</summary>
+    public int Lost => (int)Math.Round(Percent * Probes / 100.0);
+}
 
 /// <summary>Cheap snapshot for the live view tiles.</summary>
 public record IspHealthSnapshot(IspHealthStatus Status, int? Score, DateTime? ComputedAt)

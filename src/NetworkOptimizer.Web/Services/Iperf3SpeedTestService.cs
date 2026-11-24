@@ -3,7 +3,6 @@ using Microsoft.EntityFrameworkCore;
 using NetworkOptimizer.Alerts.Events;
 using NetworkOptimizer.Core.Enums;
 using NetworkOptimizer.Core.Helpers;
-using NetworkOptimizer.Storage;
 using NetworkOptimizer.Storage.Interfaces;
 using NetworkOptimizer.Storage.Models;
 using NetworkOptimizer.UniFi;
@@ -33,6 +32,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
     private readonly SiteTunnelRouting _tunnelRouting;
     private readonly AgentIperf3Service _agentIperf3;
     private readonly IAlertEventBus? _alertEventBus;
+    private readonly MonitoringInfluxRegistry? _influxRegistry;
     private readonly string _siteSlug;
     private readonly bool _isDefault;
     private readonly string _siteSuffix;
@@ -66,7 +66,8 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
         AgentIperf3Service agentIperf3,
         Licensing.LicenseStateService? licenseState = null,
         IAlertEventBus? alertEventBus = null,
-        string siteSlug = SiteManagementService.DefaultSiteSlug)
+        string siteSlug = SiteManagementService.DefaultSiteSlug,
+        MonitoringInfluxRegistry? influxRegistry = null)
     {
         _licenseState = licenseState;
         _logger = logger;
@@ -84,6 +85,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
         _tunnelRouting = tunnelRouting;
         _agentIperf3 = agentIperf3;
         _alertEventBus = alertEventBus;
+        _influxRegistry = influxRegistry;
     }
 
     /// <summary>
@@ -333,6 +335,32 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
         return await RunSpeedTestAsync(device, duration, parallelStreams);
     }
 
+    /// <inheritdoc />
+    public async Task<Iperf3Result> RunSpeedTestAsync(NetworkOptimizer.UniFi.DiscoveredDevice device)
+    {
+        // UniFi devices have iperf3 built in but don't run it persistently.
+        var config = new DeviceSshConfiguration
+        {
+            Name = device.Name ?? "Unknown Device",
+            Host = device.IpAddress ?? "",
+            DeviceType = device.Type,
+            Enabled = true,
+            StartIperf3Server = true
+        };
+
+        // Null for everything but gateway hardware in AP mode whose Device SSH login is refused.
+        var router = _serviceProvider.GetRequiredService<Ssh.DeviceSshRouterRegistry>().GetFor(_siteSlug);
+        var overrides = await router.GetCredentialOverridesAsync(Ssh.DeviceSshTarget.From(device, config.Host));
+        if (overrides != null)
+        {
+            config.SshUsername = overrides.Username;
+            config.SshPassword = overrides.Password;
+            config.SshPrivateKeyPath = overrides.PrivateKeyPath;
+        }
+
+        return await RunSpeedTestAsync(config);
+    }
+
     /// <summary>
     /// Determine the appropriate parallel streams setting based on device type
     /// </summary>
@@ -395,6 +423,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
         // Determine if we should manage the iperf3 server ourselves
         var manageServer = device.StartIperf3Server;
         var isWindows = false;
+        var saved = false;
 
         try
         {
@@ -410,6 +439,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
                     result.Success = false;
                     result.ErrorMessage = $"Cannot connect to device: {sshMsg}";
                     _logger.LogWarning("Speed test aborted - SSH connection failed to {Host}: {Message}", host, sshMsg);
+                    await SaveResultAsync(result);
                     return result;
                 }
             }
@@ -435,6 +465,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
                 {
                     result.Success = false;
                     result.ErrorMessage = $"Failed to start iperf3 server: {serverStartResult.output}";
+                    await SaveResultAsync(result);
                     return result;
                 }
 
@@ -516,6 +547,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
 
             // Save result to database
             await SaveResultAsync(result);
+            saved = true;
 
             // Publish alert event for regression detection
             await PublishSpeedTestAlertAsync(result);
@@ -544,6 +576,9 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
                 }
             }
 
+            // Early-exit failures are stored for history but never published: they are not a throughput regression.
+            if (!saved)
+                await SaveResultAsync(result);
             return result;
         }
         finally
@@ -622,7 +657,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
     /// grouped by AP MAC address.
     /// </summary>
     public async Task<Dictionary<string, List<Iperf3Result>>> GetApDeviceTestsAsync(
-        Dictionary<string, string> apIpToMac, int countPerAp = 5)
+        Dictionary<string, string> apIpToMac, int countPerAp = 3)
     {
         if (apIpToMac.Count == 0) return new();
 
@@ -647,7 +682,12 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
     {
         using var scope = CreateSiteScope();
         var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
-        return await repository.DeleteIperf3ResultAsync(id);
+        await using var db = await CreateSiteDbAsync();
+        var result = await db.Iperf3Results.FindAsync(id);
+        var deleted = await repository.DeleteIperf3ResultAsync(id);
+        if (deleted && result != null)
+            await SpeedTestInfluxExporter.SynchronizeMutationAsync(_influxRegistry, _siteSlug, result, _logger);
+        return deleted;
     }
 
     /// <summary>
@@ -665,11 +705,18 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
     /// </summary>
     public async Task<int> ClearHistoryAsync()
     {
-        using var scope = CreateSiteScope();
-        var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
-        var results = await repository.GetRecentIperf3ResultsAsync(int.MaxValue);
+        await using var db = await CreateSiteDbAsync();
+        var results = await db.Iperf3Results
+            .Where(r => r.Direction != SpeedTestDirection.CloudflareWan
+                && r.Direction != SpeedTestDirection.CloudflareWanGateway
+                && r.Direction != SpeedTestDirection.UwnWan
+                && r.Direction != SpeedTestDirection.UwnWanGateway
+                && r.Direction != SpeedTestDirection.OpenSpeedTestWan).ToListAsync();
         var count = results.Count;
-        await repository.ClearIperf3HistoryAsync();
+        db.Iperf3Results.RemoveRange(results);
+        await db.SaveChangesAsync();
+        _logger.LogInformation("Cleared {Count} LAN speed test results", count);
+        await SpeedTestInfluxExporter.ClearHistoryAsync(_influxRegistry, _siteSlug, results, _logger);
         return count;
     }
 
@@ -680,6 +727,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
             using var scope = CreateSiteScope();
             var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
             await repository.SaveIperf3ResultAsync(result);
+            await SpeedTestInfluxExporter.ExportAsync(_influxRegistry, _siteSlug, result, _logger);
         }
         catch (Exception ex)
         {
@@ -939,7 +987,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
                 DeviceIp = result.DeviceHost,
                 DeviceName = result.DeviceName,
                 MetricValue = downloadMbps,
-                SourceUrl = $"/speedtest?result={result.Id}",
+                SourceUrl = SpeedTestLinks.LanResult(result.Id),
                 Context = new Dictionary<string, string>
                 {
                     ["downloadMbps"] = downloadMbps.ToString("F1"),
@@ -947,48 +995,41 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
                 }
             });
 
-            // Check for regression vs recent average for same device and direction
+            // Check for regression vs recent results of the same device and test kind, in both directions
             try
             {
                 await using var db = await CreateSiteDbAsync();
                 var recent = await db.Iperf3Results
                     .AsNoTracking()
                     .Where(r => r.DeviceHost == result.DeviceHost && r.Id != result.Id && r.Success
-                        && r.Direction == result.Direction
-                        && r.DownloadBitsPerSecond > 0)
+                        && r.Direction == result.Direction)
                     .OrderByDescending(r => r.TestTime)
-                    .Take(5)
+                    .Take(SpeedTestRegression.RecentToRead)
                     .ToListAsync();
 
-                if (recent.Count >= 3)
+                if (SpeedTestRegression.Worst(result, recent) is { } drop)
                 {
-                    var avgDownload = recent.Average(r => r.DownloadMbps);
-                    var dropPercent = avgDownload > 0 ? (avgDownload - downloadMbps) / avgDownload * 100 : 0;
-
-                    if (dropPercent > 0)
+                    await _alertEventBus.PublishAsync(new AlertEvent
                     {
-                        await _alertEventBus.PublishAsync(new AlertEvent
+                        EventType = "speedtest.regression",
+                        Severity = SpeedTestRegression.Severity(drop),
+                        Source = "speedtest",
+                        Title = $"Speed regression: {deviceLabel}, {drop.Direction} at {drop.CurrentMbps:F0} Mbps ({drop.DropPercent:F0}% below average){_siteSuffix}",
+                        Message = $"{deviceLabel}: {drop.Direction} is {drop.DropPercent:F0}% below the recent average of {drop.AverageMbps:F0} Mbps",
+                        DeviceIp = result.DeviceHost,
+                        DeviceName = result.DeviceName,
+                        MetricValue = drop.CurrentMbps,
+                        ThresholdValue = drop.AverageMbps,
+                        SourceUrl = SpeedTestLinks.LanResult(result.Id),
+                        Context = new Dictionary<string, string>
                         {
-                            EventType = "speedtest.regression",
-                            Severity = dropPercent >= 50 ? AlertSeverity.Error
-                                : dropPercent >= 25 ? AlertSeverity.Warning : AlertSeverity.Info,
-                            Source = "speedtest",
-                            Title = $"Speed regression: {deviceLabel} at {downloadMbps:F0} Mbps ({dropPercent:F0}% below average){_siteSuffix}",
-                            Message = $"{deviceLabel} download is {dropPercent:F0}% below the recent average of {avgDownload:F0} Mbps",
-                            DeviceIp = result.DeviceHost,
-                            DeviceName = result.DeviceName,
-                            MetricValue = downloadMbps,
-                            ThresholdValue = avgDownload,
-                            SourceUrl = $"/speedtest?result={result.Id}",
-                            Context = new Dictionary<string, string>
-                            {
-                                ["current_mbps"] = downloadMbps.ToString("F1"),
-                                ["average_mbps"] = avgDownload.ToString("F1"),
-                                ["drop_percent"] = dropPercent.ToString("F0"),
-                                ["sample_count"] = recent.Count.ToString()
-                            }
-                        });
-                    }
+                            ["drop_direction"] = drop.Direction,
+                            ["current_mbps"] = drop.CurrentMbps.ToString("F1"),
+                            ["average_mbps"] = drop.AverageMbps.ToString("F1"),
+                            ["drop_percent"] = drop.DropPercent.ToString("F0"),
+                            ["sample_count"] = drop.Samples.ToString()
+                        }
+                    });
                 }
             }
             catch (Exception regressEx)

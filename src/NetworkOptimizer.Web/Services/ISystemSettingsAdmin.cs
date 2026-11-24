@@ -1,3 +1,4 @@
+using NetworkOptimizer.Storage.Models;
 using NetworkOptimizer.Storage.Models.Identity;
 using NetworkOptimizer.Web.Services.Gates;
 
@@ -13,15 +14,15 @@ namespace NetworkOptimizer.Web.Services;
 [MutatingService]
 public interface ISystemSettingsAdmin
 {
-    /// <summary>Writes a setting in the current site's database.</summary>
+    /// <summary>Writes a setting in the named site's database: the caller's site in context.</summary>
     [RequireRole(Roles.Admin)]
     [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "setting")]
-    Task SetAsync(string key, string? value);
+    Task SetAsync(string siteSlug, string key, string? value);
 
-    /// <summary>Writes an integer setting in the current site's database.</summary>
+    /// <summary>Writes an integer setting in the named site's database: the caller's site in context.</summary>
     [RequireRole(Roles.Admin)]
     [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "setting")]
-    Task SetIntAsync(string key, int value);
+    Task SetIntAsync(string siteSlug, string key, int value);
 
     /// <summary>Writes an instance-wide setting in the main database.</summary>
     [RequireRole(Roles.Admin)]
@@ -35,6 +36,26 @@ public interface ISystemSettingsAdmin
 
     /// <summary>Saves the iperf3 test preferences as one change.</summary>
     [RequireRole(Roles.Admin)]
-    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "iperf3_settings")]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "iperf3_settings", InstanceScoped = true)]
     Task SaveIperf3SettingsAsync(Iperf3Settings settings);
+
+    /// <summary>Adds an external speed test server. The list is instance-wide.</summary>
+    [RequireRole(Roles.Admin)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "external_speedtest_server", InstanceScoped = true)]
+    Task AddExternalSpeedTestServerAsync(ExternalSpeedTestServer server);
+
+    /// <summary>Updates an external speed test server.</summary>
+    [RequireRole(Roles.Admin)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "external_speedtest_server", InstanceScoped = true)]
+    Task UpdateExternalSpeedTestServerAsync(ExternalSpeedTestServer server);
+
+    /// <summary>Deletes an external speed test server, promoting another to default if needed.</summary>
+    [RequireRole(Roles.Admin)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "external_speedtest_server", InstanceScoped = true)]
+    Task DeleteExternalSpeedTestServerAsync(int id);
+
+    /// <summary>Makes an external speed test server the default.</summary>
+    [RequireRole(Roles.Admin)]
+    [AuditAction(AuditActions.SettingsChanged, Category = AuditCategories.Settings, TargetType = "external_speedtest_server", InstanceScoped = true)]
+    Task SetDefaultExternalSpeedTestServerAsync(int id);
 }

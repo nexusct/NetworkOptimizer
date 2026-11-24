@@ -6,6 +6,18 @@ namespace NetworkOptimizer.Core.Tests.Helpers;
 
 public class DisplayFormattersTests
 {
+    [Theory]
+    [InlineData(0.0, "<0.1 ms")]
+    [InlineData(0.04, "<0.1 ms")]
+    [InlineData(0.5, "0.5 ms")]
+    [InlineData(1.5, "1.5 ms")]
+    [InlineData(9.94, "9.9 ms")]
+    [InlineData(9.96, "10 ms")]
+    [InlineData(22.4, "22 ms")]
+    [InlineData(140.0, "140 ms")]
+    public void FormatResponseMs_HasTwoDigits(double ms, string expected) =>
+        DisplayFormatters.FormatResponseMs(ms).Should().Be(expected);
+
     #region StripDevicePrefix Tests
 
     [Theory]
@@ -866,6 +878,36 @@ public class DisplayFormattersTests
     public void FormatShare_TwoSignificantDigits(double percent, string expected)
     {
         DisplayFormatters.FormatShare(percent).Should().Be(expected);
+    }
+
+    #endregion
+
+    #region FormatOltVendor
+
+    [Theory]
+    [InlineData("ALCL", null, "Nokia (ALCL)")]
+    [InlineData("alcl", null, "Nokia (ALCL)")]
+    [InlineData("CALX", "E7", "Calix E7 (CALX)")]
+    [InlineData("HWTC", "", "Huawei (HWTC)")]
+    [InlineData("XYZW", null, "XYZW")]
+    [InlineData("XYZW", "M1", "XYZW M1")]
+    [InlineData(null, "E7", "E7")]
+    [InlineData(" ", null, null)]
+    [InlineData(null, null, null)]
+    public void FormatOltVendor_DecodesKnownIdsAndKeepsTheRawId(string? id, string? model, string? expected)
+    {
+        DisplayFormatters.FormatOltVendor(id, model).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("Registered", "success", "Yes · key OK")]
+    [InlineData("Registered", null, "Yes")]
+    [InlineData("Unregistered", "fail", "Unregistered · key fail")]
+    [InlineData(null, "success", "key OK")]
+    [InlineData(" ", null, null)]
+    public void FormatPonRegistration_ReadsAsTheDeviceReportsIt(string? reg, string? key, string? expected)
+    {
+        DisplayFormatters.FormatPonRegistration(reg, key).Should().Be(expected);
     }
 
     #endregion
